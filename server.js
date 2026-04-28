@@ -1069,6 +1069,18 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/reps — Returns name list of all sales reps (role != admin).
+// Accessible to ALL authenticated users (reps need it for RepSelector + leaderboard).
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/reps', requireAuth, (req, res) => {
+  const db   = getDb();
+  const reps = db.prepare(
+    `SELECT name FROM users WHERE role != 'admin' ORDER BY name`
+  ).all().map(r => r.name);
+  return res.json({ reps });
+});
+
 // Settings endpoints — GET /api/settings, PUT /api/settings/:key
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
