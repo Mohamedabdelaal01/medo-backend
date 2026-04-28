@@ -8,12 +8,26 @@
 
 const { getDb } = require('../db');
 
-const FLOW_IDS = {
-  send_immediate:     process.env.MANYCHAT_FLOW_IMMEDIATE   || 'FLOW_IMMEDIATE',
-  send_branch_info:   process.env.MANYCHAT_FLOW_BRANCH_INFO || 'FLOW_BRANCH_INFO',
-  send_offer:         process.env.MANYCHAT_FLOW_OFFER       || 'FLOW_OFFER',
-  re_engage:          process.env.MANYCHAT_FLOW_REENGAGE    || 'FLOW_REENGAGE',
-};
+// Reads flow IDs from DB settings at call-time (not module load-time),
+// so any change via the Settings page takes effect immediately — no restart needed.
+function getFlowIds() {
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT key, value FROM settings WHERE key IN (
+      'manychat_flow_immediate',
+      'manychat_flow_branch_info',
+      'manychat_flow_offer',
+      'manychat_flow_reengage'
+    )`
+  ).all();
+  const map = Object.fromEntries(rows.map(r => [r.key, r.value || null]));
+  return {
+    send_immediate:   map['manychat_flow_immediate']   || null,
+    send_branch_info: map['manychat_flow_branch_info'] || null,
+    send_offer:       map['manychat_flow_offer']       || null,
+    re_engage:        map['manychat_flow_reengage']    || null,
+  };
+}
 
 const RECENT_HOURS = 48;
 
@@ -35,6 +49,7 @@ function recentEvent(userId, eventType, hours = RECENT_HOURS) {
 
 function decide(profile) {
   if (!profile) return { action_type: 'none', flow_id: null };
+  const FLOW_IDS = getFlowIds();
 
   // visit_confirmed → send branch info / appointment confirmation
   if (profile.visit_confirmed === 1) {
@@ -66,7 +81,7 @@ function decide(profile) {
 }
 
 function flowIdFor(actionType) {
-  return FLOW_IDS[actionType] || null;
+  return getFlowIds()[actionType] || null;
 }
 
-module.exports = { decide, flowIdFor, FLOW_IDS };
+module.exports = { decide, flowIdFor, getFlowIds };

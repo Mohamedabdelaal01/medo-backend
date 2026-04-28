@@ -4,7 +4,18 @@
 
 const { getDb } = require('../db');
 
-const WEEKLY_LIMIT = 2;
+// Reads weekly_message_limit from DB at call-time so Settings page changes
+// take effect immediately without a server restart.
+function getWeeklyLimit() {
+  try {
+    const db  = getDb();
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'weekly_message_limit'`).get();
+    const val = parseInt(row?.value, 10);
+    return Number.isFinite(val) && val > 0 ? val : 2; // safe fallback = 2
+  } catch {
+    return 2;
+  }
+}
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
@@ -50,12 +61,13 @@ function getStateRotated(userId, now = new Date()) {
 }
 
 function canSend(userId, { force = false } = {}) {
-  const state = getStateRotated(userId);
+  const state       = getStateRotated(userId);
+  const weeklyLimit = getWeeklyLimit();
   if (force) return { ok: true, state };
-  if (state.sends_this_week >= WEEKLY_LIMIT) {
+  if (state.sends_this_week >= weeklyLimit) {
     return {
       ok: false,
-      reason: `Weekly send limit reached (${WEEKLY_LIMIT})`,
+      reason: `Weekly send limit reached (${weeklyLimit})`,
       state,
     };
   }
@@ -77,4 +89,4 @@ function recordSend(userId) {
   return getState(userId);
 }
 
-module.exports = { canSend, recordSend, getStateRotated, isoMondayAnchor, WEEKLY_LIMIT };
+module.exports = { canSend, recordSend, getStateRotated, isoMondayAnchor, getWeeklyLimit };

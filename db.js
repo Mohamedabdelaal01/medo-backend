@@ -223,12 +223,18 @@ function initializeDatabase() {
     ['company_name',           'Grand Furniture'],
     ['active_branches',        '["nasr_city","maadi","new_cairo","october","alexandria"]'],
     ['weekly_message_limit',   '2'],
-    ['manychat_api_key',       ''],
-    ['manychat_page_id',       ''],
-    ['manychat_visit_flow',    ''],
-    ['manychat_purchase_flow', ''],
-    ['manychat_reminder_flow', ''],
-    ['openai_api_key',         ''],
+    ['manychat_api_key',           ''],
+    ['manychat_page_id',           ''],
+    // Event-triggered flows (fired automatically on lead state changes)
+    ['manychat_visit_flow',        ''],
+    ['manychat_purchase_flow',     ''],
+    ['manychat_reminder_flow',     ''],
+    // Intelligent trigger flows (fired by /api/trigger-message decision engine)
+    ['manychat_flow_immediate',    ''],   // hot lead — active in last 6 hours
+    ['manychat_flow_branch_info',  ''],   // confirmed visit or location request
+    ['manychat_flow_offer',        ''],   // recent product_details event
+    ['manychat_flow_reengage',     ''],   // warm/hot lead inactive ≥ 3 days
+    ['openai_api_key',             ''],
     ['facebook_pixel_id',      ''],
     ['scoring_hot_threshold',  '40'],
     ['scoring_warm_threshold', '15'],
