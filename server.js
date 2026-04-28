@@ -1081,6 +1081,43 @@ app.get('/api/reps', requireAuth, (req, res) => {
   return res.json({ reps });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/branches  — returns active branches [{id, name}] (any auth user)
+// PUT /api/branches  — replaces the full branches list (admin only)
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/branches', requireAuth, (req, res) => {
+  const db  = getDb();
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'active_branches'`).get();
+  let branches = [];
+  try {
+    const parsed = JSON.parse(row?.value || '[]');
+    // Support both legacy string[] and new {id,name}[] formats
+    branches = parsed.map(b =>
+      typeof b === 'string' ? { id: b, name: b } : b
+    );
+  } catch (_) { branches = []; }
+  return res.json({ branches });
+});
+
+app.put('/api/branches', requireAuth, requireRole('admin'), (req, res) => {
+  const { branches } = req.body || {};
+  if (!Array.isArray(branches)) {
+    return res.status(400).json({ error: 'branches must be an array' });
+  }
+  // Validate each entry has id & name
+  for (const b of branches) {
+    if (!b.id || !b.name) {
+      return res.status(400).json({ error: 'each branch must have id and name' });
+    }
+  }
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES ('active_branches', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(JSON.stringify(branches));
+  return res.json({ ok: true, branches });
+});
+
 // Settings endpoints — GET /api/settings, PUT /api/settings/:key
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {

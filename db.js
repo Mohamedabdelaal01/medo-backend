@@ -221,7 +221,7 @@ function initializeDatabase() {
   // ── Seed default settings (idempotent) ────────────────────────────────────
   const defaultSettings = [
     ['company_name',           'Grand Furniture'],
-    ['active_branches',        '["nasr_city","maadi","new_cairo","october","alexandria"]'],
+    ['active_branches',        '[{"id":"nasr_city","name":"نصر سيتي"},{"id":"maadi","name":"المعادي"},{"id":"new_cairo","name":"القاهرة الجديدة"},{"id":"october","name":"أكتوبر"},{"id":"alexandria","name":"الإسكندرية"}]'],
     ['weekly_message_limit',   '2'],
     ['manychat_api_key',           ''],
     ['manychat_page_id',           ''],
@@ -245,6 +245,36 @@ function initializeDatabase() {
   );
   for (const [key, value] of defaultSettings) {
     insertSetting.run(key, value);
+  }
+
+  // ── Migrate active_branches: string[] → {id,name}[] ──────────────────────
+  // Old format was '["nasr_city","maadi",...]'. Upgrade to [{id,name}] objects.
+  const branchFallbackNames = {
+    nasr_city:  'نصر سيتي',
+    maadi:      'المعادي',
+    new_cairo:  'القاهرة الجديدة',
+    october:    'أكتوبر',
+    alexandria: 'الإسكندرية',
+    helwan:     'حلوان',
+    faisal:     'فيصل',
+    ain_shams:  'عين شمس',
+  };
+  const branchRow = db.prepare(`SELECT value FROM settings WHERE key = 'active_branches'`).get();
+  if (branchRow) {
+    try {
+      const parsed = JSON.parse(branchRow.value);
+      // If first element is a string, it's the old format — upgrade it
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        const upgraded = parsed.map(id => ({
+          id,
+          name: branchFallbackNames[id] || id,
+        }));
+        db.prepare(
+          `UPDATE settings SET value = ?, updated_at = datetime('now') WHERE key = 'active_branches'`
+        ).run(JSON.stringify(upgraded));
+        console.log('✅ Migrated active_branches to {id,name}[] format');
+      }
+    } catch (_) {}
   }
 
   console.log('✅ Database initialized at:', DB_PATH);
