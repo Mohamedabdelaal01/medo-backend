@@ -1,0 +1,258 @@
+// db.js — Database Setup & Schema
+// Uses SQLite via better-sqlite3 (no separate DB server needed)
+
+const Database = require('better-sqlite3');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grand_furniture.db');
+
+function initializeDatabase() {
+  const db = new Database(DB_PATH);
+
+  // Enable WAL mode for better performance
+  db.pragma('journal_mode = WAL');
+
+  // ── Table 1: Raw Events ────────────────────────────────────────────────
+  // Every webhook call from ManyChat stores one row here.
+  // event_id: persistent unique identifier — used for DB-level idempotency (Phase 2).
+  // Declared UNIQUE so a duplicate INSERT attempt is detectable before it happens.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id      TEXT UNIQUE,
+      user_id       TEXT NOT NULL,
+      first_name    TEXT,
+      event_type    TEXT NOT NULL,
+      event_value   TEXT,
+      score_delta   INTEGER DEFAULT 0,
+      session_count INTEGER DEFAULT 0,
+      current_score INTEGER DEFAULT 0,
+      branch        TEXT,
+      product_id    TEXT,
+      raw_payload   TEXT,
+      created_at    DATETIME DEFAULT (datetime('now'))
+    )
+  `);
+
+  // ── Phase 2 Migration — add event_id to existing events table ─────────
+  // ALTER TABLE fails silently if the column already exists (caught below).
+  // This makes the migration safe to run on every startup against an existing DB.
+  try {
+    db.exec(`ALTER TABLE events ADD COLUMN event_id TEXT`);
+    console.log('✅ Migration: event_id column added to events table');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // ── Table 2: Lead Profiles ─────────────────────────────────────────────
+  // One row per user — updated on every event.
+  // visit_at: timestamp of the first confirmed showroom visit (Phase 3).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lead_profiles (
+      user_id            TEXT PRIMARY KEY,
+      first_name         TEXT,
+      total_score        INTEGER DEFAULT 0,
+      lead_class         TEXT DEFAULT 'cold',
+      preferred_branch   TEXT,
+      last_product       TEXT,
+      product_view_count INTEGER DEFAULT 0,
+      session_count      INTEGER DEFAULT 0,
+      visit_confirmed    INTEGER DEFAULT 0,
+      location_requested INTEGER DEFAULT 0,
+      visit_at           DATETIME,
+      last_activity      DATETIME DEFAULT (datetime('now')),
+      created_at         DATETIME DEFAULT (datetime('now'))
+    )
+  `);
+
+  // ── Phase 3 Migration — add visit_at to existing lead_profiles table ───
+  // Same safe try/catch pattern as the event_id migration above.
+  // Existing rows get NULL — correct, as they have not confirmed a visit.
+  try {
+    db.exec(`ALTER TABLE lead_profiles ADD COLUMN visit_at DATETIME`);
+    console.log('✅ Migration: visit_at column added to lead_profiles table');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // ── Indexes for fast dashboard queries ────────────────────────────────
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_events_user_id    ON events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_leads_lead_class  ON lead_profiles(lead_class);
+    CREATE INDEX IF NOT EXISTS idx_leads_branch      ON lead_profiles(preferred_branch);
+  `);
+
+  // ── Phase 2: Unique index on event_id ─────────────────────────────────
+  // Partial WHERE event_id IS NOT NULL ensures existing NULL rows (from
+  // the ALTER TABLE path) are excluded — avoids false UNIQUE violations.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)
+    WHERE event_id IS NOT NULL
+  `);
+
+  // ── Phase 3: Index on visit_at for fast visit metric queries ──────────
+  // Used by visits_today and visits_this_week dashboard queries.
+  // Partial WHERE visit_at IS NOT NULL skips the majority of rows that
+  // have never confirmed a visit, keeping the index tight.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_leads_visit_at ON lead_profiles(visit_at)
+    WHERE visit_at IS NOT NULL
+  `);
+
+  // ── RBAC: assigned_rep migration ─────────────────────────────────────────
+  // Stores the name of the sales rep this lead is assigned to.
+  // NULL = unassigned (admin sees all; reps only see their assigned leads).
+  try {
+    db.exec(`ALTER TABLE lead_profiles ADD COLUMN assigned_rep TEXT`);
+    console.log('✅ Migration: assigned_rep column added to lead_profiles');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // ── O2O Attribution Migrations ────────────────────────────────────────────
+  // campaign_source: which Meta/ManyChat campaign brought this lead
+  // ad_id:           specific ad creative ID for deeper ROI analysis
+  // visit_code:      short unique code the receptionist enters to confirm arrival
+  // purchased_at:    timestamp of first recorded offline purchase
+  const o2oColumns = [
+    { col: 'campaign_source', type: 'TEXT' },
+    { col: 'ad_id',           type: 'TEXT' },
+    { col: 'visit_code',      type: 'TEXT' },
+    { col: 'purchased_at',    type: 'DATETIME' },
+    { col: 'location_reminder_sent', type: 'DATETIME' },
+  ];
+  for (const { col, type } of o2oColumns) {
+    try {
+      db.exec(`ALTER TABLE lead_profiles ADD COLUMN ${col} ${type}`);
+      console.log(`✅ Migration: ${col} column added to lead_profiles`);
+    } catch (e) {
+      if (!e.message.includes('duplicate column name')) throw e;
+    }
+  }
+
+  // Unique partial index on visit_code — skips NULLs so old rows are unaffected
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_profiles_visit_code
+    ON lead_profiles(visit_code)
+    WHERE visit_code IS NOT NULL
+  `);
+
+  // purchases: one row per offline sale, linked by user_id
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS purchases (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id     TEXT NOT NULL,
+      product_id  TEXT,
+      price       REAL,
+      branch      TEXT,
+      notes       TEXT,
+      rep         TEXT,
+      created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_purchases_user    ON purchases(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_purchases_product ON purchases(product_id);
+  `);
+
+  // ── Intelligence layer — additive tables ─────────────────────────────────
+  // messages_sent: every ManyChat flow we trigger is recorded here for audit
+  // and to drive the weekly send counter. Joined back to lead_profiles by user_id.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS messages_sent (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id      TEXT NOT NULL,
+      sent_by_rep  TEXT,
+      action_type  TEXT NOT NULL,
+      flow_id      TEXT,
+      message_text TEXT,
+      sent_at      DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_sent_user ON messages_sent(user_id, sent_at DESC);
+  `);
+
+  // follow_up_state: per-lead weekly send counter.
+  // week_anchor is the ISO date of the Monday the counter belongs to;
+  // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS follow_up_state (
+      user_id          TEXT PRIMARY KEY,
+      sends_this_week  INTEGER NOT NULL DEFAULT 0,
+      week_anchor      TEXT,
+      last_sent_at     DATETIME
+    );
+  `);
+
+  // ── Users & Settings (auth layer) ────────────────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      name          TEXT NOT NULL,
+      email         TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role          TEXT NOT NULL DEFAULT 'rep',
+      created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // New performance indexes
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at);
+    CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases(created_at);
+  `);
+
+  // ── Seed default admin (idempotent) ───────────────────────────────────────
+  const existingAdmin = db.prepare(`SELECT id FROM users WHERE email = ?`)
+    .get('admin@grandfurniture.eg');
+  if (!existingAdmin) {
+    db.prepare(
+      `INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)`
+    ).run('مدير النظام', 'admin@grandfurniture.eg', bcrypt.hashSync('Grand@2025', 10), 'admin');
+    console.log('✅ Seed: admin user created');
+  }
+
+  // ── Seed default settings (idempotent) ────────────────────────────────────
+  const defaultSettings = [
+    ['company_name',           'Grand Furniture'],
+    ['active_branches',        '["nasr_city","maadi","new_cairo","october","alexandria"]'],
+    ['weekly_message_limit',   '2'],
+    ['manychat_api_key',       ''],
+    ['manychat_page_id',       ''],
+    ['manychat_visit_flow',    ''],
+    ['manychat_purchase_flow', ''],
+    ['manychat_reminder_flow', ''],
+    ['openai_api_key',         ''],
+    ['facebook_pixel_id',      ''],
+    ['scoring_hot_threshold',  '40'],
+    ['scoring_warm_threshold', '15'],
+    ['lead_expiry_days',       '30'],
+  ];
+  const insertSetting = db.prepare(
+    `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
+  );
+  for (const [key, value] of defaultSettings) {
+    insertSetting.run(key, value);
+  }
+
+  console.log('✅ Database initialized at:', DB_PATH);
+  return db;
+}
+
+// Singleton pattern — same DB instance across app
+let dbInstance = null;
+
+function getDb() {
+  if (!dbInstance) {
+    dbInstance = initializeDatabase();
+  }
+  return dbInstance;
+}
+
+module.exports = { getDb };
