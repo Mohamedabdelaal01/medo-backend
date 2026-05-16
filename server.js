@@ -244,14 +244,27 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     user_id,
     first_name,
     event_type,
-    event_value,
+    event_value: _rawEventValue,
     session_count,
     current_score,
     // O2O attribution fields (optional — sent by ManyChat from ad UTM params)
     campaign_source,
     ad_id,
     visit_code,
+    // ManyChat product fields — fallback when event_value not provided
+    product,
+    category,
   } = req.body;
+
+  // Normalise: ManyChat flows send "product" & "category" instead of event_value.
+  // Use event_value when present; fall back to product name for product_details events.
+  const event_value = _rawEventValue
+    || (event_type === 'product_details' ? (product || null) : null)
+    || null;
+
+  // Store category alongside the product in lead_profiles (coalesced on first set)
+  // We persist it via a dedicated column added below in the UPDATE.
+  const productCategory = category || null;
 
   // ── 2. Phase 1 — In-memory idempotency (fast path) ───────────────────
   // Hash = user_id + event_type + event_value + 10-second time bucket.
@@ -369,6 +382,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       lead_class          = ?,
       preferred_branch    = COALESCE(?, preferred_branch),
       last_product        = COALESCE(?, last_product),
+      last_category       = COALESCE(?, last_category),
       product_view_count  = product_view_count + ?,
       session_count       = COALESCE(?, session_count),
       visit_confirmed     = CASE WHEN ? = 1 THEN 1 ELSE visit_confirmed END,
@@ -385,6 +399,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     newLeadClass,
     detectedBranch || null,
     lastProduct || null,
+    isProductEvent ? productCategory : null,
     isProductEvent ? 1 : 0,
     session_count || null,
     isVisitConfirmed ? 1 : 0,

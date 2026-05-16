@@ -118,11 +118,12 @@ function initializeDatabase() {
   // visit_code:      short unique code the receptionist enters to confirm arrival
   // purchased_at:    timestamp of first recorded offline purchase
   const o2oColumns = [
-    { col: 'campaign_source', type: 'TEXT' },
-    { col: 'ad_id',           type: 'TEXT' },
-    { col: 'visit_code',      type: 'TEXT' },
-    { col: 'purchased_at',    type: 'DATETIME' },
-    { col: 'location_reminder_sent', type: 'DATETIME' },
+    { col: 'campaign_source',         type: 'TEXT'     },
+    { col: 'ad_id',                   type: 'TEXT'     },
+    { col: 'visit_code',              type: 'TEXT'     },
+    { col: 'purchased_at',            type: 'DATETIME' },
+    { col: 'location_reminder_sent',  type: 'DATETIME' },
+    { col: 'last_category',           type: 'TEXT'     }, // product category from ManyChat
   ];
   for (const { col, type } of o2oColumns) {
     try {
