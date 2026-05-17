@@ -15,10 +15,21 @@ const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
 const { getManyChatClient }= require('./manychat/client');
-const { requireAuth, requireRole, authorizeRoles, JWT_SECRET } = require('./middleware/auth');
+const { requireAuth, requireRole, getJwtSecret } = require('./middleware/auth');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ── Settings helper ───────────────────────────────────────────────────────────
+// Small reader used by security middleware & integration status. Never throws.
+function getSetting(key, fallback = null) {
+  try {
+    const row = getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
+    return row && row.value != null ? row.value : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
 
 // ── API Protection Layer — In-Memory State ────────────────────────────────────
 // All state is intentionally in-memory:
@@ -51,7 +62,29 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ── Middleware ─────────────────────────────────────────────────────────────
-app.use(cors());
+// CORS locked to known origins. Vercel preview deployments use dynamic
+// subdomains, so we allow the project's *.vercel.app pattern + localhost dev.
+// FRONTEND_URL env var can add an extra explicit origin if ever needed.
+const ALLOWED_ORIGINS = [
+  'https://dashboard-frontend-last.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    // No origin = same-origin / server-to-server (ManyChat webhook, curl) → allow
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // Allow Vercel preview builds of this project (dashboard-frontend-last-*.vercel.app)
+    if (/^https:\/\/dashboard-frontend-last[\w-]*\.vercel\.app$/.test(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // Simple request logger
@@ -67,8 +100,13 @@ app.use((req, res, next) => {
 // Falls through silently if WEBHOOK_SECRET is not set (dev / staging without secret).
 // ManyChat supports custom headers — set x-webhook-secret in webhook settings.
 function validateSecret(req, res, next) {
-  const secret = process.env.WEBHOOK_SECRET;
-  if (!secret) return next(); // env var not configured — skip check
+  // Secret comes from env (highest priority) or the auto-generated DB value.
+  const secret = process.env.WEBHOOK_SECRET || getSetting('webhook_secret');
+  // Enforcement is opt-in (admin toggles it in Settings) so going live with
+  // this code doesn't instantly break an already-running ManyChat setup.
+  const enforce = getSetting('webhook_enforce', 'false') === 'true';
+
+  if (!enforce || !secret) return next(); // not enforced — accept (legacy behavior)
 
   const incoming = req.headers['x-webhook-secret'];
   if (!incoming || incoming !== secret) {
@@ -219,7 +257,7 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const payload = { id: user.id, name: user.name, email: user.email, role: user.role };
-  const token   = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  const token   = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
   return res.json({ token, user: payload });
 });
 
@@ -440,27 +478,38 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // event_id is stored here permanently — this is what Phase 2 checks on
   // subsequent requests. The UNIQUE constraint on the column guarantees
   // no two rows can share the same event_id at the DB level.
-  const eventRow = db.prepare(`
-    INSERT INTO events (
-      event_id, user_id, first_name, event_type, event_value,
-      score_delta, session_count, current_score,
-      branch, product_id, category, raw_payload
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    resolvedEventId,
-    user_id,
-    first_name || null,
-    event_type,
-    event_value || null,
-    scoreDelta,
-    session_count || null,
-    newTotalScore,
-    detectedBranch || null,
-    isProductEvent ? event_value : null,
-    hasCategory ? productCategory : null,
-    JSON.stringify(req.body)
-  );
+  let eventRow;
+  try {
+    eventRow = db.prepare(`
+      INSERT INTO events (
+        event_id, user_id, first_name, event_type, event_value,
+        score_delta, session_count, current_score,
+        branch, product_id, category, raw_payload
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      resolvedEventId,
+      user_id,
+      first_name || null,
+      event_type,
+      event_value || null,
+      scoreDelta,
+      session_count || null,
+      newTotalScore,
+      detectedBranch || null,
+      isProductEvent ? event_value : null,
+      hasCategory ? productCategory : null,
+      JSON.stringify(req.body)
+    );
+  } catch (e) {
+    // Concurrent duplicate slipped past the dedup checks and lost the race on
+    // the UNIQUE(event_id) constraint → treat as idempotent success, not 500.
+    if (e && /UNIQUE constraint failed/i.test(e.message)) {
+      console.log(`[DEDUP:RACE] Skipped — event_id:${resolvedEventId} user:${user_id}`);
+      return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event_race' });
+    }
+    throw e; // anything else → global error handler returns clean 500
+  }
 
   // ── 10. Log transition alerts ─────────────────────────────────────────
   const alreadyAdvanced = ['hot', 'visited', 'purchased', 'converted'].includes(profile.lead_class);
@@ -859,6 +908,8 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   if (visitFlowSetting && visitFlowSetting.value && visitFlowSetting.value.trim() !== '') {
     getManyChatClient().sendFlow({ user_id: lead.user_id, flow_id: visitFlowSetting.value.trim() })
       .catch(err => console.error('[Event-Trigger] Visit Flow failed:', err.message));
+  } else {
+    console.warn('[Event-Trigger] ⚠️ Visit confirmed but manychat_visit_flow is empty — no message sent. Set it in Settings → API.');
   }
 
   return res.json({
@@ -881,7 +932,7 @@ app.post('/api/purchases', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'user_id is required' });
   }
   const db  = getDb();
-  const rep = req.headers['x-rep'] || null;
+  const rep = req.user?.name || req.headers['x-rep'] || null;
 
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
@@ -907,6 +958,8 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   if (purchaseFlowSetting && purchaseFlowSetting.value && purchaseFlowSetting.value.trim() !== '') {
     getManyChatClient().sendFlow({ user_id, flow_id: purchaseFlowSetting.value.trim() })
       .catch(err => console.error('[Event-Trigger] Purchase Flow failed:', err.message));
+  } else {
+    console.warn('[Event-Trigger] ⚠️ Purchase recorded but manychat_purchase_flow is empty — no message sent. Set it in Settings → API.');
   }
 
   return res.json({ ok: true, purchase_id: result.lastInsertRowid, lead_class: 'purchased' });
@@ -942,12 +995,10 @@ app.get('/api/predictions', requireAuth, (req, res) => {
 // Body: { user_id, action_type?, force? }
 //   action_type: optional override; if omitted, the engine picks one from the
 //                lead's current state.
-//   force:       admin-only escape hatch for the 2/week cap. Caller proves
-//                admin via X-Rep-Role header (lightweight — no JWT).
+//   force:       admin-only escape hatch for the 2/week cap.
 //
-// Headers honored:
-//   X-Rep:      sales rep currently signed in (string, free-form)
-//   X-Rep-Role: 'admin' | 'rep' (only admin can use force=true)
+// Identity is taken from the JWT (req.user) — NOT from client headers, which
+// are spoofable. Only a real admin token can use force=true.
 app.post('/api/trigger-message', requireAuth, async (req, res) => {
   try {
     const { user_id, action_type, force } = req.body || {};
@@ -959,8 +1010,8 @@ app.post('/api/trigger-message', requireAuth, async (req, res) => {
     const profile = db.prepare(`SELECT * FROM lead_profiles WHERE user_id = ?`).get(user_id);
     if (!profile) return res.status(404).json({ error: 'lead_not_found' });
 
-    const role = String(req.headers['x-rep-role'] || '').toLowerCase();
-    const rep  = req.headers['x-rep'] || null;
+    const role = String(req.user?.role || '').toLowerCase();
+    const rep  = req.user?.name || null;
     const wantsForce = Boolean(force) && role === 'admin';
 
     const gate = canSend(user_id, { force: wantsForce });
@@ -1243,6 +1294,29 @@ app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
   return res.json(Object.fromEntries(rows.map(r => [r.key, r.value])));
 });
 
+// ── Integration status — drives the dashboard ManyChat banner ────────────────
+// Admin-only (exposes the webhook secret so it can be pasted into ManyChat).
+app.get('/api/integration-status', requireAuth, requireRole('admin'), (req, res) => {
+  const apiKey = (getSetting('manychat_api_key') || '').trim();
+  const flowKeys = [
+    'manychat_flow_immediate', 'manychat_flow_branch_info',
+    'manychat_flow_offer',     'manychat_flow_reengage',
+    'manychat_visit_flow',     'manychat_purchase_flow',
+    'manychat_reminder_flow',
+  ];
+  const missing_flows = flowKeys.filter(k => !(getSetting(k) || '').trim());
+
+  return res.json({
+    manychat: apiKey ? 'live' : 'mock',
+    missing_flows,
+    webhook: {
+      secret:   process.env.WEBHOOK_SECRET || getSetting('webhook_secret') || '',
+      enforced: getSetting('webhook_enforce', 'false') === 'true',
+      from_env: !!process.env.WEBHOOK_SECRET,
+    },
+  });
+});
+
 app.put('/api/settings/:key', requireAuth, requireRole('admin'), (req, res) => {
   const { key }   = req.params;
   const { value } = req.body || {};
@@ -1321,6 +1395,7 @@ function runAbandonedIntentJob() {
     const reminderFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_reminder_flow'`).get();
     
     if (!reminderFlowSetting || !reminderFlowSetting.value || reminderFlowSetting.value.trim() === '') {
+      console.warn('[Scheduler] ⚠️ Abandoned-intent job skipped — manychat_reminder_flow is empty. Set it in Settings → API.');
       return; // No flow configured
     }
 
@@ -1353,6 +1428,26 @@ setTimeout(() => {
   runAbandonedIntentJob();
   setInterval(runAbandonedIntentJob, 60 * 60 * 1000);
 }, 5000);
+
+// ── Global Error Handler ──────────────────────────────────────────────────
+// Any error thrown/forwarded in a route lands here → clean JSON, no crash.
+// MUST be registered after all routes.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ success: false, error: 'cors_forbidden' });
+  }
+  console.error('[UNHANDLED]', req.method, req.path, '-', err && err.stack ? err.stack : err);
+  return res.status(500).json({ success: false, error: 'internal_error' });
+});
+
+// Last-resort safety nets — log instead of crashing the process.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
 
 // ── Start Server ──────────────────────────────────────────────────────────
 app.listen(PORT, () => {

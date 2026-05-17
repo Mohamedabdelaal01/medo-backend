@@ -4,6 +4,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grand_furniture.db');
 
@@ -261,12 +262,28 @@ function initializeDatabase() {
     ['scoring_hot_threshold',  '40'],
     ['scoring_warm_threshold', '15'],
     ['lead_expiry_days',       '30'],
+    // Webhook security — secret is auto-generated below; enforcement is opt-in
+    // so existing ManyChat setups don't break the moment this ships.
+    ['webhook_enforce',        'false'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
   );
   for (const [key, value] of defaultSettings) {
     insertSetting.run(key, value);
+  }
+
+  // Auto-generate a strong webhook secret once (free, no env var needed).
+  // Shown read-only in the dashboard so the admin can paste it into ManyChat.
+  const whRow = db.prepare(`SELECT value FROM settings WHERE key = 'webhook_secret'`).get();
+  if (!whRow || !whRow.value) {
+    const wh = crypto.randomBytes(24).toString('hex');
+    db.prepare(`
+      INSERT INTO settings (key, value, updated_at)
+      VALUES ('webhook_secret', ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(wh);
+    console.log('🔐 Generated webhook secret (stored in settings)');
   }
 
   // ── Migrate active_branches: string[] → {id,name}[] ──────────────────────

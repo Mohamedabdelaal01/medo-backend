@@ -7,31 +7,48 @@ function getApiKey() {
   return row ? row.value : null;
 }
 
+// Always resolves to { ok, data, error } — never throws, never hangs.
 async function apiCall(endpoint, payload) {
   const apiKey = getApiKey();
   if (!apiKey) {
-    console.log(`[ManyChat REAL] Missing API Key, skipping ${endpoint}`);
-    return { ok: false, error: 'Missing API Key' };
+    console.warn(`[ManyChat] ⚠️ Missing API Key — skipping ${endpoint} (no message sent)`);
+    return { ok: false, data: null, error: 'missing_api_key' };
   }
+
+  // 10s timeout so a stalled ManyChat call can't hang the whole request.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
 
   try {
     const response = await fetch(`https://api.manychat.com/fb${endpoint}`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
-    
-    const data = await response.json();
-    if (!response.ok) {
-        console.error(`[ManyChat REAL] Error calling ${endpoint}:`, data);
+
+    // Body may not be JSON (HTML error page, empty 502, etc.) — guard it.
+    let data = null;
+    const raw = await response.text();
+    if (raw) {
+      try { data = JSON.parse(raw); }
+      catch { data = { raw }; }
     }
-    return { ok: response.ok, data };
+
+    if (!response.ok) {
+      console.error(`[ManyChat] ❌ ${endpoint} → HTTP ${response.status}:`, data);
+      return { ok: false, data, error: `http_${response.status}` };
+    }
+    return { ok: true, data, error: null };
   } catch (error) {
-    console.error(`[ManyChat REAL] Error calling ${endpoint}:`, error);
-    return { ok: false, error: error.message };
+    const isAbort = error && error.name === 'AbortError';
+    console.error(`[ManyChat] ❌ ${endpoint} →`, isAbort ? 'timeout' : error.message);
+    return { ok: false, data: null, error: isAbort ? 'timeout' : (error.message || 'request_failed') };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

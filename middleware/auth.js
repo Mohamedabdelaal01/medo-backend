@@ -1,8 +1,36 @@
 // middleware/auth.js — JWT authentication middleware
 
-const jwt = require('jsonwebtoken');
+const jwt    = require('jsonwebtoken');
+const crypto = require('crypto');
+const { getDb } = require('../db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'gf-dev-secret-2025';
+// ── Secret resolution (free, no env var required) ──────────────────────────
+// Priority: process.env.JWT_SECRET  →  persistent random secret in DB settings.
+// The DB-stored secret is generated once and survives as long as the DB does,
+// so tokens stay valid without any hardcoded fallback.
+let _cachedSecret = null;
+
+function getJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (_cachedSecret) return _cachedSecret;
+
+  const db  = getDb();
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'jwt_secret'`).get();
+  if (row && row.value) {
+    _cachedSecret = row.value;
+    return _cachedSecret;
+  }
+
+  const generated = crypto.randomBytes(48).toString('hex');
+  db.prepare(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES ('jwt_secret', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(generated);
+  _cachedSecret = generated;
+  console.log('🔐 Generated persistent JWT secret (stored in settings)');
+  return _cachedSecret;
+}
 
 /**
  * requireAuth — verifies Bearer token in Authorization header.
@@ -17,7 +45,7 @@ function requireAuth(req, res, next) {
   }
 
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = jwt.verify(token, getJwtSecret());
     next();
   } catch {
     return res.status(401).json({ error: 'Token expired or invalid' });
@@ -53,4 +81,4 @@ function authorizeRoles(...roles) {
   };
 }
 
-module.exports = { requireAuth, requireRole, authorizeRoles, JWT_SECRET };
+module.exports = { requireAuth, requireRole, authorizeRoles, getJwtSecret };
