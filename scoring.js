@@ -6,6 +6,7 @@
 const SCORE_MAP = {
   entry_offer:      5,
   entry_catalog:    5,
+  category_request: 10,   // picked a specific category (غرف النوم / السفرة …)
   entry_location:   10,
   product_details:  20,
   location_request: 40,
@@ -14,9 +15,14 @@ const SCORE_MAP = {
   visit_confirmed:  100,
 
   // Bonus events (applied contextually in server.js)
-  repeat_product_view: 10,
   map_click:           25,
 };
+
+// Event types that are scored ONCE per distinct value per user.
+// A 2nd click on the SAME product / SAME category earns 0 points
+// (the event is still recorded for analytics, just with score_delta = 0).
+// A click on a DIFFERENT product/category still earns full points.
+const DEDUP_SCORED_EVENTS = ['product_details', 'category_request'];
 
 // ── Lead Classification Thresholds ────────────────────────────────────────
 // 5-state system:
@@ -67,22 +73,26 @@ function classifyLead(totalScore, visitConfirmed = false, locationRequested = fa
 
 /**
  * Full scoring result for a new event
- * @param {object} profile - current lead profile from DB
- * @param {string} eventType - incoming event
- * @param {string} eventValue - incoming event value
+ * @param {object}  profile       - current lead profile from DB
+ * @param {string}  eventType     - incoming event
+ * @param {string}  eventValue    - incoming event value
+ * @param {boolean} alreadyScored - true when this exact product/category was
+ *                                  already scored for this user before
+ *                                  (caller resolves this via a DB lookup).
  * @returns {object} { scoreDelta, newTotalScore, newLeadClass }
  */
-function processScore(profile, eventType, eventValue) {
+function processScore(profile, eventType, eventValue, alreadyScored = false) {
   let scoreDelta = getScoreDelta(eventType);
 
-  // Bonus: map click inside branch detail
-  if (eventValue && eventValue.includes('map_click')) {
-    scoreDelta += SCORE_MAP.map_click;
+  // Per-value dedup: a repeated view of the SAME product or the SAME category
+  // earns zero. Distinct products/categories are unaffected.
+  if (alreadyScored && DEDUP_SCORED_EVENTS.includes(eventType)) {
+    scoreDelta = 0;
   }
 
-  // Bonus: repeat product view
-  if (eventType === 'product_details' && profile.product_view_count >= 2) {
-    scoreDelta += SCORE_MAP.repeat_product_view;
+  // Bonus: map click inside branch detail (independent signal — kept)
+  if (scoreDelta > 0 && eventValue && eventValue.includes('map_click')) {
+    scoreDelta += SCORE_MAP.map_click;
   }
 
   const newTotalScore = (profile.total_score || 0) + scoreDelta;
@@ -112,4 +122,4 @@ function processScore(profile, eventType, eventValue) {
   };
 }
 
-module.exports = { getScoreDelta, classifyLead, processScore, SCORE_MAP, THRESHOLDS };
+module.exports = { getScoreDelta, classifyLead, processScore, SCORE_MAP, THRESHOLDS, DEDUP_SCORED_EVENTS };

@@ -322,11 +322,32 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     `).get(user_id);
   }
 
+  // ── 5b. Per-value dedup — has this user already been scored for this
+  //         exact product / category before?  If yes, the event is still
+  //         recorded (for analytics) but earns 0 points.
+  let alreadyScored = false;
+  if (event_type === 'product_details' && event_value) {
+    const seen = db.prepare(`
+      SELECT 1 FROM events
+      WHERE user_id = ? AND event_type = 'product_details' AND product_id = ?
+      LIMIT 1
+    `).get(user_id, event_value);
+    alreadyScored = !!seen;
+  } else if (event_type === 'category_request' && productCategory) {
+    const seen = db.prepare(`
+      SELECT 1 FROM events
+      WHERE user_id = ? AND event_type = 'category_request' AND category = ?
+      LIMIT 1
+    `).get(user_id, productCategory);
+    alreadyScored = !!seen;
+  }
+
   // ── 6. Calculate new score & classification ───────────────────────────
   const { scoreDelta, newTotalScore, newLeadClass } = processScore(
     profile,
     event_type,
-    event_value
+    event_value,
+    alreadyScored
   );
 
   // ── 7. Detect context-specific flags ─────────────────────────────────
@@ -334,6 +355,10 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     .includes(event_type);
 
   const isProductEvent = event_type === 'product_details';
+
+  // Both product views AND category picks carry a category we want to persist
+  const isCategoryEvent = event_type === 'category_request';
+  const hasCategory     = (isProductEvent || isCategoryEvent) && !!productCategory;
 
   const isVisitConfirmed = event_type === 'visit_confirmed';
 
@@ -399,7 +424,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     newLeadClass,
     detectedBranch || null,
     lastProduct || null,
-    isProductEvent ? productCategory : null,
+    hasCategory ? productCategory : null,
     isProductEvent ? 1 : 0,
     session_count || null,
     isVisitConfirmed ? 1 : 0,
@@ -419,9 +444,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     INSERT INTO events (
       event_id, user_id, first_name, event_type, event_value,
       score_delta, session_count, current_score,
-      branch, product_id, raw_payload
+      branch, product_id, category, raw_payload
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     resolvedEventId,
     user_id,
@@ -433,6 +458,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     newTotalScore,
     detectedBranch || null,
     isProductEvent ? event_value : null,
+    hasCategory ? productCategory : null,
     JSON.stringify(req.body)
   );
 
@@ -1042,6 +1068,58 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     LIMIT 10
   `).all(fromDate, toDate, ...branchParam, ...campaignParam);
 
+  // ── Category demand breakdown ─────────────────────────────────────────
+  // Each category's total interest: product views + category picks + how
+  // many distinct customers and distinct models were involved.
+  const categories = db.prepare(`
+    SELECT
+      e.category                                                       AS category,
+      SUM(CASE WHEN e.event_type = 'product_details'  THEN 1 ELSE 0 END) AS product_views,
+      SUM(CASE WHEN e.event_type = 'category_request' THEN 1 ELSE 0 END) AS category_requests,
+      COUNT(DISTINCT e.user_id)                                        AS unique_users,
+      COUNT(DISTINCT CASE WHEN e.event_type = 'product_details'
+                          THEN e.event_value END)                      AS models_viewed
+    FROM events e
+    JOIN lead_profiles lp ON e.user_id = lp.user_id
+    WHERE e.category IS NOT NULL AND e.category != ''
+      AND e.event_type IN ('product_details','category_request')
+      AND date(e.created_at) BETWEEN ? AND ?
+      ${branchClause} ${campaignClause}
+    GROUP BY e.category
+    ORDER BY product_views DESC, category_requests DESC
+  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+
+  // ── Top products PER category ─────────────────────────────────────────
+  // Full per-model ranking inside each category (no LIMIT — the UI can
+  // show the top 50 of غرف النوم, top 50 of السفرة … independently).
+  const productsByCategoryRows = db.prepare(`
+    SELECT
+      e.category    AS category,
+      e.event_value AS product,
+      COUNT(*)                  AS views,
+      COUNT(DISTINCT e.user_id) AS unique_users
+    FROM events e
+    JOIN lead_profiles lp ON e.user_id = lp.user_id
+    WHERE e.event_type = 'product_details'
+      AND e.category IS NOT NULL AND e.category != ''
+      AND e.event_value IS NOT NULL
+      AND date(e.created_at) BETWEEN ? AND ?
+      ${branchClause} ${campaignClause}
+    GROUP BY e.category, e.event_value
+    ORDER BY e.category, views DESC
+  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+
+  // Nest products under their category for the frontend
+  const productsByCategory = {};
+  for (const row of productsByCategoryRows) {
+    if (!productsByCategory[row.category]) productsByCategory[row.category] = [];
+    productsByCategory[row.category].push({
+      product: row.product,
+      views: row.views,
+      unique_users: row.unique_users,
+    });
+  }
+
   // Campaigns in range
   const branchOnlyClause   = branch   ? `AND lp.preferred_branch = ?` : '';
   const campaignOnlyClause = campaign ? `AND lp.campaign_source = ?`  : '';
@@ -1077,6 +1155,8 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     eventsSeries,
     funnel:      funnel || { total_leads: 0, hot: 0, visited: 0, purchased: 0 },
     topProducts,
+    categories,
+    productsByCategory,
     campaigns,
     branches,
     meta: { from: fromDate, to: toDate, branch: branch || null, campaign: campaign || null },

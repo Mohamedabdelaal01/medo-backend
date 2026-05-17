@@ -45,6 +45,27 @@ function initializeDatabase() {
     if (!e.message.includes('duplicate column name')) throw e;
   }
 
+  // ── Category Migration — per-event product category ───────────────────
+  // Stores the furniture category (غرف النوم / السفرة / الانتريهات / الأطفال)
+  // on EVERY product_details & category_request event so analytics can break
+  // demand down per category instead of mixing all products together.
+  try {
+    db.exec(`ALTER TABLE events ADD COLUMN category TEXT`);
+    console.log('✅ Migration: category column added to events table');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+  // Composite index powers the per-user "already scored this product/category"
+  // dedup lookups in POST /api/events without a full table scan.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_events_user_type_prod
+      ON events(user_id, event_type, product_id);
+    CREATE INDEX IF NOT EXISTS idx_events_user_type_cat
+      ON events(user_id, event_type, category);
+    CREATE INDEX IF NOT EXISTS idx_events_category
+      ON events(category);
+  `);
+
   // ── Table 2: Lead Profiles ─────────────────────────────────────────────
   // One row per user — updated on every event.
   // visit_at: timestamp of the first confirmed showroom visit (Phase 3).
