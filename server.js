@@ -1137,6 +1137,27 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     ORDER BY leads DESC
   `).all(fromDate, toDate, ...branchParam);
 
+  // ── Ad funnel — per campaign+ad, how far did customers get? ───────────
+  // The key question: each ad reached how many customers up to
+  // location_request (the strongest pre-visit buying signal).
+  const adFunnel = db.prepare(`
+    SELECT
+      COALESCE(lp.campaign_source, 'بدون حملة')                              AS campaign_source,
+      COALESCE(lp.ad_id, '—')                                               AS ad_id,
+      COUNT(DISTINCT lp.user_id)                                            AS leads,
+      SUM(CASE WHEN lp.product_view_count > 0 THEN 1 ELSE 0 END)            AS product_viewers,
+      SUM(CASE WHEN lp.location_requested = 1 THEN 1 ELSE 0 END)            AS location_requests,
+      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted')
+               THEN 1 ELSE 0 END)                                          AS visited,
+      SUM(CASE WHEN lp.lead_class = 'purchased' THEN 1 ELSE 0 END)         AS purchased
+    FROM lead_profiles lp
+    WHERE lp.campaign_source IS NOT NULL
+      AND date(lp.created_at) BETWEEN ? AND ?
+      ${branchOnlyClause}
+    GROUP BY lp.campaign_source, lp.ad_id
+    ORDER BY location_requests DESC, leads DESC
+  `).all(fromDate, toDate, ...branchParam);
+
   // Branch breakdown in range
   const branches = db.prepare(`
     SELECT
@@ -1158,6 +1179,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     categories,
     productsByCategory,
     campaigns,
+    adFunnel,
     branches,
     meta: { from: fromDate, to: toDate, branch: branch || null, campaign: campaign || null },
   });
