@@ -3,10 +3,30 @@
 
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grand_furniture.db');
+// ── Persistent DB path resolution ─────────────────────────────────────────
+// Priority:
+//   1. DB_PATH env var (explicit override)
+//   2. A writable /data dir → the Railway Volume mount convention. Once a
+//      volume is attached at /data in the Railway dashboard, the DB lives
+//      there and SURVIVES redeploys — no env var needed.
+//   3. Local file next to the code (dev, or prod without a volume = EPHEMERAL)
+function resolveDbPath() {
+  if (process.env.DB_PATH) return process.env.DB_PATH;
+  try {
+    if (fs.existsSync('/data')) {
+      fs.accessSync('/data', fs.constants.W_OK);
+      return '/data/grand_furniture.db';
+    }
+  } catch (_) { /* /data not writable — fall through */ }
+  return path.join(__dirname, 'grand_furniture.db');
+}
+
+const DB_PATH = resolveDbPath();
+const DB_PERSISTENT = !!process.env.DB_PATH || DB_PATH.startsWith('/data');
 
 function initializeDatabase() {
   const db = new Database(DB_PATH);
@@ -317,6 +337,12 @@ function initializeDatabase() {
   }
 
   console.log('✅ Database initialized at:', DB_PATH);
+  if (DB_PERSISTENT) {
+    console.log('💾 Storage: PERSISTENT — data survives redeploys ✅');
+  } else {
+    console.warn('⚠️  Storage: EPHEMERAL — data is WIPED on every redeploy.');
+    console.warn('⚠️  Fix (free): Railway → service → Variables/Volumes → add a Volume mounted at /data, then redeploy.');
+  }
   return db;
 }
 
