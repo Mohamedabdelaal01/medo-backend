@@ -31,6 +31,35 @@ function getSetting(key, fallback = null) {
   }
 }
 
+// ── Auto-assignment ───────────────────────────────────────────────────────────
+// Assigns an unassigned lead to the rep with the FEWEST active leads
+// (active = not purchased/converted). Returns the rep name or null.
+// Safe & best-effort: never throws into the webhook path.
+function autoAssignLead(db, userId, leadName) {
+  try {
+    const pick = db.prepare(`
+      SELECT u.name AS rep,
+        (SELECT COUNT(*) FROM lead_profiles lp
+           WHERE lp.assigned_rep = u.name
+             AND lp.lead_class NOT IN ('purchased','converted')) AS load
+      FROM users u
+      WHERE u.role != 'admin'
+      ORDER BY load ASC, u.name ASC
+      LIMIT 1
+    `).get();
+
+    if (!pick || !pick.rep) return null; // no reps exist yet
+
+    db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
+      .run(pick.rep, userId);
+    console.log(`👤 AUTO-ASSIGN: ${leadName || userId} → ${pick.rep} (load was ${pick.load})`);
+    return pick.rep;
+  } catch (e) {
+    console.warn('[auto-assign] failed:', e.message);
+    return null;
+  }
+}
+
 // ── API Protection Layer — In-Memory State ────────────────────────────────────
 // All state is intentionally in-memory:
 //   - No DB schema changes
@@ -520,6 +549,20 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     console.log(`🔴 HOT LEAD: ${first_name || user_id} — Score: ${newTotalScore} — Branch: ${detectedBranch || 'unknown'}`);
   }
 
+  // ── Auto-assign on first qualification (cold → warm/hot) ──────────────
+  // Fires once when the lead first becomes warm (or jumps straight to hot)
+  // and isn't already owned by a rep. Toggle: settings.auto_assign_enabled.
+  const becameQualified =
+    ['warm', 'hot'].includes(newLeadClass) &&
+    ['cold', '', null, undefined].includes(profile.lead_class);
+  if (
+    becameQualified &&
+    !profile.assigned_rep &&
+    getSetting('auto_assign_enabled', 'true') === 'true'
+  ) {
+    autoAssignLead(db, user_id, first_name);
+  }
+
   // Alert on transition into visited (new) or legacy converted
   if (newLeadClass === 'visited' && profile.lead_class !== 'visited' && profile.lead_class !== 'converted') {
     console.log(`🏪 VISITED: ${first_name || user_id} — Score: ${newTotalScore} — Branch: ${detectedBranch || 'unknown'}`);
@@ -850,6 +893,83 @@ app.put('/api/leads/:user_id/assign', requireAuth, requireRole('admin'), (req, r
     .run(rep_name || null, req.params.user_id);
 
   return res.json({ ok: true, user_id: req.params.user_id, assigned_rep: rep_name || null });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tasks — rep follow-up reminders
+//   POST   /api/tasks            create { lead_id, due_at, note, source? }
+//   GET    /api/tasks?status=    list (rep sees own; admin sees all / ?rep=)
+//   PATCH  /api/tasks/:id        { status: 'done' | 'pending' }
+//   DELETE /api/tasks/:id        delete (owner or admin)
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/tasks', requireAuth, (req, res) => {
+  const { lead_id, due_at, note, source } = req.body || {};
+  if (!lead_id || typeof lead_id !== 'string') {
+    return res.status(400).json({ error: 'lead_id is required' });
+  }
+  if (!due_at || !/^\d{4}-\d{2}-\d{2}$/.test(due_at)) {
+    return res.status(400).json({ error: 'due_at must be YYYY-MM-DD' });
+  }
+  const db = getDb();
+  const lead = db.prepare(`SELECT first_name FROM lead_profiles WHERE user_id = ?`).get(lead_id);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+
+  const repName = req.user?.name || 'مندوب';
+  const info = db.prepare(`
+    INSERT INTO tasks (lead_id, lead_name, rep_name, due_at, note, source)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(lead_id, lead.first_name || null, repName, due_at,
+         (note || '').slice(0, 500), source === 'reschedule' ? 'reschedule' : 'manual');
+
+  return res.json({ ok: true, id: info.lastInsertRowid });
+});
+
+app.get('/api/tasks', requireAuth, (req, res) => {
+  const db = getDb();
+  const isAdmin = req.user?.role === 'admin';
+  const status  = req.query.status || 'pending';
+  const where = [];
+  const params = [];
+
+  if (!isAdmin) { where.push('rep_name = ?'); params.push(req.user?.name || ''); }
+  else if (req.query.rep) { where.push('rep_name = ?'); params.push(req.query.rep); }
+  if (req.query.lead_id) { where.push('lead_id = ?'); params.push(req.query.lead_id); }
+  if (status !== 'all') { where.push('status = ?'); params.push(status); }
+
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const rows = db.prepare(`
+    SELECT * FROM tasks ${clause}
+    ORDER BY (status = 'done') ASC, due_at ASC, created_at ASC
+  `).all(...params);
+
+  return res.json({ tasks: rows });
+});
+
+app.patch('/api/tasks/:id', requireAuth, (req, res) => {
+  const db = getDb();
+  const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'task_not_found' });
+  if (req.user?.role !== 'admin' && task.rep_name !== req.user?.name) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const status = req.body?.status === 'done' ? 'done' : 'pending';
+  db.prepare(`
+    UPDATE tasks
+    SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE NULL END
+    WHERE id = ?
+  `).run(status, status, req.params.id);
+  return res.json({ ok: true });
+});
+
+app.delete('/api/tasks/:id', requireAuth, (req, res) => {
+  const db = getDb();
+  const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'task_not_found' });
+  if (req.user?.role !== 'admin' && task.rep_name !== req.user?.name) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  db.prepare(`DELETE FROM tasks WHERE id = ?`).run(req.params.id);
+  return res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════════════════════

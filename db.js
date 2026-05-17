@@ -215,6 +215,25 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_messages_sent_user ON messages_sent(user_id, sent_at DESC);
   `);
 
+  // tasks: rep follow-up reminders. due_at is a plain YYYY-MM-DD (showroom
+  // reps think in days, not timestamps). status: 'pending' | 'done'.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      lead_id      TEXT NOT NULL,
+      lead_name    TEXT,
+      rep_name     TEXT NOT NULL,
+      due_at       TEXT NOT NULL,
+      note         TEXT,
+      source       TEXT NOT NULL DEFAULT 'manual',
+      status       TEXT NOT NULL DEFAULT 'pending',
+      created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+      completed_at DATETIME
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_rep    ON tasks(rep_name, status, due_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_lead   ON tasks(lead_id);
+  `);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
@@ -285,6 +304,8 @@ function initializeDatabase() {
     // Webhook security — secret is auto-generated below; enforcement is opt-in
     // so existing ManyChat setups don't break the moment this ships.
     ['webhook_enforce',        'false'],
+    // Auto-assign a lead to the least-loaded rep when it first turns warm.
+    ['auto_assign_enabled',    'true'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
