@@ -87,10 +87,13 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Simple request logger
+// Request logger — skip health checks (Railway pings them constantly) and
+// stay quiet in production to avoid log bloat. Set LOG_REQUESTS=1 to force on.
+const LOG_REQUESTS = process.env.LOG_REQUESTS === '1' || process.env.NODE_ENV !== 'production';
 app.use((req, res, next) => {
-  const time = new Date().toISOString();
-  console.log(`[${time}] ${req.method} ${req.path}`);
+  if (LOG_REQUESTS && req.path !== '/health') {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  }
   next();
 });
 
