@@ -1016,8 +1016,8 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
   const profile = db.prepare(`SELECT * FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!profile) return res.status(404).json({ error: 'Lead not found' });
 
-  const history = db.prepare(`
-    SELECT event_type, event_value, category, product_id, score_delta, created_at
+  let history = db.prepare(`
+    SELECT event_type, event_value, category, product_id, branch, score_delta, created_at
     FROM events WHERE user_id = ?
     ORDER BY created_at DESC
     LIMIT 50
@@ -1029,14 +1029,14 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
     WHERE user_id = ? ORDER BY created_at DESC
   `).all(user_id).map(r => r.phone);
 
-  const visits = db.prepare(`
+  let visits = db.prepare(`
     SELECT branch, visited_at FROM lead_visits
     WHERE user_id = ? ORDER BY visited_at DESC
   `).all(user_id);
 
   // Every branch the customer ASKED about (branch_selected) — a customer
   // comparing 2 branches must show both, not just the latest preferred_branch.
-  const requestedBranches = db.prepare(`
+  let requestedBranches = db.prepare(`
     SELECT
       COALESCE(NULLIF(event_value,''), branch) AS branch,
       MIN(created_at) AS first_at,
@@ -1047,6 +1047,18 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
     GROUP BY COALESCE(NULLIF(event_value,''), branch)
     ORDER BY last_at DESC
   `).all(user_id);
+
+  // Reception accounts see ONLY their own branch — never other branches the
+  // customer also asked about. Admin/rep see everything.
+  if (req.user?.role === 'reception' && req.user.branch) {
+    const b = req.user.branch;
+    profile.preferred_branch = b;
+    visits = visits.filter(v => v.branch === b);
+    requestedBranches = requestedBranches.filter(r => r.branch === b);
+    history = history.filter(h =>
+      h.event_type !== 'branch_selected' || h.event_value === b || h.branch === b
+    );
+  }
 
   return res.json({ profile, history, phones, visits, requestedBranches });
 });
