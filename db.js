@@ -166,6 +166,7 @@ function initializeDatabase() {
     { col: 'purchased_at',            type: 'DATETIME' },
     { col: 'location_reminder_sent',  type: 'DATETIME' },
     { col: 'last_category',           type: 'TEXT'     }, // product category from ManyChat
+    { col: 'phone',                   type: 'TEXT'     }, // normalized phone → reception lookup
   ];
   for (const { col, type } of o2oColumns) {
     try {
@@ -181,6 +182,14 @@ function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_profiles_visit_code
     ON lead_profiles(visit_code)
     WHERE visit_code IS NOT NULL
+  `);
+
+  // Non-unique index on phone — reception looks leads up by phone. NOT unique
+  // because two FB users could share a phone (family); we match the most recent.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_lead_profiles_phone
+    ON lead_profiles(phone)
+    WHERE phone IS NOT NULL
   `);
 
   // purchases: one row per offline sale, linked by user_id

@@ -31,6 +31,22 @@ function getSetting(key, fallback = null) {
   }
 }
 
+// ── Phone normalization ───────────────────────────────────────────────────────
+// Collapses every way an Egyptian number can be typed/sent to ONE canonical
+// local form (01XXXXXXXXX), so the phone the customer types in ManyChat and
+// the phone the receptionist types both match the same stored value.
+//   "+20 101 234 5678" / "00201012345678" / "201012345678" / "01012345678"
+//   → all become "01012345678"
+function normalizePhone(raw) {
+  if (raw == null) return null;
+  let d = String(raw).replace(/\D/g, '');          // digits only
+  if (!d) return null;
+  d = d.replace(/^00/, '');                          // drop intl "00" prefix
+  if (d.startsWith('20') && d.length >= 11) d = d.slice(2); // drop EG country code
+  if (d.length === 10 && d[0] !== '0') d = '0' + d;  // 1012345678 → 01012345678
+  return d;
+}
+
 // ── Auto-assignment ───────────────────────────────────────────────────────────
 // Assigns an unassigned lead to the rep with the FEWEST active leads
 // (active = not purchased/converted). Returns the rep name or null.
@@ -321,10 +337,14 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     campaign_source,
     ad_id,
     visit_code,
+    phone,
     // ManyChat product fields — fallback when event_value not provided
     product,
     category,
   } = req.body;
+
+  // Canonical phone (used as the reception lookup key — replaces visit code)
+  const normPhone = normalizePhone(phone);
 
   // Normalise: ManyChat flows send "product" & "category" instead of event_value.
   // Use event_value when present; fall back to product name for product_details events.
@@ -383,9 +403,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   if (!profile) {
     db.prepare(`
-      INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(user_id, first_name || 'Unknown', campaign_source || null, ad_id || null, visit_code || null);
+      INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(user_id, first_name || 'Unknown', campaign_source || null, ad_id || null, visit_code || null, normPhone || null);
 
     profile = db.prepare(`
       SELECT * FROM lead_profiles WHERE user_id = ?
@@ -486,6 +506,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       campaign_source     = COALESCE(campaign_source, ?),
       ad_id               = COALESCE(ad_id, ?),
       visit_code          = COALESCE(visit_code, ?),
+      phone               = COALESCE(?, phone),
       last_activity       = datetime('now')
     WHERE user_id = ?
   `).run(
@@ -503,6 +524,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     campaign_source || null,
     ad_id || null,
     visit_code || null,
+    normPhone || null,
     user_id
   );
 
@@ -669,7 +691,7 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     SELECT user_id, first_name, total_score, lead_class,
            preferred_branch, last_product, last_activity,
            visit_confirmed, location_requested,
-           campaign_source, ad_id, visit_code
+           campaign_source, ad_id, visit_code, phone
     FROM lead_profiles
     WHERE lead_class IN ('hot', 'visited', 'purchased', 'converted')
   `).all();
@@ -993,27 +1015,38 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/visits/confirm — Receptionist scans/enters visit code to confirm
-// a lead physically arrived at the showroom.
-// Body: { visit_code }
+// POST /api/visits/confirm — Receptionist confirms a lead arrived.
+// Primary: { phone }  (customer gave their number in ManyChat)
+// Fallback: { visit_code }  (legacy — still works)
 // Returns: { ok, user_id, first_name, campaign_source, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
-  const { visit_code } = req.body || {};
-  if (!visit_code || typeof visit_code !== 'string' || !visit_code.trim()) {
-    return res.status(400).json({ error: 'visit_code is required' });
-  }
+  const { phone, visit_code } = req.body || {};
   const db = getDb();
-  const lead = db.prepare(`
-    SELECT user_id, first_name, campaign_source, lead_class, visit_confirmed
-    FROM lead_profiles WHERE visit_code = ?
-  `).get(visit_code.trim());
 
-  if (!lead) {
-    return res.status(404).json({ error: 'visit_code_not_found' });
+  let lead = null;
+  if (phone != null && String(phone).trim() !== '') {
+    const np = normalizePhone(phone);
+    if (!np) return res.status(400).json({ error: 'invalid_phone' });
+    // Most recent lead with this phone (phone is not unique — family devices)
+    lead = db.prepare(`
+      SELECT user_id, first_name, campaign_source, lead_class, visit_confirmed
+      FROM lead_profiles WHERE phone = ?
+      ORDER BY last_activity DESC LIMIT 1
+    `).get(np);
+    if (!lead) return res.status(404).json({ error: 'phone_not_found' });
+  } else if (visit_code != null && String(visit_code).trim() !== '') {
+    lead = db.prepare(`
+      SELECT user_id, first_name, campaign_source, lead_class, visit_confirmed
+      FROM lead_profiles WHERE visit_code = ?
+    `).get(String(visit_code).trim());
+    if (!lead) return res.status(404).json({ error: 'visit_code_not_found' });
+  } else {
+    return res.status(400).json({ error: 'phone_required' });
   }
 
-  // Mark as visited (idempotent — won't downgrade a purchased lead)
+  // Mark as visited (idempotent — won't downgrade a purchased lead).
+  // Update by user_id so it works whether we matched by phone or code.
   const newClass = lead.lead_class === 'purchased' ? 'purchased' : 'visited';
   db.prepare(`
     UPDATE lead_profiles SET
@@ -1021,10 +1054,10 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       visit_confirmed = 1,
       visit_at        = CASE WHEN visit_at IS NULL THEN datetime('now') ELSE visit_at END,
       last_activity   = datetime('now')
-    WHERE visit_code = ?
-  `).run(newClass, visit_code.trim());
+    WHERE user_id = ?
+  `).run(newClass, lead.user_id);
 
-  console.log(`🏪 VISIT CONFIRMED via code: ${visit_code} → ${lead.first_name || lead.user_id} (${lead.campaign_source || 'no campaign'})`);
+  console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} (${lead.campaign_source || 'no campaign'})`);
 
   // Event-Triggered Flow: Visit Confirmed
   const visitFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_visit_flow'`).get();
