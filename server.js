@@ -906,7 +906,14 @@ app.get('/api/leads', requireAuth, (req, res) => {
   const total = db.prepare(`SELECT COUNT(*) as n FROM lead_profiles ${where}`).get(...params).n;
 
   const leads = db.prepare(`
-    SELECT * FROM lead_profiles
+    SELECT lead_profiles.*,
+      (SELECT COALESCE(NULLIF(e.event_value,''), e.branch)
+         FROM events e
+         WHERE e.user_id = lead_profiles.user_id
+           AND e.event_type = 'branch_selected'
+           AND COALESCE(NULLIF(e.event_value,''), e.branch) IS NOT NULL
+         ORDER BY e.created_at DESC LIMIT 1) AS requested_branch
+    FROM lead_profiles
     ${where}
     ORDER BY total_score DESC, last_activity DESC
     LIMIT ? OFFSET ?
