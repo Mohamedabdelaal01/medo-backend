@@ -1030,7 +1030,7 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
   `).all(user_id).map(r => r.phone);
 
   let visits = db.prepare(`
-    SELECT branch, visited_at FROM lead_visits
+    SELECT branch, visited_at, sales_rep FROM lead_visits
     WHERE user_id = ? ORDER BY visited_at DESC
   `).all(user_id);
 
@@ -1193,14 +1193,16 @@ app.get('/api/reception/leads', requireAuth, (req, res) => {
       (SELECT GROUP_CONCAT(ph.phone, ' ، ')
          FROM lead_phones ph WHERE ph.user_id = lp.user_id)            AS phones,
       (SELECT v.visited_at FROM lead_visits v
-         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS visited_at
+         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS visited_at,
+      (SELECT v.sales_rep FROM lead_visits v
+         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS sales_rep
     FROM events e
     JOIN lead_profiles lp ON lp.user_id = e.user_id
     WHERE e.event_type = 'branch_selected'
       AND (e.event_value = ? OR e.branch = ?)
     GROUP BY lp.user_id
     ORDER BY (visited_at IS NOT NULL) ASC, last_requested DESC
-  `).all(branch, branch, branch);
+  `).all(branch, branch, branch, branch);
 
   // total branch_selected events for this branch (helps the admin debug
   // an id mismatch between ManyChat / Settings / the reception account)
@@ -1210,6 +1212,160 @@ app.get('/api/reception/leads', requireAuth, (req, res) => {
   `).get(branch, branch).n;
 
   return res.json({ branch, count: rows.length, total: totalForBranch, leads: rows });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/reps — list showroom salespeople (role='sales').
+//   reception → locked to its own branch. admin → all or ?branch=
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/reps', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (!['reception', 'admin', 'sales'].includes(role)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'reception' ? (req.user.branch || null) : (req.query.branch || null);
+  const db = getDb();
+  const rows = branch
+    ? db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND branch=? ORDER BY name`).all(branch)
+    : db.prepare(`SELECT name, branch FROM users WHERE role='sales' ORDER BY name`).all();
+  return res.json({ reps: rows });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/visits/set-sales — reception attaches the salesperson who served.
+// Body: { user_id, sales_rep }   (reception → own branch; admin → ?branch)
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/visits/set-sales', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (!['reception', 'admin'].includes(role)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const { user_id, sales_rep, branch: bodyBranch } = req.body || {};
+  if (!user_id || !sales_rep) {
+    return res.status(400).json({ error: 'user_id and sales_rep required' });
+  }
+  const branch = role === 'reception' ? (req.user.branch || null) : (bodyBranch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db = getDb();
+  // Attach to the existing visit row for this branch; create it if the
+  // salesperson is being set without a prior confirm (robust).
+  const existing = db.prepare(
+    `SELECT id FROM lead_visits WHERE user_id=? AND branch=?`
+  ).get(user_id, branch);
+  if (existing) {
+    db.prepare(`UPDATE lead_visits SET sales_rep=? WHERE id=?`).run(sales_rep, existing.id);
+  } else {
+    db.prepare(
+      `INSERT INTO lead_visits (user_id, branch, sales_rep) VALUES (?,?,?)`
+    ).run(user_id, branch, sales_rep);
+  }
+  console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${sales_rep}`);
+  return res.json({ ok: true, user_id, branch, sales_rep });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/my — a salesperson's own customers + this-month KPIs.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/my', requireAuth, (req, res) => {
+  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+  const me = req.user.name;
+  const db = getDb();
+
+  const customers = db.prepare(`
+    SELECT
+      lp.user_id, lp.first_name, lp.lead_class, lp.total_score, lp.last_activity,
+      v.branch, v.visited_at,
+      (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
+         WHERE ph.user_id = lp.user_id)                                  AS phones,
+      (SELECT COUNT(*)        FROM purchases p
+         WHERE p.user_id = lp.user_id AND p.rep = ?)                      AS my_purchases,
+      (SELECT COALESCE(SUM(p.price),0) FROM purchases p
+         WHERE p.user_id = lp.user_id AND p.rep = ?)                      AS my_sales_total
+    FROM lead_visits v
+    JOIN lead_profiles lp ON lp.user_id = v.user_id
+    WHERE v.sales_rep = ?
+    ORDER BY (my_purchases > 0) ASC, v.visited_at DESC
+  `).all(me, me, me);
+
+  // This-month performance
+  const servedMonth = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits
+    WHERE sales_rep = ? AND strftime('%Y-%m', visited_at) = strftime('%Y-%m','now')
+  `).get(me).n;
+  const boughtMonth = db.prepare(`
+    SELECT COUNT(DISTINCT v.user_id) AS n
+    FROM lead_visits v
+    JOIN purchases p ON p.user_id = v.user_id AND p.rep = ?
+    WHERE v.sales_rep = ?
+      AND strftime('%Y-%m', p.created_at) = strftime('%Y-%m','now')
+  `).get(me, me).n;
+  const salesMonth = db.prepare(`
+    SELECT COALESCE(SUM(price),0) AS total FROM purchases
+    WHERE rep = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m','now')
+  `).get(me).total;
+
+  const kpis = {
+    served_month:  servedMonth,
+    bought_month:  boughtMonth,
+    sales_month:   salesMonth,
+    close_rate:    servedMonth ? Math.round((boughtMonth / servedMonth) * 100) : 0,
+  };
+
+  return res.json({ kpis, customers });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/analytics — admin: per-salesperson + per-branch sales.
+// Filters: ?sales= &branch= &from= &to=  (dates apply to visited_at)
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const { sales, branch, from, to } = req.query;
+  const where = [`v.sales_rep IS NOT NULL`];
+  const params = [];
+  if (sales)  { where.push(`v.sales_rep = ?`);              params.push(sales); }
+  if (branch) { where.push(`v.branch = ?`);                 params.push(branch); }
+  if (from)   { where.push(`date(v.visited_at) >= ?`);      params.push(from); }
+  if (to)     { where.push(`date(v.visited_at) <= ?`);      params.push(to); }
+  const clause = where.join(' AND ');
+
+  const bySales = db.prepare(`
+    SELECT
+      v.sales_rep AS sales_rep,
+      v.branch    AS branch,
+      COUNT(DISTINCT v.user_id) AS served,
+      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
+      COALESCE(SUM(DISTINCT_PRICE.amount),0) AS total_sales
+    FROM lead_visits v
+    LEFT JOIN purchases p
+      ON p.user_id = v.user_id AND p.rep = v.sales_rep
+    LEFT JOIN (
+      SELECT user_id, rep, SUM(price) AS amount FROM purchases GROUP BY user_id, rep
+    ) DISTINCT_PRICE ON DISTINCT_PRICE.user_id = v.user_id AND DISTINCT_PRICE.rep = v.sales_rep
+    WHERE ${clause}
+    GROUP BY v.sales_rep, v.branch
+    ORDER BY total_sales DESC
+  `).all(...params);
+
+  const enriched = bySales.map(r => ({
+    ...r,
+    not_bought: r.served - r.bought,
+    close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
+  }));
+
+  const byBranch = db.prepare(`
+    SELECT v.branch AS branch,
+      COUNT(DISTINCT v.user_id) AS served,
+      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought
+    FROM lead_visits v
+    LEFT JOIN purchases p ON p.user_id = v.user_id
+    WHERE ${clause}
+    GROUP BY v.branch
+    ORDER BY bought DESC
+  `).all(...params);
+
+  return res.json({ bySales: enriched, byBranch });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1639,7 +1795,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
   // Branch only meaningful for reception accounts
-  const branchVal = role === 'reception' ? (branch || null) : null;
+  const branchVal = ['reception', 'sales'].includes(role) ? (branch || null) : null;
   const db   = getDb();
   const hash = bcrypt.hashSync(password, 10);
   try {
@@ -1666,7 +1822,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (role)     { updates.push('role = ?');          params.push(role); }
   if (password) { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
   // Set branch for reception accounts; clear it for any other role
-  if (role)     { updates.push('branch = ?');        params.push(role === 'reception' ? (branch || null) : null); }
+  if (role)     { updates.push('branch = ?');        params.push(['reception','sales'].includes(role) ? (branch || null) : null); }
   else if (branch !== undefined) { updates.push('branch = ?'); params.push(branch || null); }
 
   if (!updates.length) {

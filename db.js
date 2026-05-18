@@ -270,6 +270,15 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_lead_visits_user ON lead_visits(user_id);
   `);
 
+  // sales_rep — the showroom salesperson reception attached to this visit
+  try {
+    db.exec(`ALTER TABLE lead_visits ADD COLUMN sales_rep TEXT`);
+    console.log('✅ Migration: sales_rep column added to lead_visits');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_sales ON lead_visits(sales_rep)`);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
