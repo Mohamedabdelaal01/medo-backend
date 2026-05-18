@@ -474,15 +474,19 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     }
   }
 
-  // Detect branch from event_value.
-  // For visit_confirmed with structured payload, use the explicit branch field.
-  // For all other cases, search for a known branch name inside the string value.
+  // Detect branch:
+  //  - visit_confirmed structured payload → explicit branch field
+  //  - branch_selected → event_value IS the branch the customer picked
+  //    (use it directly — works for ANY branch id, not a hardcoded list)
+  //  - otherwise → try a known-id substring match, else keep existing
   const BRANCHES = ['nasr_city', 'maadi', 'helwan', 'faisal', 'ain_shams'];
   const detectedBranch = visitPayload?.branch
     ? visitPayload.branch
-    : event_value
-      ? BRANCHES.find(b => event_value.includes(b)) || profile.preferred_branch
-      : profile.preferred_branch;
+    : (event_type === 'branch_selected' && event_value)
+      ? event_value.trim()
+      : event_value
+        ? BRANCHES.find(b => event_value.includes(b)) || profile.preferred_branch
+        : profile.preferred_branch;
 
   // Detect product from event_value (if it's a product event)
   const lastProduct = isProductEvent
@@ -885,8 +889,13 @@ app.get('/api/leads', requireAuth, (req, res) => {
     params.push(leadClass);
   }
   if (branch) {
-    where += ` AND preferred_branch = ?`;
-    params.push(branch);
+    // Match the branch the customer actually requested (branch_selected
+    // event_value/branch) — not only the fragile preferred_branch.
+    where += ` AND (preferred_branch = ? OR user_id IN (
+      SELECT user_id FROM events
+      WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
+    ))`;
+    params.push(branch, branch, branch);
   }
   if (search) {
     where += ` AND first_name LIKE ?`;
