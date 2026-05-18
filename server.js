@@ -1041,8 +1041,11 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
 // Returns: { ok, user_id, first_name, campaign_source, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
-  const { phone, visit_code } = req.body || {};
+  const { phone, visit_code, branch } = req.body || {};
   const db = getDb();
+  // The receptionist explicitly picks the branch they're at — that is the
+  // source of truth for WHICH branch was visited (no guessing from intent).
+  const pickedBranch = (typeof branch === 'string' && branch.trim()) ? branch.trim() : null;
 
   let lead = null;
   if (phone != null && String(phone).trim() !== '') {
@@ -1091,15 +1094,17 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     WHERE user_id = ?
   `).run(newClass, lead.user_id);
 
-  // Record THIS branch visit separately — visiting حلوان later must not erase
-  // an earlier فيصل visit. One row per (customer, branch).
-  if (lead.preferred_branch) {
+  // Record THIS branch visit separately. The receptionist's explicit choice
+  // wins; fall back to the lead's last intent only if none was picked.
+  // visiting حلوان later must not erase an earlier فيصل visit (one row each).
+  const visitBranch = pickedBranch || lead.preferred_branch || null;
+  if (visitBranch) {
     db.prepare(`
       INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)
-    `).run(lead.user_id, lead.preferred_branch);
+    `).run(lead.user_id, visitBranch);
   }
 
-  console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${lead.preferred_branch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
+  console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${visitBranch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
   // Event-Triggered Flow: Visit Confirmed
   const visitFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_visit_flow'`).get();
@@ -1115,7 +1120,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     user_id:         lead.user_id,
     first_name:      lead.first_name || 'غير معروف',
     campaign_source: lead.campaign_source || null,
-    branch:          lead.preferred_branch || null,
+    branch:          visitBranch || null,
     lead_class:      newClass,
   });
 });
