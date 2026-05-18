@@ -1369,6 +1369,72 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/branch/overview — branch manager's read-only view of THEIR branch.
+//   branch_manager → locked to its own branch. admin → ?branch=<id>
+//   Returns branch KPIs + per-salesperson performance for that branch only.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/branch/overview', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (role !== 'branch_manager' && role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.query.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db = getDb();
+
+  // Customers who requested this branch (branch_selected) — even if not visited
+  const requested = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n FROM events
+    WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
+  `).get(branch, branch).n;
+
+  // Customers who actually visited this branch (one row per user/branch)
+  const visited = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE branch = ?
+  `).get(branch).n;
+
+  // Per-salesperson performance in this branch (same logic as admin analytics)
+  const bySales = db.prepare(`
+    SELECT
+      v.sales_rep AS sales_rep,
+      COUNT(DISTINCT v.user_id) AS served,
+      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
+      COALESCE(SUM(DP.amount),0) AS total_sales
+    FROM lead_visits v
+    LEFT JOIN purchases p ON p.user_id = v.user_id AND p.rep = v.sales_rep
+    LEFT JOIN (
+      SELECT user_id, rep, SUM(price) AS amount FROM purchases GROUP BY user_id, rep
+    ) DP ON DP.user_id = v.user_id AND DP.rep = v.sales_rep
+    WHERE v.branch = ? AND v.sales_rep IS NOT NULL
+    GROUP BY v.sales_rep
+    ORDER BY total_sales DESC
+  `).all(branch).map(r => ({
+    ...r,
+    not_bought: r.served - r.bought,
+    close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
+  }));
+
+  const served      = bySales.reduce((s, r) => s + r.served, 0);
+  const bought      = bySales.reduce((s, r) => s + r.bought, 0);
+  const totalSales  = bySales.reduce((s, r) => s + r.total_sales, 0);
+
+  return res.json({
+    branch,
+    kpis: {
+      requested,
+      visited,
+      bought,
+      total_sales: totalSales,
+      close_rate: served ? Math.round((bought / served) * 100) : 0,
+    },
+    bySales,
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/purchases — Sales rep records an offline purchase for a lead.
 // Body: { user_id, product_id?, price?, branch?, notes? }
 // Returns: { ok, purchase_id, lead_class }
@@ -1795,7 +1861,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
   // Branch only meaningful for reception accounts
-  const branchVal = ['reception', 'sales'].includes(role) ? (branch || null) : null;
+  const branchVal = ['reception', 'sales', 'branch_manager'].includes(role) ? (branch || null) : null;
   const db   = getDb();
   const hash = bcrypt.hashSync(password, 10);
   try {
@@ -1822,7 +1888,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (role)     { updates.push('role = ?');          params.push(role); }
   if (password) { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
   // Set branch for reception accounts; clear it for any other role
-  if (role)     { updates.push('branch = ?');        params.push(['reception','sales'].includes(role) ? (branch || null) : null); }
+  if (role)     { updates.push('branch = ?');        params.push(['reception','sales','branch_manager'].includes(role) ? (branch || null) : null); }
   else if (branch !== undefined) { updates.push('branch = ?'); params.push(branch || null); }
 
   if (!updates.length) {
