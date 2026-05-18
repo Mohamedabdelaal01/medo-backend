@@ -983,7 +983,7 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Lead not found' });
 
   const history = db.prepare(`
-    SELECT event_type, event_value, score_delta, created_at
+    SELECT event_type, event_value, category, product_id, score_delta, created_at
     FROM events WHERE user_id = ?
     ORDER BY created_at DESC
     LIMIT 50
