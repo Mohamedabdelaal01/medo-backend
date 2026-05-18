@@ -300,10 +300,20 @@ function initializeDatabase() {
     );
   `);
 
+  // users.branch — which branch a "reception" account belongs to
+  // (NULL for admin/rep). Migration is idempotent.
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN branch TEXT`);
+    console.log('✅ Migration: branch column added to users');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
   // New performance indexes
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at);
     CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases(created_at);
+    CREATE INDEX IF NOT EXISTS idx_events_branch_type ON events(branch, event_type);
   `);
 
   // ── Seed default admin (idempotent) ───────────────────────────────────────

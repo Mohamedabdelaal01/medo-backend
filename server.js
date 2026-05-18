@@ -304,7 +304,10 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ error: 'بيانات الدخول غير صحيحة' });
   }
 
-  const payload = { id: user.id, name: user.name, email: user.email, role: user.role };
+  const payload = {
+    id: user.id, name: user.name, email: user.email,
+    role: user.role, branch: user.branch || null,
+  };
   const token   = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
   return res.json({ token, user: payload });
 });
@@ -1041,14 +1044,24 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
 // Returns: { ok, user_id, first_name, campaign_source, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
-  const { phone, visit_code, branch } = req.body || {};
+  const { phone, visit_code, branch, user_id } = req.body || {};
   const db = getDb();
   // The receptionist explicitly picks the branch they're at — that is the
   // source of truth for WHICH branch was visited (no guessing from intent).
-  const pickedBranch = (typeof branch === 'string' && branch.trim()) ? branch.trim() : null;
+  // A reception account is LOCKED to its own branch (can't confirm for others).
+  const pickedBranch = req.user?.role === 'reception'
+    ? (req.user.branch || null)
+    : ((typeof branch === 'string' && branch.trim()) ? branch.trim() : null);
 
   let lead = null;
-  if (phone != null && String(phone).trim() !== '') {
+  if (user_id != null && String(user_id).trim() !== '') {
+    lead = db.prepare(`
+      SELECT user_id, first_name, campaign_source, lead_class,
+             visit_confirmed, preferred_branch
+      FROM lead_profiles WHERE user_id = ?
+    `).get(String(user_id).trim());
+    if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  } else if (phone != null && String(phone).trim() !== '') {
     const np = normalizePhone(phone);
     if (!np) return res.status(400).json({ error: 'invalid_phone' });
     // Match against EVERY phone the customer ever gave (lead_phones), not just
@@ -1123,6 +1136,46 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     branch:          visitBranch || null,
     lead_class:      newClass,
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/reception/leads — customers who requested THIS branch's address.
+// reception role → locked to its own branch. admin → ?branch=<id> required.
+// Shows everyone who picked the branch (branch_selected event) even if they
+// haven't visited yet; visited_here flags who already came.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/reception/leads', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (role !== 'reception' && role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'reception'
+    ? (req.user.branch || null)
+    : (req.query.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      lp.user_id,
+      lp.first_name,
+      lp.total_score,
+      lp.lead_class,
+      lp.last_activity,
+      MIN(e.created_at) AS first_requested,
+      MAX(e.created_at) AS last_requested,
+      (SELECT GROUP_CONCAT(ph.phone, ' ، ')
+         FROM lead_phones ph WHERE ph.user_id = lp.user_id)            AS phones,
+      (SELECT v.visited_at FROM lead_visits v
+         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS visited_at
+    FROM events e
+    JOIN lead_profiles lp ON lp.user_id = e.user_id
+    WHERE e.event_type = 'branch_selected' AND e.branch = ?
+    GROUP BY lp.user_id
+    ORDER BY (visited_at IS NOT NULL) ASC, last_requested DESC
+  `).all(branch, branch);
+
+  return res.json({ branch, count: rows.length, leads: rows });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1541,23 +1594,25 @@ app.put('/api/settings/:key', requireAuth, requireRole('admin'), (req, res) => {
 app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
   const db    = getDb();
   const users = db.prepare(
-    `SELECT id, name, email, role, created_at FROM users ORDER BY created_at`
+    `SELECT id, name, email, role, branch, created_at FROM users ORDER BY created_at`
   ).all();
   return res.json(users);
 });
 
 app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
-  const { name, email, password, role = 'rep' } = req.body || {};
+  const { name, email, password, role = 'rep', branch } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
+  // Branch only meaningful for reception accounts
+  const branchVal = role === 'reception' ? (branch || null) : null;
   const db   = getDb();
   const hash = bcrypt.hashSync(password, 10);
   try {
     const result = db.prepare(
-      `INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)`
-    ).run(name, email, hash, role);
-    return res.json({ id: result.lastInsertRowid, name, email, role });
+      `INSERT INTO users (name, email, password_hash, role, branch) VALUES (?, ?, ?, ?, ?)`
+    ).run(name, email, hash, role, branchVal);
+    return res.json({ id: result.lastInsertRowid, name, email, role, branch: branchVal });
   } catch (e) {
     if (e.message.includes('UNIQUE')) {
       return res.status(409).json({ error: 'البريد الإلكتروني مستخدم مسبقاً' });
@@ -1567,7 +1622,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
-  const { name, email, role, password } = req.body || {};
+  const { name, email, role, password, branch } = req.body || {};
   const db      = getDb();
   const updates = [];
   const params  = [];
@@ -1576,6 +1631,9 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (email)    { updates.push('email = ?');         params.push(email); }
   if (role)     { updates.push('role = ?');          params.push(role); }
   if (password) { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
+  // Set branch for reception accounts; clear it for any other role
+  if (role)     { updates.push('branch = ?');        params.push(role === 'reception' ? (branch || null) : null); }
+  else if (branch !== undefined) { updates.push('branch = ?'); params.push(branch || null); }
 
   if (!updates.length) {
     return res.status(400).json({ error: 'Nothing to update' });
