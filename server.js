@@ -1170,12 +1170,20 @@ app.get('/api/reception/leads', requireAuth, (req, res) => {
          WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS visited_at
     FROM events e
     JOIN lead_profiles lp ON lp.user_id = e.user_id
-    WHERE e.event_type = 'branch_selected' AND e.branch = ?
+    WHERE e.event_type = 'branch_selected'
+      AND (e.event_value = ? OR e.branch = ?)
     GROUP BY lp.user_id
     ORDER BY (visited_at IS NOT NULL) ASC, last_requested DESC
-  `).all(branch, branch);
+  `).all(branch, branch, branch);
 
-  return res.json({ branch, count: rows.length, leads: rows });
+  // total branch_selected events for this branch (helps the admin debug
+  // an id mismatch between ManyChat / Settings / the reception account)
+  const totalForBranch = db.prepare(`
+    SELECT COUNT(*) AS n FROM events
+    WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
+  `).get(branch, branch).n;
+
+  return res.json({ branch, count: rows.length, total: totalForBranch, leads: rows });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
