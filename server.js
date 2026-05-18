@@ -1812,6 +1812,23 @@ app.get('/api/branches', requireAuth, (req, res) => {
       typeof b === 'string' ? { id: b, name: b } : b
     );
   } catch (_) { branches = []; }
+
+  // Also include branches that ACTUALLY appear in branch_selected events —
+  // so filters always match real data even if the configured id differs
+  // from what ManyChat sent (fysal vs faisal vs Arabic, etc.).
+  try {
+    const seen = db.prepare(`
+      SELECT DISTINCT COALESCE(NULLIF(event_value,''), branch) AS b
+      FROM events
+      WHERE event_type = 'branch_selected'
+        AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
+    `).all().map(r => r.b);
+    const known = new Set(branches.map(x => x.id));
+    for (const b of seen) {
+      if (!known.has(b)) { branches.push({ id: b, name: b }); known.add(b); }
+    }
+  } catch (_) { /* events table edge — ignore */ }
+
   return res.json({ branches });
 });
 
