@@ -1034,7 +1034,21 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
     WHERE user_id = ? ORDER BY visited_at DESC
   `).all(user_id);
 
-  return res.json({ profile, history, phones, visits });
+  // Every branch the customer ASKED about (branch_selected) — a customer
+  // comparing 2 branches must show both, not just the latest preferred_branch.
+  const requestedBranches = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(event_value,''), branch) AS branch,
+      MIN(created_at) AS first_at,
+      MAX(created_at) AS last_at
+    FROM events
+    WHERE user_id = ? AND event_type = 'branch_selected'
+      AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
+    GROUP BY COALESCE(NULLIF(event_value,''), branch)
+    ORDER BY last_at DESC
+  `).all(user_id);
+
+  return res.json({ profile, history, phones, visits, requestedBranches });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
