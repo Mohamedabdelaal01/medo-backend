@@ -1,10 +1,15 @@
 // services/prediction.js — Weekly visit forecast
-// Reads existing events table (no schema change). Counts visit_confirmed and
-// location_request as visit signals over the last 14 days, projects next 7.
+// A "potential visit" = a customer who showed they want to come to a branch:
+// picked a branch (branch_selected, usually with phone), asked for the
+// location, or already confirmed. Counts DISTINCT customers per day over the
+// last 14 days and projects the next 7.
 
 const { getDb } = require('../db');
 
-const VISIT_EVENTS = ['visit_confirmed', 'location_request'];
+// branch_selected is the strongest pre-visit signal in this funnel
+// (customer chose a branch + left their phone) — count it even if they
+// never tapped the map link.
+const VISIT_EVENTS = ['branch_selected', 'location_request', 'visit_confirmed'];
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 function dayKey(d) {
@@ -37,19 +42,20 @@ function getDailySeries(days = 14) {
   const db = getDb();
   const placeholders = VISIT_EVENTS.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT created_at FROM events
+    SELECT user_id, created_at FROM events
     WHERE event_type IN (${placeholders})
       AND created_at >= datetime('now', '-${days} days')
   `).all(...VISIT_EVENTS);
 
-  const buckets = new Map();
-  for (const day of lastNDays(days)) buckets.set(day, 0);
+  // Count DISTINCT customers per day — a customer comparing two branches
+  // is one potential visitor, not two.
+  const seen = new Map(); // day → Set(user_id)
+  for (const day of lastNDays(days)) seen.set(day, new Set());
   for (const row of rows) {
-    // SQLite UTC string "YYYY-MM-DD HH:MM:SS"
-    const day = row.created_at.slice(0, 10);
-    if (buckets.has(day)) buckets.set(day, buckets.get(day) + 1);
+    const day = row.created_at.slice(0, 10); // "YYYY-MM-DD"
+    if (seen.has(day)) seen.get(day).add(row.user_id);
   }
-  return [...buckets.entries()].map(([date, count]) => ({ date, count }));
+  return [...seen.entries()].map(([date, set]) => ({ date, count: set.size }));
 }
 
 function predict() {
@@ -68,13 +74,13 @@ function predict() {
   if (totalSamples >= 14 && sd < recentAvg * 0.6) confidence = 'high';
   else if (totalSamples >= 7) confidence = 'medium';
 
-  // Per-branch visit count over the last 7 days — uses the events.branch column.
+  // Per-branch ACTUAL confirmed arrivals over the last 7 days — read from
+  // lead_visits (reception confirmations live here, not in the events table).
   const db = getDb();
   const topBranches = db.prepare(`
-    SELECT branch, COUNT(*) AS visits
-    FROM events
-    WHERE event_type = 'visit_confirmed'
-      AND created_at >= datetime('now', '-7 days')
+    SELECT branch, COUNT(DISTINCT user_id) AS visits
+    FROM lead_visits
+    WHERE visited_at >= datetime('now', '-7 days')
       AND branch IS NOT NULL
     GROUP BY branch
     ORDER BY visits DESC
