@@ -528,6 +528,15 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     user_id
   );
 
+  // Keep EVERY phone the customer ever sent — never overwrite history.
+  // profile.phone above stays as the latest (quick display); lead_phones is
+  // the full set the receptionist can match against.
+  if (normPhone) {
+    db.prepare(`
+      INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)
+    `).run(user_id, normPhone);
+  }
+
   // ── 9. Insert raw event record (with event_id) ────────────────────────
   // event_id is stored here permanently — this is what Phase 2 checks on
   // subsequent requests. The UNIQUE constraint on the column guarantees
@@ -1011,7 +1020,18 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
     LIMIT 50
   `).all(user_id);
 
-  return res.json({ profile, history });
+  // All phones the customer gave + every branch they actually visited
+  const phones = db.prepare(`
+    SELECT phone, created_at FROM lead_phones
+    WHERE user_id = ? ORDER BY created_at DESC
+  `).all(user_id).map(r => r.phone);
+
+  const visits = db.prepare(`
+    SELECT branch, visited_at FROM lead_visits
+    WHERE user_id = ? ORDER BY visited_at DESC
+  `).all(user_id);
+
+  return res.json({ profile, history, phones, visits });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1028,16 +1048,30 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   if (phone != null && String(phone).trim() !== '') {
     const np = normalizePhone(phone);
     if (!np) return res.status(400).json({ error: 'invalid_phone' });
-    // Most recent lead with this phone (phone is not unique — family devices)
+    // Match against EVERY phone the customer ever gave (lead_phones), not just
+    // the latest one on the profile — so an older number still works.
     lead = db.prepare(`
-      SELECT user_id, first_name, campaign_source, lead_class, visit_confirmed
-      FROM lead_profiles WHERE phone = ?
-      ORDER BY last_activity DESC LIMIT 1
+      SELECT lp.user_id, lp.first_name, lp.campaign_source, lp.lead_class,
+             lp.visit_confirmed, lp.preferred_branch
+      FROM lead_phones ph
+      JOIN lead_profiles lp ON lp.user_id = ph.user_id
+      WHERE ph.phone = ?
+      ORDER BY lp.last_activity DESC LIMIT 1
     `).get(np);
+    // Fallback: legacy rows whose phone is only on the profile
+    if (!lead) {
+      lead = db.prepare(`
+        SELECT user_id, first_name, campaign_source, lead_class,
+               visit_confirmed, preferred_branch
+        FROM lead_profiles WHERE phone = ?
+        ORDER BY last_activity DESC LIMIT 1
+      `).get(np);
+    }
     if (!lead) return res.status(404).json({ error: 'phone_not_found' });
   } else if (visit_code != null && String(visit_code).trim() !== '') {
     lead = db.prepare(`
-      SELECT user_id, first_name, campaign_source, lead_class, visit_confirmed
+      SELECT user_id, first_name, campaign_source, lead_class,
+             visit_confirmed, preferred_branch
       FROM lead_profiles WHERE visit_code = ?
     `).get(String(visit_code).trim());
     if (!lead) return res.status(404).json({ error: 'visit_code_not_found' });
@@ -1045,8 +1079,8 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'phone_required' });
   }
 
-  // Mark as visited (idempotent — won't downgrade a purchased lead).
-  // Update by user_id so it works whether we matched by phone or code.
+  // Global "has visited at least one branch" flag — for scoring/funnel.
+  // (Idempotent — won't downgrade a purchased lead.)
   const newClass = lead.lead_class === 'purchased' ? 'purchased' : 'visited';
   db.prepare(`
     UPDATE lead_profiles SET
@@ -1057,7 +1091,15 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     WHERE user_id = ?
   `).run(newClass, lead.user_id);
 
-  console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} (${lead.campaign_source || 'no campaign'})`);
+  // Record THIS branch visit separately — visiting حلوان later must not erase
+  // an earlier فيصل visit. One row per (customer, branch).
+  if (lead.preferred_branch) {
+    db.prepare(`
+      INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)
+    `).run(lead.user_id, lead.preferred_branch);
+  }
+
+  console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${lead.preferred_branch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
   // Event-Triggered Flow: Visit Confirmed
   const visitFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_visit_flow'`).get();
@@ -1073,6 +1115,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     user_id:         lead.user_id,
     first_name:      lead.first_name || 'غير معروف',
     campaign_source: lead.campaign_source || null,
+    branch:          lead.preferred_branch || null,
     lead_class:      newClass,
   });
 });

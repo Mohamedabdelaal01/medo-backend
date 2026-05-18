@@ -243,6 +243,33 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_tasks_lead   ON tasks(lead_id);
   `);
 
+  // lead_phones: EVERY phone a customer ever gave (they may have several, or
+  // re-enter a different one). Never overwritten — reception can match ANY.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lead_phones (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    TEXT NOT NULL,
+      phone      TEXT NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, phone)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lead_phones_phone ON lead_phones(phone);
+    CREATE INDEX IF NOT EXISTS idx_lead_phones_user  ON lead_phones(user_id);
+  `);
+
+  // lead_visits: one row per branch the customer actually visited. Visiting
+  // فيصل then later picking حلوان must NOT erase the فيصل visit.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lead_visits (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    TEXT NOT NULL,
+      branch     TEXT,
+      visited_at DATETIME NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, branch)
+    );
+    CREATE INDEX IF NOT EXISTS idx_lead_visits_user ON lead_visits(user_id);
+  `);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
