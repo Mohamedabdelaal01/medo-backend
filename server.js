@@ -930,6 +930,32 @@ app.put('/api/leads/:user_id/assign', requireAuth, requireRole('admin'), (req, r
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// DELETE /api/leads/:user_id — Admin permanently deletes a customer + ALL
+// their data across every table. Irreversible.
+// ════════════════════════════════════════════════════════════════════════════
+app.delete('/api/leads/:user_id', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const { user_id } = req.params;
+  const lead = db.prepare(`SELECT first_name FROM lead_profiles WHERE user_id = ?`).get(user_id);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+
+  const wipe = db.transaction(() => {
+    db.prepare(`DELETE FROM events          WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM lead_phones     WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM lead_visits     WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM tasks           WHERE lead_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM purchases       WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM messages_sent   WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM follow_up_state WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM lead_profiles   WHERE user_id = ?`).run(user_id);
+  });
+  wipe();
+
+  console.log(`🗑️  LEAD DELETED by admin ${req.user?.name || '?'}: ${lead.first_name || user_id} (${user_id})`);
+  return res.json({ ok: true, deleted: user_id });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Tasks — rep follow-up reminders
 //   POST   /api/tasks            create { lead_id, due_at, note, source? }
 //   GET    /api/tasks?status=    list (rep sees own; admin sees all / ?rep=)
