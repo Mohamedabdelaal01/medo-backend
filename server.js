@@ -675,13 +675,17 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     LIMIT 10
   `).all();
 
-  // Branch demand (location requests per branch)
+  // Branch demand — DISTINCT customers who asked for each branch (a customer
+  // comparing/re-picking the same branch counts once, not per event).
+  // Group by the branch the customer actually picked (event_value).
   const branchDemand = db.prepare(`
-    SELECT branch, COUNT(*) as requests
+    SELECT
+      COALESCE(NULLIF(event_value,''), branch) AS branch,
+      COUNT(DISTINCT user_id) AS requests
     FROM events
     WHERE event_type IN ('branch_selected', 'location_request')
-    AND branch IS NOT NULL
-    GROUP BY branch
+      AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
+    GROUP BY COALESCE(NULLIF(event_value,''), branch)
     ORDER BY requests DESC
   `).all();
 
@@ -777,14 +781,13 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     ? parseFloat(((totalVisited.count / totalLeads.count) * 100).toFixed(1))
     : 0.0;
 
-  // ── Branch visit breakdown — Phase 3 ──────────────────────────────────
-  // Counts actual visits (visit_confirmed events) per branch.
-  // Complements branchDemand (which counts intent signals) with real arrival data.
+  // ── Branch visit breakdown ────────────────────────────────────────────
+  // Real reception-confirmed arrivals per branch (lead_visits is the source
+  // of truth — reception confirmations don't create events).
   const branchVisits = db.prepare(`
-    SELECT branch, COUNT(*) as visits
-    FROM events
-    WHERE event_type = 'visit_confirmed'
-    AND branch IS NOT NULL
+    SELECT branch, COUNT(DISTINCT user_id) as visits
+    FROM lead_visits
+    WHERE branch IS NOT NULL
     GROUP BY branch
     ORDER BY visits DESC
   `).all();
