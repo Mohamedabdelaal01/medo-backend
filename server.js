@@ -665,9 +665,10 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     AND date(last_activity) = date('now')
   `).get();
 
-  // Top products by intent (most product_details events)
+  // Top products — DISTINCT customers interested (a customer viewing the
+  // same product repeatedly counts once, matching the dedup scoring rule).
   const topProducts = db.prepare(`
-    SELECT product_id, COUNT(*) as views
+    SELECT product_id, COUNT(DISTINCT user_id) as views
     FROM events
     WHERE event_type = 'product_details' AND product_id IS NOT NULL
     GROUP BY product_id
@@ -819,8 +820,8 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
   const productGap = db.prepare(`
     SELECT
       e.product_id,
-      COUNT(*)            AS views,
-      COALESCE(p.buys, 0) AS purchases
+      COUNT(DISTINCT e.user_id) AS views,
+      COALESCE(p.buys, 0)       AS purchases
     FROM events e
     LEFT JOIN (
       SELECT product_id, COUNT(*) AS buys
@@ -1664,9 +1665,9 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
       ${branchClause} ${campaignClause}
   `).get(fromDate, toDate, ...branchParam, ...campaignParam);
 
-  // Top products in range
+  // Top products in range — DISTINCT customers (not raw repeated views)
   const topProducts = db.prepare(`
-    SELECT e.event_value AS product, COUNT(*) AS views
+    SELECT e.event_value AS product, COUNT(DISTINCT e.user_id) AS views
     FROM events e
     JOIN lead_profiles lp ON e.user_id = lp.user_id
     WHERE e.event_type = 'product_details'
@@ -1683,8 +1684,10 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
   const categories = db.prepare(`
     SELECT
       e.category                                                       AS category,
-      SUM(CASE WHEN e.event_type = 'product_details'  THEN 1 ELSE 0 END) AS product_views,
-      SUM(CASE WHEN e.event_type = 'category_request' THEN 1 ELSE 0 END) AS category_requests,
+      COUNT(DISTINCT CASE WHEN e.event_type = 'product_details'
+                          THEN e.user_id END)                          AS product_views,
+      COUNT(DISTINCT CASE WHEN e.event_type = 'category_request'
+                          THEN e.user_id END)                          AS category_requests,
       COUNT(DISTINCT e.user_id)                                        AS unique_users,
       COUNT(DISTINCT CASE WHEN e.event_type = 'product_details'
                           THEN e.event_value END)                      AS models_viewed
@@ -1705,7 +1708,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     SELECT
       e.category    AS category,
       e.event_value AS product,
-      COUNT(*)                  AS views,
+      COUNT(DISTINCT e.user_id) AS views,
       COUNT(DISTINCT e.user_id) AS unique_users
     FROM events e
     JOIN lead_profiles lp ON e.user_id = lp.user_id
