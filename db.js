@@ -333,6 +333,15 @@ function initializeDatabase() {
     if (!e.message.includes('duplicate column name')) throw e;
   }
 
+  // users.active — 1 = can log in, 0 = disabled (kept for history but blocked
+  // at login). Existing rows default to 1 so nobody is locked out by the migration.
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1`);
+    console.log('✅ Migration: active column added to users');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
   // New performance indexes
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at);

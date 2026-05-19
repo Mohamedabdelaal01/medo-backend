@@ -304,6 +304,10 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ error: 'بيانات الدخول غير صحيحة' });
   }
 
+  if (user.active === 0) {
+    return res.status(403).json({ error: 'الحساب موقوف — كلّم مدير الفرع أو مدير النظام' });
+  }
+
   const payload = {
     id: user.id, name: user.name, email: user.email,
     role: user.role, branch: user.branch || null,
@@ -1542,8 +1546,13 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const { userId } = req.params;
-  const { followed_up } = req.body || {};
+  const { followed_up, followed_up_by } = req.body || {};
   const newVal = followed_up ? 1 : 0;
+  // Who did the follow-up: the chosen sales/manager name when marking done;
+  // cleared when reverting back to "not followed up".
+  const byName = newVal
+    ? (followed_up_by && String(followed_up_by).trim()) || req.user?.name || null
+    : null;
 
   const db = getDb();
   db.prepare(`
@@ -1553,9 +1562,103 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
       followed_up    = excluded.followed_up,
       followed_up_at = excluded.followed_up_at,
       followed_up_by = excluded.followed_up_by
-  `).run(branch, userId, newVal, newVal ? new Date().toISOString() : null, req.user?.name || null);
+  `).run(branch, userId, newVal, newVal ? new Date().toISOString() : null, byName);
 
-  return res.json({ ok: true, followed_up: newVal });
+  return res.json({ ok: true, followed_up: newVal, followed_up_by: byName });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Branch sales accounts — branch_manager manages the sales users of THEIR
+// branch only. admin may target any branch via ?branch / body.branch.
+// These rows live in the same `users` table, so they also show up in the
+// admin's user-management screen automatically.
+// ════════════════════════════════════════════════════════════════════════════
+function resolveBranchScope(req) {
+  const role = req.user?.role;
+  if (role !== 'branch_manager' && role !== 'admin') return { error: 'forbidden' };
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.query.branch || req.body?.branch || null);
+  if (!branch) return { error: 'branch_required' };
+  return { branch };
+}
+
+app.get('/api/branch/sales', requireAuth, (req, res) => {
+  const scope = resolveBranchScope(req);
+  if (scope.error) return res.status(scope.error === 'forbidden' ? 403 : 400).json({ error: scope.error });
+  const db = getDb();
+  const sales = db.prepare(
+    `SELECT id, name, email, branch, active, created_at
+       FROM users WHERE role = 'sales' AND branch = ? ORDER BY name`
+  ).all(scope.branch);
+  return res.json({ branch: scope.branch, sales });
+});
+
+app.post('/api/branch/sales', requireAuth, (req, res) => {
+  const scope = resolveBranchScope(req);
+  if (scope.error) return res.status(scope.error === 'forbidden' ? 403 : 400).json({ error: scope.error });
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'الاسم والإيميل والباسورد مطلوبين' });
+  }
+  const db = getDb();
+  try {
+    const result = db.prepare(
+      `INSERT INTO users (name, email, password_hash, role, branch, active)
+       VALUES (?, ?, ?, 'sales', ?, 1)`
+    ).run(name, email, bcrypt.hashSync(password, 10), scope.branch);
+    return res.json({ id: result.lastInsertRowid, name, email, branch: scope.branch, active: 1 });
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) {
+      return res.status(409).json({ error: 'البريد الإلكتروني مستخدم مسبقاً' });
+    }
+    throw e;
+  }
+});
+
+// Guard: the target user must be a 'sales' account in the manager's branch.
+function loadOwnedSales(db, id, branch) {
+  return db.prepare(
+    `SELECT id FROM users WHERE id = ? AND role = 'sales' AND branch = ?`
+  ).get(id, branch);
+}
+
+app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
+  const scope = resolveBranchScope(req);
+  if (scope.error) return res.status(scope.error === 'forbidden' ? 403 : 400).json({ error: scope.error });
+  const db = getDb();
+  if (!loadOwnedSales(db, req.params.id, scope.branch)) {
+    return res.status(404).json({ error: 'الحساب مش موجود في فرعك' });
+  }
+  const { name, email, password, active } = req.body || {};
+  const updates = [];
+  const params  = [];
+  if (name)               { updates.push('name = ?');          params.push(name); }
+  if (email)              { updates.push('email = ?');         params.push(email); }
+  if (password)           { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
+  if (active !== undefined) { updates.push('active = ?');       params.push(active ? 1 : 0); }
+  if (!updates.length) return res.status(400).json({ error: 'مفيش حاجة تتعدّل' });
+  params.push(req.params.id);
+  try {
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) {
+      return res.status(409).json({ error: 'البريد الإلكتروني مستخدم مسبقاً' });
+    }
+    throw e;
+  }
+  return res.json({ ok: true });
+});
+
+app.delete('/api/branch/sales/:id', requireAuth, (req, res) => {
+  const scope = resolveBranchScope(req);
+  if (scope.error) return res.status(scope.error === 'forbidden' ? 403 : 400).json({ error: scope.error });
+  const db = getDb();
+  if (!loadOwnedSales(db, req.params.id, scope.branch)) {
+    return res.status(404).json({ error: 'الحساب مش موجود في فرعك' });
+  }
+  db.prepare(`DELETE FROM users WHERE id = ?`).run(req.params.id);
+  return res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1993,7 +2096,7 @@ app.put('/api/settings/:key', requireAuth, requireRole('admin'), (req, res) => {
 app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
   const db    = getDb();
   const users = db.prepare(
-    `SELECT id, name, email, role, branch, created_at FROM users ORDER BY created_at`
+    `SELECT id, name, email, role, branch, active, created_at FROM users ORDER BY created_at`
   ).all();
   return res.json(users);
 });
