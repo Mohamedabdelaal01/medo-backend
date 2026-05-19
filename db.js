@@ -279,6 +279,21 @@ function initializeDatabase() {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_sales ON lead_visits(sales_rep)`);
 
+  // branch_customer_followups: tracks whether a branch manager has followed up
+  // with a specific customer. One row per (branch, user_id) pair.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS branch_customer_followups (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      branch        TEXT NOT NULL,
+      user_id       TEXT NOT NULL,
+      followed_up   INTEGER NOT NULL DEFAULT 0,
+      followed_up_at DATETIME,
+      followed_up_by TEXT,
+      UNIQUE(branch, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_bcf_branch ON branch_customer_followups(branch);
+  `);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.

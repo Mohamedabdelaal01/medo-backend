@@ -1481,6 +1481,79 @@ app.get('/api/branch/overview', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/branch/customers — customers who requested this branch + follow-up status
+//   branch_manager → locked to own branch. admin → ?branch=<id>
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/branch/customers', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (role !== 'branch_manager' && role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.query.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db = getDb();
+
+  const customers = db.prepare(`
+    SELECT DISTINCT
+      lp.user_id,
+      lp.first_name,
+      lp.total_score,
+      lp.lead_class,
+      lp.last_activity,
+      lp.visit_confirmed,
+      lp.last_product,
+      lp.last_category,
+      COALESCE(f.followed_up, 0)    AS followed_up,
+      f.followed_up_at,
+      f.followed_up_by
+    FROM lead_profiles lp
+    INNER JOIN events e
+      ON e.user_id = lp.user_id
+      AND e.event_type IN ('branch_selected', 'location_request')
+      AND (e.event_value = ? OR e.branch = ?)
+    LEFT JOIN branch_customer_followups f
+      ON f.user_id = lp.user_id AND f.branch = ?
+    ORDER BY lp.total_score DESC, lp.last_activity DESC
+    LIMIT 200
+  `).all(branch, branch, branch);
+
+  return res.json({ branch, customers });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/branch/customers/:userId/followup — toggle follow-up status
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (role !== 'branch_manager' && role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.body?.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const { userId } = req.params;
+  const { followed_up } = req.body || {};
+  const newVal = followed_up ? 1 : 0;
+
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO branch_customer_followups (branch, user_id, followed_up, followed_up_at, followed_up_by)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(branch, user_id) DO UPDATE SET
+      followed_up    = excluded.followed_up,
+      followed_up_at = excluded.followed_up_at,
+      followed_up_by = excluded.followed_up_by
+  `).run(branch, userId, newVal, newVal ? new Date().toISOString() : null, req.user?.name || null);
+
+  return res.json({ ok: true, followed_up: newVal });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/purchases — Sales rep records an offline purchase for a lead.
 // Body: { user_id, product_id?, price?, branch?, notes? }
 // Returns: { ok, purchase_id, lead_class }
