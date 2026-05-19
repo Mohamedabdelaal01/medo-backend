@@ -1110,7 +1110,29 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
     );
   }
 
-  return res.json({ profile, history, phones, visits, requestedBranches });
+  // Follow-up activity (assignment + completed-call history). Visible to
+  // admin/rep (all branches), branch_manager (own branch only), reception
+  // (own branch only). The sales role sees their own branch too.
+  const scopeBranch =
+    (req.user?.role === 'branch_manager' || req.user?.role === 'reception' || req.user?.role === 'sales')
+      ? (req.user.branch || null)
+      : null;
+
+  let followups = db.prepare(
+    `SELECT branch, assigned_sales, assigned_by, assigned_at,
+            followed_up, followed_up_by, followed_up_at, call_summary
+       FROM branch_customer_followups WHERE user_id = ?`
+  ).all(user_id);
+  let followupLog = db.prepare(
+    `SELECT branch, sales, call_summary, followed_up_at
+       FROM followup_log WHERE user_id = ? ORDER BY followed_up_at DESC`
+  ).all(user_id);
+  if (scopeBranch) {
+    followups   = followups.filter(f => f.branch === scopeBranch);
+    followupLog = followupLog.filter(l => l.branch === scopeBranch);
+  }
+
+  return res.json({ profile, history, phones, visits, requestedBranches, followups, followupLog });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1402,7 +1424,40 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     ...r,
     not_bought: r.served - r.bought,
     close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
+    followed_up: 0, fu_visited: 0, fu_not_visited: 0,
   }));
+
+  // Follow-up stats per (assigned_sales, branch). Reuses the sales/branch
+  // filters (date filters apply to visits, not the follow-up timeline).
+  const fuWhere  = [`f.assigned_sales IS NOT NULL`, `f.followed_up = 1`];
+  const fuParams = [];
+  if (sales)  { fuWhere.push(`f.assigned_sales = ?`); fuParams.push(sales); }
+  if (branch) { fuWhere.push(`f.branch = ?`);         fuParams.push(branch); }
+  const fuStats = db.prepare(`
+    SELECT f.assigned_sales AS sales_rep, f.branch AS branch,
+      COUNT(*) AS followed_up,
+      SUM(CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END) AS fu_visited
+    FROM branch_customer_followups f
+    LEFT JOIN lead_visits lv
+      ON lv.user_id = f.user_id AND lv.branch = f.branch
+    WHERE ${fuWhere.join(' AND ')}
+    GROUP BY f.assigned_sales, f.branch
+  `).all(...fuParams);
+
+  const keyOf = (rep, br) => `${rep}|${br}`;
+  const idx = new Map(enriched.map(r => [keyOf(r.sales_rep, r.branch), r]));
+  for (const s of fuStats) {
+    const k = keyOf(s.sales_rep, s.branch);
+    const row = idx.get(k) || {
+      sales_rep: s.sales_rep, branch: s.branch, served: 0, bought: 0,
+      not_bought: 0, close_rate: 0, total_sales: 0,
+      followed_up: 0, fu_visited: 0, fu_not_visited: 0,
+    };
+    row.followed_up    = s.followed_up;
+    row.fu_visited     = s.fu_visited;
+    row.fu_not_visited = s.followed_up - s.fu_visited;
+    if (!idx.has(k)) { idx.set(k, row); enriched.push(row); }
+  }
 
   const byBranch = db.prepare(`
     SELECT v.branch AS branch,
@@ -1465,7 +1520,35 @@ app.get('/api/branch/overview', requireAuth, (req, res) => {
     ...r,
     not_bought: r.served - r.bought,
     close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
+    followed_up: 0, fu_visited: 0, fu_not_visited: 0,
   }));
+
+  // Follow-up stats per assigned sales rep (a rep may have follow-ups but no
+  // visits yet, so merge — adding rows for reps missing from the visit query).
+  const fuStats = db.prepare(`
+    SELECT
+      f.assigned_sales AS sales_rep,
+      COUNT(*)                                                    AS followed_up,
+      SUM(CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END)      AS fu_visited
+    FROM branch_customer_followups f
+    LEFT JOIN (
+      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
+    ) lv ON lv.user_id = f.user_id
+    WHERE f.branch = ? AND f.assigned_sales IS NOT NULL AND f.followed_up = 1
+    GROUP BY f.assigned_sales
+  `).all(branch, branch);
+
+  const byName = new Map(bySales.map(r => [r.sales_rep, r]));
+  for (const s of fuStats) {
+    const row = byName.get(s.sales_rep) || {
+      sales_rep: s.sales_rep, served: 0, bought: 0, not_bought: 0,
+      close_rate: 0, total_sales: 0, followed_up: 0, fu_visited: 0, fu_not_visited: 0,
+    };
+    row.followed_up    = s.followed_up;
+    row.fu_visited     = s.fu_visited;
+    row.fu_not_visited = s.followed_up - s.fu_visited;
+    if (!byName.has(s.sales_rep)) { byName.set(s.sales_rep, row); bySales.push(row); }
+  }
 
   const served      = bySales.reduce((s, r) => s + r.served, 0);
   const bought      = bySales.reduce((s, r) => s + r.bought, 0);
@@ -1515,7 +1598,11 @@ app.get('/api/branch/customers', requireAuth, (req, res) => {
       lp.last_category,
       COALESCE(f.followed_up, 0)     AS followed_up,
       f.followed_up_at,
-      f.followed_up_by
+      f.followed_up_by,
+      f.assigned_sales,
+      f.assigned_by,
+      f.call_summary,
+      CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited
     FROM (
       SELECT DISTINCT user_id
       FROM events
@@ -1525,15 +1612,74 @@ app.get('/api/branch/customers', requireAuth, (req, res) => {
     LEFT JOIN lead_profiles lp ON lp.user_id = req.user_id
     LEFT JOIN branch_customer_followups f
       ON f.user_id = req.user_id AND f.branch = ?
+    LEFT JOIN (
+      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
+    ) lv ON lv.user_id = req.user_id
     ORDER BY COALESCE(lp.total_score, 0) DESC, lp.last_activity DESC
     LIMIT 200
-  `).all(branch, branch, branch);
+  `).all(branch, branch, branch, branch);
 
   return res.json({ branch, customers });
 });
 
+// Records a completed follow-up in the append-only log (history survives
+// reassignment). Only called when a follow-up is actually marked done.
+function logFollowup(db, branch, userId, sales, summary) {
+  db.prepare(`
+    INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+  `).run(branch, userId, sales || null, (summary && String(summary).trim()) || null);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-// PATCH /api/branch/customers/:userId/followup — toggle follow-up status
+// PATCH /api/branch/customers/:userId/assign — manager hands a customer to a
+// sales rep. Reassigning to a DIFFERENT sales rep resets the follow-up so the
+// new rep starts fresh; prior call summaries stay in followup_log.
+// Body: { sales }   (branch_manager → own branch; admin → body.branch)
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/branch/customers/:userId/assign', requireAuth, (req, res) => {
+  const role = req.user?.role;
+  if (role !== 'branch_manager' && role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.body?.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const { userId } = req.params;
+  const sales = (req.body?.sales && String(req.body.sales).trim()) || null;
+  if (!sales) return res.status(400).json({ error: 'sales_required' });
+
+  const db  = getDb();
+  const cur = db.prepare(
+    `SELECT assigned_sales, followed_up FROM branch_customer_followups WHERE branch = ? AND user_id = ?`
+  ).get(branch, userId);
+
+  // Changing the owner → start a brand-new follow-up cycle.
+  const resetCycle = cur && cur.assigned_sales && cur.assigned_sales !== sales;
+
+  db.prepare(`
+    INSERT INTO branch_customer_followups
+      (branch, user_id, assigned_sales, assigned_at, assigned_by, followed_up, followed_up_at, followed_up_by, call_summary)
+    VALUES (?, ?, ?, datetime('now'), ?, 0, NULL, NULL, NULL)
+    ON CONFLICT(branch, user_id) DO UPDATE SET
+      assigned_sales = excluded.assigned_sales,
+      assigned_at    = excluded.assigned_at,
+      assigned_by    = excluded.assigned_by
+      ${resetCycle ? `,
+      followed_up    = 0,
+      followed_up_at = NULL,
+      followed_up_by = NULL,
+      call_summary   = NULL` : ''}
+  `).run(branch, userId, sales, req.user?.name || null);
+
+  return res.json({ ok: true, assigned_sales: sales, reset: !!resetCycle });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/branch/customers/:userId/followup — manager marks follow-up done
+// himself (he can also do the call). Accepts an optional call_summary.
 // ════════════════════════════════════════════════════════════════════════════
 app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
   const role = req.user?.role;
@@ -1546,25 +1692,98 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const { userId } = req.params;
-  const { followed_up, followed_up_by } = req.body || {};
+  const { followed_up, followed_up_by, call_summary } = req.body || {};
   const newVal = followed_up ? 1 : 0;
-  // Who did the follow-up: the chosen sales/manager name when marking done;
-  // cleared when reverting back to "not followed up".
   const byName = newVal
     ? (followed_up_by && String(followed_up_by).trim()) || req.user?.name || null
     : null;
+  const summary = newVal ? (call_summary && String(call_summary).trim()) || null : null;
 
   const db = getDb();
   db.prepare(`
-    INSERT INTO branch_customer_followups (branch, user_id, followed_up, followed_up_at, followed_up_by)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO branch_customer_followups
+      (branch, user_id, followed_up, followed_up_at, followed_up_by, call_summary)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(branch, user_id) DO UPDATE SET
       followed_up    = excluded.followed_up,
       followed_up_at = excluded.followed_up_at,
-      followed_up_by = excluded.followed_up_by
-  `).run(branch, userId, newVal, newVal ? new Date().toISOString() : null, byName);
+      followed_up_by = excluded.followed_up_by,
+      call_summary   = excluded.call_summary
+  `).run(branch, userId, newVal, newVal ? new Date().toISOString() : null, byName, summary);
+
+  if (newVal) logFollowup(db, branch, userId, byName, summary);
 
   return res.json({ ok: true, followed_up: newVal, followed_up_by: byName });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sales follow-ups — the sales rep sees customers the branch manager assigned
+// to them, splits pending vs done, and writes a call summary on completion.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/followups', requireAuth, (req, res) => {
+  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+  const me     = req.user.name;
+  const branch = req.user.branch || null;
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db = getDb();
+  const customers = db.prepare(`
+    SELECT
+      f.user_id,
+      lp.first_name,
+      COALESCE(lp.total_score, 0)     AS total_score,
+      COALESCE(lp.lead_class, 'cold') AS lead_class,
+      lp.last_activity,
+      lp.last_category,
+      f.followed_up,
+      f.followed_up_at,
+      f.call_summary,
+      f.assigned_at,
+      (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
+         WHERE ph.user_id = f.user_id)                              AS phones,
+      CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END            AS visited
+    FROM branch_customer_followups f
+    LEFT JOIN lead_profiles lp ON lp.user_id = f.user_id
+    LEFT JOIN (
+      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
+    ) lv ON lv.user_id = f.user_id
+    WHERE f.branch = ? AND f.assigned_sales = ?
+    ORDER BY f.followed_up ASC, f.assigned_at DESC
+  `).all(branch, branch, me);
+
+  return res.json({ branch, customers });
+});
+
+app.patch('/api/sales/followups/:userId', requireAuth, (req, res) => {
+  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+  const me     = req.user.name;
+  const branch = req.user.branch || null;
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const { userId } = req.params;
+  const { followed_up, call_summary } = req.body || {};
+  const newVal = followed_up ? 1 : 0;
+
+  const db  = getDb();
+  const own = db.prepare(`
+    SELECT id FROM branch_customer_followups
+    WHERE branch = ? AND user_id = ? AND assigned_sales = ?
+  `).get(branch, userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+
+  const summary = newVal ? (call_summary && String(call_summary).trim()) || null : null;
+  db.prepare(`
+    UPDATE branch_customer_followups SET
+      followed_up    = ?,
+      followed_up_at = ?,
+      followed_up_by = ?,
+      call_summary   = ?
+    WHERE branch = ? AND user_id = ?
+  `).run(newVal, newVal ? new Date().toISOString() : null, newVal ? me : null, summary, branch, userId);
+
+  if (newVal) logFollowup(db, branch, userId, me, summary);
+
+  return res.json({ ok: true, followed_up: newVal });
 });
 
 // ════════════════════════════════════════════════════════════════════════════

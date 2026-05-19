@@ -279,8 +279,9 @@ function initializeDatabase() {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_sales ON lead_visits(sales_rep)`);
 
-  // branch_customer_followups: tracks whether a branch manager has followed up
-  // with a specific customer. One row per (branch, user_id) pair.
+  // branch_customer_followups: live follow-up state per (branch, user_id).
+  // The branch manager assigns the customer to a sales rep; that sales rep
+  // (or the manager) then marks the follow-up done and writes a call summary.
   db.exec(`
     CREATE TABLE IF NOT EXISTS branch_customer_followups (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,6 +293,38 @@ function initializeDatabase() {
       UNIQUE(branch, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_bcf_branch ON branch_customer_followups(branch);
+  `);
+
+  // Assignment + call-summary columns (idempotent migration).
+  // assigned_sales: the sales rep the manager handed this customer to.
+  for (const { col, type } of [
+    { col: 'assigned_sales', type: 'TEXT'     },
+    { col: 'assigned_at',    type: 'DATETIME' },
+    { col: 'assigned_by',    type: 'TEXT'     },
+    { col: 'call_summary',   type: 'TEXT'     },
+  ]) {
+    try {
+      db.exec(`ALTER TABLE branch_customer_followups ADD COLUMN ${col} ${type}`);
+      console.log(`✅ Migration: ${col} added to branch_customer_followups`);
+    } catch (e) {
+      if (!e.message.includes('duplicate column name')) throw e;
+    }
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bcf_assigned ON branch_customer_followups(assigned_sales)`);
+
+  // followup_log: append-only history. One row per COMPLETED follow-up so
+  // reassigning a customer to another sales rep never erases what was done
+  // before — the old call summaries stay visible in the customer profile.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS followup_log (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      branch         TEXT NOT NULL,
+      user_id        TEXT NOT NULL,
+      sales          TEXT,
+      call_summary   TEXT,
+      followed_up_at DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_fulog_user ON followup_log(user_id, followed_up_at DESC);
   `);
 
   // follow_up_state: per-lead weekly send counter.
