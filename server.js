@@ -1496,27 +1496,32 @@ app.get('/api/branch/customers', requireAuth, (req, res) => {
 
   const db = getDb();
 
+  // Driven by events (same universe as the "عملاء طلبوا الفرع" KPI) so the
+  // count matches it. lead_profiles is LEFT JOINed — a customer with a
+  // branch_selected event but no profile row still shows up.
   const customers = db.prepare(`
-    SELECT DISTINCT
-      lp.user_id,
+    SELECT
+      req.user_id,
       lp.first_name,
-      lp.total_score,
-      lp.lead_class,
+      COALESCE(lp.total_score, 0)    AS total_score,
+      COALESCE(lp.lead_class, 'cold') AS lead_class,
       lp.last_activity,
-      lp.visit_confirmed,
+      COALESCE(lp.visit_confirmed, 0) AS visit_confirmed,
       lp.last_product,
       lp.last_category,
-      COALESCE(f.followed_up, 0)    AS followed_up,
+      COALESCE(f.followed_up, 0)     AS followed_up,
       f.followed_up_at,
       f.followed_up_by
-    FROM lead_profiles lp
-    INNER JOIN events e
-      ON e.user_id = lp.user_id
-      AND e.event_type IN ('branch_selected', 'location_request')
-      AND (e.event_value = ? OR e.branch = ?)
+    FROM (
+      SELECT DISTINCT user_id
+      FROM events
+      WHERE event_type = 'branch_selected'
+        AND (event_value = ? OR branch = ?)
+    ) req
+    LEFT JOIN lead_profiles lp ON lp.user_id = req.user_id
     LEFT JOIN branch_customer_followups f
-      ON f.user_id = lp.user_id AND f.branch = ?
-    ORDER BY lp.total_score DESC, lp.last_activity DESC
+      ON f.user_id = req.user_id AND f.branch = ?
+    ORDER BY COALESCE(lp.total_score, 0) DESC, lp.last_activity DESC
     LIMIT 200
   `).all(branch, branch, branch);
 
