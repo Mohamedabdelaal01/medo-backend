@@ -441,6 +441,10 @@ function initializeDatabase() {
     ['achievement_followup_weight', '30'],
     ['achievement_visit_weight',    '30'],
     ['achievement_close_weight',    '40'],
+    // Visit forecast — expected % of customers who picked a branch and
+    // will actually show up, split by whether they shared a phone number.
+    ['forecast_with_phone_weight',    '80'],
+    ['forecast_without_phone_weight', '35'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`

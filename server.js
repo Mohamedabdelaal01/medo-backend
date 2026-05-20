@@ -1684,6 +1684,32 @@ app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), 
   return res.json(getAchievementWeights());
 });
 
+app.get('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`SELECT key, value FROM settings WHERE key IN
+    ('forecast_with_phone_weight','forecast_without_phone_weight')`).all();
+  const m = Object.fromEntries(rows.map(r => [r.key, parseFloat(r.value)]));
+  return res.json({
+    with_phone:    Number.isFinite(m.forecast_with_phone_weight)    ? m.forecast_with_phone_weight    : 80,
+    without_phone: Number.isFinite(m.forecast_without_phone_weight) ? m.forecast_without_phone_weight : 35,
+  });
+});
+
+app.put('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (req, res) => {
+  const { with_phone, without_phone } = req.body || {};
+  const w = parseFloat(with_phone), wo = parseFloat(without_phone);
+  if (!Number.isFinite(w)  || w  < 0 || w  > 100) return res.status(400).json({ error: 'invalid_with_phone_weight' });
+  if (!Number.isFinite(wo) || wo < 0 || wo > 100) return res.status(400).json({ error: 'invalid_without_phone_weight' });
+  const db = getDb();
+  const upsert = db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+  `);
+  upsert.run('forecast_with_phone_weight',    String(w));
+  upsert.run('forecast_without_phone_weight', String(wo));
+  return res.json({ ok: true, weights: { with_phone: w, without_phone: wo } });
+});
+
 app.put('/api/settings/achievement-weights', requireAuth, requireRole('admin'), (req, res) => {
   const { followup, visit, close } = req.body || {};
   const f = parseFloat(followup), v = parseFloat(visit), c = parseFloat(close);
