@@ -53,51 +53,51 @@ function getForecastWeights() {
   return { withPct, withoutPct };
 }
 
-// For each of the last N days, count distinct customers who triggered
-// branch_selected, split by whether they had ALREADY shared a phone at the
-// MOMENT they picked the branch.
+// Two-bucket daily series of intent signals:
+//   • with_phone    — customers who reached `branch_selected` (highest intent
+//                     in the funnel; in this flow they always have a phone).
+//   • without_phone — customers who triggered `location_request` BUT never
+//                     left a phone. The flow still sends them the branch
+//                     address after a 2-minute timeout, so they're potential
+//                     visitors at a lower probability (~35%).
 //
-// Important: we compare timestamps, not presence. A customer who picked
-// nasr_city at 10:00 and then dropped their phone at 10:02 is counted as
-// "without phone" — that captures real intent at decision time and matches
-// the conversion-rate split (people who commit a phone first close ~80%,
-// the rest ~35% because they still get the location/address but slower).
+// Branch-selectors are excluded from the without_phone bucket on the same day
+// to keep the two cohorts disjoint (no double counting).
 function getDailySeries(days = 14) {
   const db = getDb();
-  const rows = db.prepare(`
-    SELECT
-      e.user_id,
-      e.created_at AS event_at,
-      substr(e.created_at, 1, 10) AS day,
-      (
-        SELECT 1 FROM lead_phones p
-        WHERE p.user_id = e.user_id
-          AND p.created_at <= e.created_at
-        LIMIT 1
-      ) AS had_phone_before
+
+  // High-intent: branch_selected users (all have phone in this flow)
+  const branchRows = db.prepare(`
+    SELECT user_id, substr(created_at, 1, 10) AS day
+    FROM events
+    WHERE event_type = 'branch_selected'
+      AND created_at >= datetime('now', ?)
+  `).all(`-${days} days`);
+
+  // Low-intent: location_request users with NO phone ever recorded.
+  // These got the address auto-sent after the phone-prompt timeout.
+  const locRows = db.prepare(`
+    SELECT user_id, substr(created_at, 1, 10) AS day
     FROM events e
-    WHERE e.event_type = 'branch_selected'
+    WHERE e.event_type = 'location_request'
       AND e.created_at >= datetime('now', ?)
+      AND NOT EXISTS (SELECT 1 FROM lead_phones p WHERE p.user_id = e.user_id)
   `).all(`-${days} days`);
 
   const buckets = new Map(); // day → { withPhone:Set, withoutPhone:Set }
   for (const day of lastNDays(days)) {
     buckets.set(day, { withPhone: new Set(), withoutPhone: new Set() });
   }
-  // A user can pick a branch multiple times in a day. Take the FIRST event
-  // of the day for the with/without decision (earliest moment of intent).
-  const firstPerUserPerDay = new Map(); // `${day}|${uid}` → had_phone_before
-  for (const r of rows) {
-    const key = `${r.day}|${r.user_id}`;
-    if (!firstPerUserPerDay.has(key) || r.event_at < firstPerUserPerDay.get(key).event_at) {
-      firstPerUserPerDay.set(key, r);
-    }
-  }
-  for (const r of firstPerUserPerDay.values()) {
+  for (const r of branchRows) {
     const b = buckets.get(r.day);
-    if (!b) continue;
-    if (r.had_phone_before) b.withPhone.add(r.user_id);
-    else                    b.withoutPhone.add(r.user_id);
+    if (b) b.withPhone.add(r.user_id);
+  }
+  for (const r of locRows) {
+    const b = buckets.get(r.day);
+    // A user who reached branch_selected the same day shouldn't be double-
+    // counted in the lower bucket (defensive — in practice branch_selected
+    // users have phone so they wouldn't pass the NOT EXISTS filter).
+    if (b && !b.withPhone.has(r.user_id)) b.withoutPhone.add(r.user_id);
   }
 
   const { withPct, withoutPct } = getForecastWeights();

@@ -2723,7 +2723,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-05-20-forecast-v5-events';
+const BUILD_VERSION = '2026-05-20-forecast-v6-location-bucket';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
