@@ -345,10 +345,45 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     // ManyChat product fields — fallback when event_value not provided
     product,
     category,
+    // ── Enrichment fields (optional — captured if ManyChat sends them) ──
+    last_name,
+    gender,
+    locale,
+    timezone,
+    last_input_text,
+    subscribed_at,
+    growth_tool_id,
+    source: manychat_source,
   } = req.body;
+
+  // Detect unresolved ManyChat user_field placeholders (e.g. "{{cuf_14597615}}")
+  // — these mean the External Request reference is wrong on the ManyChat side
+  // and we should treat the value as missing rather than store garbage.
+  const isBrokenPlaceholder = (v) => typeof v === 'string' && /^\{\{[^}]+\}\}$/.test(v.trim());
+  const cleanCampaignSource = isBrokenPlaceholder(campaign_source) ? null : campaign_source;
+  const cleanAdId           = isBrokenPlaceholder(ad_id)           ? null : ad_id;
+  const cleanVisitCode      = isBrokenPlaceholder(visit_code)      ? null : visit_code;
+  if (isBrokenPlaceholder(campaign_source) || isBrokenPlaceholder(ad_id)) {
+    console.warn(`[events] broken placeholder from ManyChat — user_id=${user_id}, event=${event_type}, campaign_source=${campaign_source}, ad_id=${ad_id}`);
+  }
 
   // Canonical phone (used as the reception lookup key — replaces visit code)
   const normPhone = normalizePhone(phone);
+
+  // Build an extra_fields JSON of anything that isn't already a first-class
+  // column. Lets us capture future ManyChat additions without another
+  // schema migration.
+  const KNOWN_FIELDS = new Set([
+    'user_id','first_name','event_type','event_value','session_count','current_score',
+    'campaign_source','ad_id','visit_code','phone','product','category',
+    'last_name','gender','locale','timezone','last_input_text','subscribed_at',
+    'growth_tool_id','source','branch','event_id',
+  ]);
+  const extraFields = {};
+  for (const k of Object.keys(req.body || {})) {
+    if (!KNOWN_FIELDS.has(k)) extraFields[k] = req.body[k];
+  }
+  const extraFieldsJson = Object.keys(extraFields).length ? JSON.stringify(extraFields) : null;
 
   // Normalise: ManyChat flows send "product" & "category" instead of event_value.
   // Use event_value when present; fall back to product name for product_details events.
@@ -409,7 +444,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     db.prepare(`
       INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(user_id, first_name || 'Unknown', campaign_source || null, ad_id || null, visit_code || null, normPhone || null);
+    `).run(user_id, first_name || 'Unknown', cleanCampaignSource || null, cleanAdId || null, cleanVisitCode || null, normPhone || null);
 
     profile = db.prepare(`
       SELECT * FROM lead_profiles WHERE user_id = ?
@@ -515,6 +550,16 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       ad_id               = COALESCE(ad_id, ?),
       visit_code          = COALESCE(visit_code, ?),
       phone               = COALESCE(?, phone),
+      -- ManyChat enrichment fields (only fill if not already set)
+      last_name           = COALESCE(?, last_name),
+      gender              = COALESCE(?, gender),
+      locale              = COALESCE(?, locale),
+      timezone            = COALESCE(?, timezone),
+      last_input_text     = COALESCE(?, last_input_text),  -- newest typed text wins
+      subscribed_at       = COALESCE(subscribed_at, ?),
+      growth_tool_id      = COALESCE(growth_tool_id, ?),
+      manychat_source     = COALESCE(?, manychat_source),
+      extra_fields        = COALESCE(?, extra_fields),
       last_activity       = datetime('now')
     WHERE user_id = ?
   `).run(
@@ -529,10 +574,20 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     isVisitConfirmed ? 1 : 0,
     isLocationEvent ? 1 : 0,
     isVisitConfirmed ? 1 : 0,  // visit_at — same flag, separate param
-    campaign_source || null,
-    ad_id || null,
-    visit_code || null,
+    cleanCampaignSource || null,
+    cleanAdId || null,
+    cleanVisitCode || null,
     normPhone || null,
+    // ManyChat enrichment fields
+    last_name || null,
+    gender || null,
+    locale || null,
+    timezone || null,
+    last_input_text || null,
+    subscribed_at || null,
+    growth_tool_id || null,
+    manychat_source || null,
+    extraFieldsJson,
     user_id
   );
 
@@ -1684,6 +1739,39 @@ app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), 
   return res.json(getAchievementWeights());
 });
 
+// Admin alert: surface ManyChat External Requests that still send the
+// literal placeholder "{{cuf_…}}" because the user_field reference was
+// configured wrong. Lets the admin spot broken attribution at a glance.
+app.get('/api/admin/manychat-health', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+  // Count leads stored with literal placeholders (legacy rows from before
+  // we started rejecting them on ingest).
+  const broken = db.prepare(`
+    SELECT
+      SUM(CASE WHEN campaign_source LIKE '{{%}}' THEN 1 ELSE 0 END) AS broken_campaign_source,
+      SUM(CASE WHEN ad_id           LIKE '{{%}}' THEN 1 ELSE 0 END) AS broken_ad_id,
+      SUM(CASE WHEN visit_code      LIKE '{{%}}' THEN 1 ELSE 0 END) AS broken_visit_code,
+      COUNT(*) AS total_leads
+    FROM lead_profiles
+  `).get();
+
+  // Count enrichment-field coverage to see which fields ManyChat is
+  // actually sending us right now.
+  const coverage = db.prepare(`
+    SELECT
+      COUNT(CASE WHEN gender          IS NOT NULL AND gender != ''           THEN 1 END) AS with_gender,
+      COUNT(CASE WHEN locale          IS NOT NULL AND locale != ''           THEN 1 END) AS with_locale,
+      COUNT(CASE WHEN last_input_text IS NOT NULL AND last_input_text != ''  THEN 1 END) AS with_last_input_text,
+      COUNT(CASE WHEN last_name       IS NOT NULL AND last_name != ''        THEN 1 END) AS with_last_name,
+      COUNT(CASE WHEN growth_tool_id  IS NOT NULL AND growth_tool_id != ''   THEN 1 END) AS with_growth_tool_id,
+      COUNT(CASE WHEN extra_fields    IS NOT NULL AND extra_fields != ''     THEN 1 END) AS with_extra_fields,
+      COUNT(*) AS total
+    FROM lead_profiles
+  `).get();
+
+  return res.json({ broken_placeholders: broken, enrichment_coverage: coverage });
+});
+
 // Debug endpoint — show the raw_payload fields ManyChat actually sends, so
 // we know what extra data we could be capturing but currently ignore.
 app.get('/api/admin/manychat-payload-sample', requireAuth, requireRole('admin'), (_req, res) => {
@@ -2761,7 +2849,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-05-20-forecast-v6-location-bucket';
+const BUILD_VERSION = '2026-05-20-manychat-enrichment-v1';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',

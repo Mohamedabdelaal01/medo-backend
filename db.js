@@ -118,6 +118,28 @@ function initializeDatabase() {
     if (!e.message.includes('duplicate column name')) throw e;
   }
 
+  // ── ManyChat enrichment columns ────────────────────────────────────────
+  // These hold the extra profile fields ManyChat can attach to events
+  // (some are already sent, others become available once the admin adds
+  // them to the External Request payload — see ManyChat setup guide).
+  for (const col of [
+    `last_name        TEXT`,
+    `gender           TEXT`,
+    `locale           TEXT`,
+    `timezone         TEXT`,
+    `last_input_text  TEXT`,
+    `subscribed_at    DATETIME`,
+    `growth_tool_id   TEXT`,
+    `manychat_source  TEXT`,   // 'manychat' channel marker
+    `extra_fields     TEXT`,   // JSON dump of anything new ManyChat sends
+  ]) {
+    try {
+      db.exec(`ALTER TABLE lead_profiles ADD COLUMN ${col}`);
+    } catch (e) {
+      if (!e.message.includes('duplicate column name')) throw e;
+    }
+  }
+
   // ── Indexes for fast dashboard queries ────────────────────────────────
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_user_id    ON events(user_id);
