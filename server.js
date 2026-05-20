@@ -1684,6 +1684,32 @@ app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), 
   return res.json(getAchievementWeights());
 });
 
+// Debug endpoint — verify the forecast split logic against raw data
+app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      e.user_id,
+      e.created_at AS branch_event_at,
+      (SELECT MIN(p.created_at) FROM lead_phones p WHERE p.user_id = e.user_id) AS first_phone_at,
+      (SELECT COUNT(*)            FROM lead_phones p WHERE p.user_id = e.user_id) AS phone_count
+    FROM events e
+    WHERE e.event_type = 'branch_selected'
+      AND e.created_at >= datetime('now', '-7 days')
+    ORDER BY e.created_at DESC
+    LIMIT 30
+  `).all();
+
+  const summary = {
+    total:                     rows.length,
+    has_phone_row:             rows.filter(r => r.phone_count > 0).length,
+    no_phone_row:              rows.filter(r => r.phone_count === 0).length,
+    phone_before_or_eq_branch: rows.filter(r => r.first_phone_at && r.first_phone_at <= r.branch_event_at).length,
+    phone_after_branch:        rows.filter(r => r.first_phone_at && r.first_phone_at >  r.branch_event_at).length,
+  };
+  return res.json({ summary, sample: rows.slice(0, 10) });
+});
+
 app.get('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (_req, res) => {
   const db = getDb();
   const rows = db.prepare(`SELECT key, value FROM settings WHERE key IN
@@ -2664,7 +2690,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-05-20-forecast-v3-timing';
+const BUILD_VERSION = '2026-05-20-forecast-v4-debug';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
