@@ -2581,6 +2581,58 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   return res.json({ ok: true });
 });
 
+// DELETE /api/users/:id — admin removes a user account permanently.
+// Safety: admin cannot delete their OWN account (prevents self-lockout).
+// Returns 404 if the user doesn't exist, 400 if attempting self-deletion.
+app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(targetId)) return res.status(400).json({ error: 'bad_id' });
+  if (targetId === req.user.id)   return res.status(400).json({ error: 'cannot_delete_self' });
+
+  const db = getDb();
+  const row = db.prepare(`SELECT id, role FROM users WHERE id = ?`).get(targetId);
+  if (!row) return res.status(404).json({ error: 'user_not_found' });
+
+  // Safety: never delete the last admin account.
+  if (row.role === 'admin') {
+    const others = db.prepare(
+      `SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND id != ?`
+    ).get(targetId);
+    if ((others?.n || 0) === 0) {
+      return res.status(400).json({ error: 'cannot_delete_last_admin' });
+    }
+  }
+
+  db.prepare(`DELETE FROM users WHERE id = ?`).run(targetId);
+  return res.json({ ok: true });
+});
+
+// Also expose the dashboard summary's age buckets so the customers analytics
+// page can show *real* aging across all leads (not just the recent_hot_leads
+// preview). Returns counts for today / week / month / older.
+app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT
+      SUM(CASE WHEN julianday('now') - julianday(created_at) <= 1  THEN 1 ELSE 0 END) AS today,
+      SUM(CASE WHEN julianday('now') - julianday(created_at) >  1
+            AND julianday('now') - julianday(created_at) <= 7  THEN 1 ELSE 0 END) AS week,
+      SUM(CASE WHEN julianday('now') - julianday(created_at) >  7
+            AND julianday('now') - julianday(created_at) <= 30 THEN 1 ELSE 0 END) AS month,
+      SUM(CASE WHEN julianday('now') - julianday(created_at) > 30 THEN 1 ELSE 0 END) AS older,
+      COUNT(*) AS total
+    FROM lead_profiles
+    WHERE created_at IS NOT NULL
+  `).get();
+  return res.json({
+    today: row?.today || 0,
+    week:  row?.week  || 0,
+    month: row?.month || 0,
+    older: row?.older || 0,
+    total: row?.total || 0,
+  });
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // GET /health — Health check
 // ════════════════════════════════════════════════════════════════════════════
