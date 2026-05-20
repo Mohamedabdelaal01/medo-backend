@@ -2584,8 +2584,15 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 // GET /health — Health check
 // ════════════════════════════════════════════════════════════════════════════
+// Version marker — bumped on every meaningful release so the admin
+// (and our deploy checks) can confirm production is running the latest code.
+const BUILD_VERSION = '2026-05-20-achievements-v1';
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status:    'ok',
+    timestamp: new Date().toISOString(),
+    version:   BUILD_VERSION,
+  });
 });
 
 // ── Background Jobs ───────────────────────────────────────────────────────
