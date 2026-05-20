@@ -339,6 +339,25 @@ function initializeDatabase() {
     );
   `);
 
+  // achievement_badges: persisted recognitions for sales reps and branches.
+  // entity_type = 'sales' (sales_rep name) or 'branch' (branch id).
+  // badge_code is unique per (entity_type, entity_id) — re-awarding the same
+  // weekly trophy to the same person is idempotent.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS achievement_badges (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type TEXT NOT NULL CHECK (entity_type IN ('sales','branch')),
+      entity_id   TEXT NOT NULL,
+      badge_code  TEXT NOT NULL,
+      badge_label TEXT NOT NULL,
+      earned_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+      score       REAL,
+      UNIQUE(entity_type, entity_id, badge_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_badges_entity
+      ON achievement_badges(entity_type, entity_id);
+  `);
+
   // ── Users & Settings (auth layer) ────────────────────────────────────────
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -418,6 +437,10 @@ function initializeDatabase() {
     ['webhook_enforce',        'false'],
     // Auto-assign a lead to the least-loaded rep when it first turns warm.
     ['auto_assign_enabled',    'true'],
+    // Achievement scoring weights (must sum to 100). Editable from Settings.
+    ['achievement_followup_weight', '30'],
+    ['achievement_visit_weight',    '30'],
+    ['achievement_close_weight',    '40'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`

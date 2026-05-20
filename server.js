@@ -15,7 +15,7 @@ const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
 const { getManyChatClient }= require('./manychat/client');
-const { requireAuth, requireRole, getJwtSecret } = require('./middleware/auth');
+const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -148,13 +148,10 @@ app.use((req, res, next) => {
 // Falls through silently if WEBHOOK_SECRET is not set (dev / staging without secret).
 // ManyChat supports custom headers — set x-webhook-secret in webhook settings.
 function validateSecret(req, res, next) {
-  // Secret comes from env (highest priority) or the auto-generated DB value.
-  const secret = process.env.WEBHOOK_SECRET || getSetting('webhook_secret');
-  // Enforcement is opt-in (admin toggles it in Settings) so going live with
-  // this code doesn't instantly break an already-running ManyChat setup.
+  const secret  = process.env.WEBHOOK_SECRET || getSetting('webhook_secret');
   const enforce = getSetting('webhook_enforce', 'false') === 'true';
 
-  if (!enforce || !secret) return next(); // not enforced — accept (legacy behavior)
+  if (!enforce || !secret) return next();
 
   const incoming = req.headers['x-webhook-secret'];
   if (!incoming || incoming !== secret) {
@@ -840,6 +837,12 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     LIMIT 20
   `).all();
 
+  // Distinct customers who have shared at least one phone number — used by
+  // admin Customers analytics to compute phone-collection coverage.
+  const withPhonesCount = db.prepare(
+    `SELECT COUNT(DISTINCT user_id) AS count FROM lead_phones`
+  ).get();
+
   const responseData = {
     summary: {
       total_leads:        totalLeads.count,
@@ -849,6 +852,7 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
       visits_this_week:   visitsThisWeek.count,
       conversion_to_visit: conversionToVisit,
       lead_distribution:  leadCounts,
+      with_phones_count:  withPhonesCount.count,
     },
     top_products:          topProducts,
     branch_demand:         branchDemand,
@@ -1242,11 +1246,8 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
 // Shows everyone who picked the branch (branch_selected event) even if they
 // haven't visited yet; visited_here flags who already came.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/reception/leads', requireAuth, (req, res) => {
+app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (role !== 'reception' && role !== 'admin') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'reception'
     ? (req.user.branch || null)
     : (req.query.branch || null);
@@ -1290,11 +1291,8 @@ app.get('/api/reception/leads', requireAuth, (req, res) => {
 // GET /api/sales/reps — list showroom salespeople (role='sales').
 //   reception → locked to its own branch. admin → all or ?branch=
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/sales/reps', requireAuth, (req, res) => {
+app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sales'), (req, res) => {
   const role = req.user?.role;
-  if (!['reception', 'admin', 'sales'].includes(role)) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'reception' ? (req.user.branch || null) : (req.query.branch || null);
   const db = getDb();
   const rows = branch
@@ -1307,11 +1305,8 @@ app.get('/api/sales/reps', requireAuth, (req, res) => {
 // POST /api/visits/set-sales — reception attaches the salesperson who served.
 // Body: { user_id, sales_rep }   (reception → own branch; admin → ?branch)
 // ════════════════════════════════════════════════════════════════════════════
-app.post('/api/visits/set-sales', requireAuth, (req, res) => {
+app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (!['reception', 'admin'].includes(role)) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const { user_id, sales_rep, branch: bodyBranch } = req.body || {};
   if (!user_id || !sales_rep) {
     return res.status(400).json({ error: 'user_id and sales_rep required' });
@@ -1339,8 +1334,7 @@ app.post('/api/visits/set-sales', requireAuth, (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/sales/my — a salesperson's own customers + this-month KPIs.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/sales/my', requireAuth, (req, res) => {
-  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
   const me = req.user.name;
   const db = getDb();
 
@@ -1474,15 +1468,249 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Admin Achievements — composite-score leaderboards for sales reps & branches.
+//
+// Score formula (weights configurable in settings, default 30/30/40):
+//   followup_rate = followups_done / phones_received
+//   visit_rate    = visits_done    / followups_done
+//   close_rate    = purchases_done / visits_done
+//   score = followup_rate*W1 + visit_rate*W2 + close_rate*W3   (0..100)
+//
+// "phones_received" = customers assigned to this sales/branch AND lead has
+// at least one phone in lead_phones (i.e. the customer actually left a number).
+// ════════════════════════════════════════════════════════════════════════════
+function getAchievementWeights() {
+  const db  = getDb();
+  const row = db.prepare(`SELECT key, value FROM settings WHERE key IN (
+    'achievement_followup_weight','achievement_visit_weight','achievement_close_weight'
+  )`).all();
+  const m = Object.fromEntries(row.map(r => [r.key, parseFloat(r.value) || 0]));
+  const w = {
+    followup: m.achievement_followup_weight || 30,
+    visit:    m.achievement_visit_weight    || 30,
+    close:    m.achievement_close_weight    || 40,
+  };
+  return w;
+}
+
+function computeScore(metrics, weights) {
+  const fr = metrics.phones_received  ? metrics.followups_done / metrics.phones_received : 0;
+  const vr = metrics.followups_done   ? metrics.visits_done    / metrics.followups_done  : 0;
+  const cr = metrics.visits_done      ? metrics.purchases_done / metrics.visits_done     : 0;
+  return {
+    followup_rate: Math.round(fr * 100),
+    visit_rate:    Math.round(vr * 100),
+    close_rate:    Math.round(cr * 100),
+    score:         Math.round(fr * weights.followup + vr * weights.visit + cr * weights.close),
+  };
+}
+
+app.get('/api/admin/achievements/sales', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const { branch } = req.query;
+  const branchClause = branch ? `AND f.branch = ?` : '';
+  const branchParam  = branch ? [branch] : [];
+
+  // For each (sales_rep, branch): count phones_received, followups_done,
+  // visits_done (by that rep at that branch), purchases_done (by that rep).
+  const rows = db.prepare(`
+    SELECT
+      f.assigned_sales AS sales_rep,
+      f.branch         AS branch,
+      COUNT(DISTINCT CASE WHEN ph.user_id IS NOT NULL THEN f.user_id END)   AS phones_received,
+      SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END)                    AS followups_done,
+      (SELECT COUNT(DISTINCT v.user_id) FROM lead_visits v
+        WHERE v.sales_rep = f.assigned_sales AND v.branch = f.branch)       AS visits_done,
+      (SELECT COUNT(DISTINCT p.user_id) FROM purchases p
+        WHERE p.rep = f.assigned_sales AND p.branch = f.branch)             AS purchases_done
+    FROM branch_customer_followups f
+    LEFT JOIN lead_phones ph ON ph.user_id = f.user_id
+    WHERE f.assigned_sales IS NOT NULL ${branchClause}
+    GROUP BY f.assigned_sales, f.branch
+  `).all(...branchParam);
+
+  const weights = getAchievementWeights();
+  const enriched = rows.map(r => ({ ...r, ...computeScore(r, weights) }))
+    .sort((a, b) => b.score - a.score)
+    .map((r, i) => ({ ...r, rank: i + 1 }));
+
+  // Attach badges
+  const badges = db.prepare(`
+    SELECT entity_id, badge_code, badge_label, earned_at, score
+    FROM achievement_badges WHERE entity_type = 'sales'
+    ORDER BY earned_at DESC
+  `).all();
+  const badgesByRep = badges.reduce((acc, b) => {
+    (acc[b.entity_id] ||= []).push(b);
+    return acc;
+  }, {});
+  for (const r of enriched) r.badges = badgesByRep[r.sales_rep] || [];
+
+  return res.json({ weights, rows: enriched });
+});
+
+app.get('/api/admin/achievements/branches', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      f.branch AS branch,
+      COUNT(DISTINCT CASE WHEN ph.user_id IS NOT NULL THEN f.user_id END)  AS phones_received,
+      SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END)                   AS followups_done,
+      (SELECT COUNT(DISTINCT v.user_id) FROM lead_visits v
+        WHERE v.branch = f.branch)                                         AS visits_done,
+      (SELECT COUNT(DISTINCT p.user_id) FROM purchases p
+        WHERE p.branch = f.branch)                                         AS purchases_done
+    FROM branch_customer_followups f
+    LEFT JOIN lead_phones ph ON ph.user_id = f.user_id
+    WHERE f.branch IS NOT NULL
+    GROUP BY f.branch
+  `).all();
+
+  const weights = getAchievementWeights();
+  const enriched = rows.map(r => ({ ...r, ...computeScore(r, weights) }))
+    .sort((a, b) => b.score - a.score)
+    .map((r, i) => ({ ...r, rank: i + 1 }));
+
+  const badges = db.prepare(`
+    SELECT entity_id, badge_code, badge_label, earned_at, score
+    FROM achievement_badges WHERE entity_type = 'branch'
+    ORDER BY earned_at DESC
+  `).all();
+  const badgesByBranch = badges.reduce((acc, b) => {
+    (acc[b.entity_id] ||= []).push(b);
+    return acc;
+  }, {});
+  for (const r of enriched) r.badges = badgesByBranch[r.branch] || [];
+
+  return res.json({ weights, rows: enriched });
+});
+
+app.post('/api/admin/achievements/award', requireAuth, requireRole('admin'), (req, res) => {
+  const { entity_type, entity_id, badge_code, badge_label, score } = req.body || {};
+  if (!['sales','branch'].includes(entity_type)) return res.status(400).json({ error: 'bad_entity_type' });
+  if (!entity_id || !badge_code || !badge_label) return res.status(400).json({ error: 'missing_fields' });
+
+  const db = getDb();
+  try {
+    db.prepare(`
+      INSERT INTO achievement_badges (entity_type, entity_id, badge_code, badge_label, score)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(entity_type, entity_id, badge_code, badge_label, score ?? null);
+    return res.json({ ok: true });
+  } catch (e) {
+    // UNIQUE violation = badge already awarded → idempotent
+    if (String(e.message).includes('UNIQUE')) return res.json({ ok: true, alreadyEarned: true });
+    return res.status(500).json({ error: 'award_failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/reps-analytics — per-call-rep performance (role='rep').
+// Returns per-rep counters: leads assigned, hot/visited/purchased among them,
+// messages triggered, tasks pending/done. No personal tools — pure analytics.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/reps-analytics', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+
+  // All users with role='rep' (call reps / موديريتورز)
+  const reps = db.prepare(`
+    SELECT name, email, branch, active, created_at
+    FROM users
+    WHERE role = 'rep'
+    ORDER BY name
+  `).all();
+
+  // Lead aggregates grouped by assigned_rep
+  const leadStats = db.prepare(`
+    SELECT
+      assigned_rep AS rep,
+      COUNT(*) AS leads_assigned,
+      SUM(CASE WHEN lead_class = 'hot'       THEN 1 ELSE 0 END) AS hot_leads,
+      SUM(CASE WHEN lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END) AS visited,
+      SUM(CASE WHEN lead_class = 'purchased' THEN 1 ELSE 0 END) AS purchased
+    FROM lead_profiles
+    WHERE assigned_rep IS NOT NULL AND assigned_rep != ''
+    GROUP BY assigned_rep
+  `).all();
+  const leadsByRep = Object.fromEntries(leadStats.map(r => [r.rep, r]));
+
+  // Messages sent per rep
+  const msgStats = db.prepare(`
+    SELECT sent_by_rep AS rep, COUNT(*) AS messages_sent
+    FROM messages_sent
+    WHERE sent_by_rep IS NOT NULL
+    GROUP BY sent_by_rep
+  `).all();
+  const msgsByRep = Object.fromEntries(msgStats.map(r => [r.rep, r.messages_sent]));
+
+  // Tasks per rep
+  const taskStats = db.prepare(`
+    SELECT rep_name AS rep,
+      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS tasks_pending,
+      SUM(CASE WHEN status = 'done'    THEN 1 ELSE 0 END) AS tasks_done
+    FROM tasks
+    WHERE rep_name IS NOT NULL
+    GROUP BY rep_name
+  `).all();
+  const tasksByRep = Object.fromEntries(taskStats.map(r => [r.rep, r]));
+
+  const rows = reps.map(u => {
+    const ls = leadsByRep[u.name]   || {};
+    const ts = tasksByRep[u.name]   || {};
+    const leads     = ls.leads_assigned || 0;
+    const visited   = ls.visited        || 0;
+    const purchased = ls.purchased      || 0;
+    return {
+      name:           u.name,
+      email:          u.email,
+      branch:         u.branch,
+      active:         u.active,
+      leads_assigned: leads,
+      hot_leads:      ls.hot_leads || 0,
+      visited,
+      purchased,
+      messages_sent:  msgsByRep[u.name] || 0,
+      tasks_pending:  ts.tasks_pending  || 0,
+      tasks_done:     ts.tasks_done     || 0,
+      conversion_rate: leads   ? Math.round((visited   / leads)   * 100) : 0,
+      close_rate:      visited ? Math.round((purchased / visited) * 100) : 0,
+    };
+  }).sort((a, b) => (b.purchased - a.purchased) || (b.visited - a.visited));
+
+  return res.json({ rows });
+});
+
+app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), (_req, res) => {
+  return res.json(getAchievementWeights());
+});
+
+app.put('/api/settings/achievement-weights', requireAuth, requireRole('admin'), (req, res) => {
+  const { followup, visit, close } = req.body || {};
+  const f = parseFloat(followup), v = parseFloat(visit), c = parseFloat(close);
+  if ([f, v, c].some(n => !Number.isFinite(n) || n < 0 || n > 100)) {
+    return res.status(400).json({ error: 'invalid_weights' });
+  }
+  if (Math.round(f + v + c) !== 100) {
+    return res.status(400).json({ error: 'weights_must_sum_to_100' });
+  }
+  const db = getDb();
+  const upsert = db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+  `);
+  upsert.run('achievement_followup_weight', String(f));
+  upsert.run('achievement_visit_weight',    String(v));
+  upsert.run('achievement_close_weight',    String(c));
+  return res.json({ ok: true, weights: getAchievementWeights() });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/branch/overview — branch manager's read-only view of THEIR branch.
 //   branch_manager → locked to its own branch. admin → ?branch=<id>
 //   Returns branch KPIs + per-salesperson performance for that branch only.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/branch/overview', requireAuth, (req, res) => {
+app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (role !== 'branch_manager' && role !== 'admin') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'branch_manager'
     ? (req.user.branch || null)
     : (req.query.branch || null);
@@ -1571,11 +1799,8 @@ app.get('/api/branch/overview', requireAuth, (req, res) => {
 // GET /api/branch/customers — customers who requested this branch + follow-up status
 //   branch_manager → locked to own branch. admin → ?branch=<id>
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/branch/customers', requireAuth, (req, res) => {
+app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (role !== 'branch_manager' && role !== 'admin') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'branch_manager'
     ? (req.user.branch || null)
     : (req.query.branch || null);
@@ -1637,11 +1862,8 @@ function logFollowup(db, branch, userId, sales, summary) {
 // new rep starts fresh; prior call summaries stay in followup_log.
 // Body: { sales }   (branch_manager → own branch; admin → body.branch)
 // ════════════════════════════════════════════════════════════════════════════
-app.patch('/api/branch/customers/:userId/assign', requireAuth, (req, res) => {
+app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (role !== 'branch_manager' && role !== 'admin') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'branch_manager'
     ? (req.user.branch || null)
     : (req.body?.branch || null);
@@ -1681,11 +1903,8 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, (req, res) => {
 // PATCH /api/branch/customers/:userId/followup — manager marks follow-up done
 // himself (he can also do the call). Accepts an optional call_summary.
 // ════════════════════════════════════════════════════════════════════════════
-app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
+app.patch('/api/branch/customers/:userId/followup', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const role = req.user?.role;
-  if (role !== 'branch_manager' && role !== 'admin') {
-    return res.status(403).json({ error: 'forbidden' });
-  }
   const branch = role === 'branch_manager'
     ? (req.user.branch || null)
     : (req.body?.branch || null);
@@ -1720,8 +1939,7 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, (req, res) => {
 // Sales follow-ups — the sales rep sees customers the branch manager assigned
 // to them, splits pending vs done, and writes a call summary on completion.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/sales/followups', requireAuth, (req, res) => {
-  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res) => {
   const me     = req.user.name;
   const branch = req.user.branch || null;
   if (!branch) return res.status(400).json({ error: 'branch_required' });
@@ -1754,8 +1972,7 @@ app.get('/api/sales/followups', requireAuth, (req, res) => {
   return res.json({ branch, customers });
 });
 
-app.patch('/api/sales/followups/:userId', requireAuth, (req, res) => {
-  if (req.user?.role !== 'sales') return res.status(403).json({ error: 'forbidden' });
+app.patch('/api/sales/followups/:userId', requireAuth, authorizeRoles('sales'), (req, res) => {
   const me     = req.user.name;
   const branch = req.user.branch || null;
   if (!branch) return res.status(400).json({ error: 'branch_required' });
@@ -1958,7 +2175,7 @@ app.get('/api/predictions', requireAuth, (req, res) => {
 //
 // Identity is taken from the JWT (req.user) — NOT from client headers, which
 // are spoofable. Only a real admin token can use force=true.
-app.post('/api/trigger-message', requireAuth, async (req, res) => {
+app.post('/api/trigger-message', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales'), async (req, res) => {
   try {
     const { user_id, action_type, force } = req.body || {};
     if (!user_id || typeof user_id !== 'string') {
