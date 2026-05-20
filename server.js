@@ -1687,6 +1687,23 @@ app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), 
 // Debug endpoint — verify the forecast split logic against raw data
 app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, res) => {
   const db = getDb();
+
+  // Breakdown of ALL event types from last 7 days, with phone-coverage stats
+  const eventBreakdown = db.prepare(`
+    SELECT
+      event_type,
+      COUNT(*)                                                                AS events,
+      COUNT(DISTINCT user_id)                                                 AS unique_users,
+      COUNT(DISTINCT CASE WHEN EXISTS (
+        SELECT 1 FROM lead_phones p WHERE p.user_id = events.user_id
+      ) THEN user_id END)                                                     AS users_with_phone
+    FROM events
+    WHERE created_at >= datetime('now', '-7 days')
+    GROUP BY event_type
+    ORDER BY unique_users DESC
+  `).all();
+
+  // For users who did branch_selected last 7 days, sample with timing
   const rows = db.prepare(`
     SELECT
       e.user_id,
@@ -1697,17 +1714,33 @@ app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, r
     WHERE e.event_type = 'branch_selected'
       AND e.created_at >= datetime('now', '-7 days')
     ORDER BY e.created_at DESC
-    LIMIT 30
+    LIMIT 10
   `).all();
 
-  const summary = {
-    total:                     rows.length,
-    has_phone_row:             rows.filter(r => r.phone_count > 0).length,
-    no_phone_row:              rows.filter(r => r.phone_count === 0).length,
-    phone_before_or_eq_branch: rows.filter(r => r.first_phone_at && r.first_phone_at <= r.branch_event_at).length,
-    phone_after_branch:        rows.filter(r => r.first_phone_at && r.first_phone_at >  r.branch_event_at).length,
-  };
-  return res.json({ summary, sample: rows.slice(0, 10) });
+  // Users who did location_request but NEVER gave phone — the "got address
+  // without phone" cohort
+  const locationNoPhone = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n
+    FROM events e
+    WHERE e.event_type = 'location_request'
+      AND e.created_at >= datetime('now', '-7 days')
+      AND NOT EXISTS (SELECT 1 FROM lead_phones p WHERE p.user_id = e.user_id)
+  `).get();
+
+  const branchNoPhone = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n
+    FROM events e
+    WHERE e.event_type = 'branch_selected'
+      AND e.created_at >= datetime('now', '-7 days')
+      AND NOT EXISTS (SELECT 1 FROM lead_phones p WHERE p.user_id = e.user_id)
+  `).get();
+
+  return res.json({
+    event_breakdown_last7: eventBreakdown,
+    branch_selected_no_phone_users: branchNoPhone.n,
+    location_request_no_phone_users: locationNoPhone.n,
+    sample: rows,
+  });
 });
 
 app.get('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (_req, res) => {
@@ -2690,7 +2723,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-05-20-forecast-v4-debug';
+const BUILD_VERSION = '2026-05-20-forecast-v5-events';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
