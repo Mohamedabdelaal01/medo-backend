@@ -54,15 +54,27 @@ function getForecastWeights() {
 }
 
 // For each of the last N days, count distinct customers who triggered
-// branch_selected, split by whether they ever shared a phone number
-// (presence in lead_phones table).
+// branch_selected, split by whether they had ALREADY shared a phone at the
+// MOMENT they picked the branch.
+//
+// Important: we compare timestamps, not presence. A customer who picked
+// nasr_city at 10:00 and then dropped their phone at 10:02 is counted as
+// "without phone" — that captures real intent at decision time and matches
+// the conversion-rate split (people who commit a phone first close ~80%,
+// the rest ~35% because they still get the location/address but slower).
 function getDailySeries(days = 14) {
   const db = getDb();
   const rows = db.prepare(`
     SELECT
       e.user_id,
+      e.created_at AS event_at,
       substr(e.created_at, 1, 10) AS day,
-      (SELECT 1 FROM lead_phones p WHERE p.user_id = e.user_id LIMIT 1) AS has_phone
+      (
+        SELECT 1 FROM lead_phones p
+        WHERE p.user_id = e.user_id
+          AND p.created_at <= e.created_at
+        LIMIT 1
+      ) AS had_phone_before
     FROM events e
     WHERE e.event_type = 'branch_selected'
       AND e.created_at >= datetime('now', ?)
@@ -72,11 +84,20 @@ function getDailySeries(days = 14) {
   for (const day of lastNDays(days)) {
     buckets.set(day, { withPhone: new Set(), withoutPhone: new Set() });
   }
+  // A user can pick a branch multiple times in a day. Take the FIRST event
+  // of the day for the with/without decision (earliest moment of intent).
+  const firstPerUserPerDay = new Map(); // `${day}|${uid}` → had_phone_before
   for (const r of rows) {
+    const key = `${r.day}|${r.user_id}`;
+    if (!firstPerUserPerDay.has(key) || r.event_at < firstPerUserPerDay.get(key).event_at) {
+      firstPerUserPerDay.set(key, r);
+    }
+  }
+  for (const r of firstPerUserPerDay.values()) {
     const b = buckets.get(r.day);
     if (!b) continue;
-    if (r.has_phone) b.withPhone.add(r.user_id);
-    else             b.withoutPhone.add(r.user_id);
+    if (r.had_phone_before) b.withPhone.add(r.user_id);
+    else                    b.withoutPhone.add(r.user_id);
   }
 
   const { withPct, withoutPct } = getForecastWeights();
