@@ -1684,6 +1684,44 @@ app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), 
   return res.json(getAchievementWeights());
 });
 
+// Debug endpoint — show the raw_payload fields ManyChat actually sends, so
+// we know what extra data we could be capturing but currently ignore.
+app.get('/api/admin/manychat-payload-sample', requireAuth, requireRole('admin'), (_req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT event_type, raw_payload, created_at
+    FROM events
+    WHERE raw_payload IS NOT NULL AND raw_payload != ''
+      AND created_at >= datetime('now', '-7 days')
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all();
+
+  // Aggregate ALL keys we've ever seen in raw_payload across the sample,
+  // so the admin can see at a glance which fields ManyChat sends.
+  const fieldFrequency = {};
+  const samples = [];
+  for (const r of rows) {
+    try {
+      const parsed = JSON.parse(r.raw_payload);
+      for (const k of Object.keys(parsed)) {
+        fieldFrequency[k] = (fieldFrequency[k] || 0) + 1;
+      }
+      samples.push({ event_type: r.event_type, payload: parsed });
+    } catch (_) {
+      // ignore malformed rows
+    }
+  }
+  return res.json({
+    fields_observed:   fieldFrequency,
+    sample_payloads:   samples.slice(0, 5),
+    extracted_today:   {
+      // What our handler currently destructures from the body:
+      handled_fields: ['user_id','event_type','event_value','campaign_source','ad_id','visit_code','phone','product','category','branch','event_id'],
+    },
+  });
+});
+
 // Debug endpoint — verify the forecast split logic against raw data
 app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, res) => {
   const db = getDb();
