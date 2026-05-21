@@ -2550,7 +2550,18 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
       (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id
          ORDER BY v.visited_at DESC LIMIT 1) AS sales_rep,
       (SELECT COALESCE(SUM(p.price), 0) FROM purchases p
-         WHERE p.user_id = lp.user_id)       AS purchase_total
+         WHERE p.user_id = lp.user_id)       AS purchase_total,
+      (SELECT COUNT(*) FROM revisit_followups rf
+         WHERE rf.user_id = lp.user_id)      AS followup_count,
+      (SELECT rf.created_at FROM revisit_followups rf
+         WHERE rf.user_id = lp.user_id
+         ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_at,
+      (SELECT rf.followed_up_by FROM revisit_followups rf
+         WHERE rf.user_id = lp.user_id
+         ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_by,
+      (SELECT rf.note FROM revisit_followups rf
+         WHERE rf.user_id = lp.user_id
+         ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_note
     FROM lead_profiles lp
     WHERE lp.visit_confirmed = 1
       AND ${statusWhere}
@@ -2601,6 +2612,128 @@ app.post('/api/revisit/:userId/reopen', requireAuth, authorizeRoles('admin', 'br
   `).run(req.user?.name || null, userId);
 
   return res.json({ ok: true, revisit_status: 'pending' });
+});
+
+// POST /api/revisit/:userId/followup — log a re-visit follow-up attempt.
+// Appends to revisit_followups so we can see how many times (and when) the
+// customer was followed up — the customer STAYS in the pending list.
+// Body: { note }.
+app.post('/api/revisit/:userId/followup', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const { userId } = req.params;
+  const note = (req.body?.note && String(req.body.note).trim()) || null;
+  const db = getDb();
+  const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+
+  db.prepare(`
+    INSERT INTO revisit_followups (user_id, followed_up_by, note)
+    VALUES (?, ?, ?)
+  `).run(userId, req.user?.name || null, note);
+
+  // Surface the latest activity on the profile too.
+  db.prepare(`UPDATE lead_profiles SET last_activity = datetime('now') WHERE user_id = ?`)
+    .run(userId);
+
+  const count = db.prepare(
+    `SELECT COUNT(*) AS n FROM revisit_followups WHERE user_id = ?`
+  ).get(userId).n;
+
+  console.log(`📞 REVISIT FOLLOWUP #${count}: ${userId} by ${req.user?.name || '?'}`);
+  return res.json({ ok: true, followup_count: count });
+});
+
+// GET /api/revisit/:userId/followups — full re-visit follow-up history.
+app.get('/api/revisit/:userId/followups', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const db = getDb();
+  const followups = db.prepare(`
+    SELECT id, followed_up_by, note, created_at
+    FROM revisit_followups
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+  `).all(req.params.userId);
+  return res.json({ followups });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/revisit/analytics — funnel analytics for visited-but-no-purchase
+// customers + re-follow-up activity. Scoped by role (admin / manager / sales).
+// Returns: { summary, byBranch[], bySales[] }
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const db   = getDb();
+  const role = req.user?.role;
+
+  let rbacWhere = '1=1';
+  const params = [];
+  if (role === 'branch_manager') {
+    const b = req.user.branch || null;
+    if (!b) return res.status(400).json({ error: 'branch_required' });
+    rbacWhere = `(lp.preferred_branch = ?
+      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
+    params.push(b, b);
+  } else if (role === 'sales' || role === 'rep') {
+    const me = req.user.name;
+    rbacWhere = `(lp.assigned_rep = ?
+      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE sales_rep = ?))`;
+    params.push(me, me);
+  }
+
+  // One row per customer who visited the showroom.
+  const rows = db.prepare(`
+    SELECT
+      lp.user_id, lp.lead_class, lp.purchased_at, lp.revisit_status,
+      (SELECT v.branch    FROM lead_visits v WHERE v.user_id = lp.user_id
+         ORDER BY v.visited_at DESC LIMIT 1) AS branch,
+      (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id
+         ORDER BY v.visited_at DESC LIMIT 1) AS sales_rep,
+      (SELECT COUNT(*) FROM revisit_followups rf WHERE rf.user_id = lp.user_id) AS followup_count
+    FROM lead_profiles lp
+    WHERE lp.visit_confirmed = 1 AND ${rbacWhere}
+  `).all(...params);
+
+  const blank = () => ({ pending: 0, bought: 0, lost: 0, followups: 0 });
+  const summary = { visited_total: rows.length, pending: 0, bought: 0, lost: 0,
+                    followups_total: 0, customers_followed: 0 };
+  const branchMap = new Map();
+  const salesMap  = new Map();
+
+  for (const r of rows) {
+    const bucket = (r.lead_class === 'purchased' || r.purchased_at) ? 'bought'
+      : (r.revisit_status === 'lost') ? 'lost' : 'pending';
+    summary[bucket]++;
+    summary.followups_total += r.followup_count || 0;
+    if (r.followup_count > 0) summary.customers_followed++;
+
+    const bKey = r.branch || '—';
+    if (!branchMap.has(bKey)) branchMap.set(bKey, { branch: bKey, ...blank() });
+    branchMap.get(bKey)[bucket]++;
+    branchMap.get(bKey).followups += r.followup_count || 0;
+
+    if (r.sales_rep) {
+      const sKey = `${r.sales_rep}|${r.branch || ''}`;
+      if (!salesMap.has(sKey)) salesMap.set(sKey, { sales_rep: r.sales_rep, branch: r.branch || '—', ...blank() });
+      salesMap.get(sKey)[bucket]++;
+      salesMap.get(sKey).followups += r.followup_count || 0;
+    }
+  }
+
+  const noBuy = summary.pending + summary.lost;
+  summary.no_purchase_total = noBuy;
+  summary.conversion_rate   = summary.visited_total
+    ? Math.round((summary.bought / summary.visited_total) * 100) : 0;
+  summary.avg_followups = summary.customers_followed
+    ? Math.round((summary.followups_total / summary.customers_followed) * 10) / 10 : 0;
+
+  const withRate = (o) => {
+    const total = o.pending + o.bought + o.lost;
+    return { ...o, conversion: total ? Math.round((o.bought / total) * 100) : 0 };
+  };
+
+  return res.json({
+    summary,
+    byBranch: [...branchMap.values()].map(withRate).sort((a, b) => b.bought - a.bought),
+    bySales:  [...salesMap.values()].map(withRate).sort((a, b) => b.bought - a.bought),
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════

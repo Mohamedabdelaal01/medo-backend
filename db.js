@@ -354,6 +354,20 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_fulog_user ON followup_log(user_id, followed_up_at DESC);
   `);
 
+  // revisit_followups: append-only log of re-visit follow-up attempts for
+  // customers who visited but didn't buy — so we can see WHEN and HOW MANY
+  // times a customer was followed up, and who did it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS revisit_followups (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id        TEXT NOT NULL,
+      followed_up_by TEXT,
+      note           TEXT,
+      created_at     DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_revisit_fu_user ON revisit_followups(user_id, created_at DESC);
+  `);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
