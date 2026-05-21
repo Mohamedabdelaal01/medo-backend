@@ -1416,6 +1416,99 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/reception/walkin — register a walk-in customer who never came
+// through ManyChat (found us on the street / by referral, etc.). Reception
+// captures name + phone + interest + source, and the customer is created as a
+// normal confirmed-visit lead so the rest of the system (sales linking,
+// purchase logging, follow-up) treats them exactly like an online lead.
+//   reception → locked to own branch. admin → body.branch
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
+  const role = req.user?.role;
+  const { first_name, phone, interest, source, branch: bodyBranch } = req.body || {};
+
+  const branch = role === 'reception' ? (req.user.branch || null) : (bodyBranch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const name = (first_name && String(first_name).trim()) || '';
+  if (!name) return res.status(400).json({ error: 'first_name_required' });
+
+  const np = normalizePhone(phone);
+  if (!np) return res.status(400).json({ error: 'invalid_phone' });
+
+  const interestVal = (interest && String(interest).trim()) || null;
+  const sourceVal   = (source   && String(source).trim())   || 'زيارة مباشرة';
+
+  const db = getDb();
+
+  // Re-use an existing lead if this phone is already known — avoid duplicates.
+  let lead = db.prepare(`
+    SELECT lp.user_id FROM lead_phones ph
+    JOIN lead_profiles lp ON lp.user_id = ph.user_id
+    WHERE ph.phone = ? ORDER BY lp.last_activity DESC LIMIT 1
+  `).get(np)
+    || db.prepare(`SELECT user_id FROM lead_profiles WHERE phone = ? LIMIT 1`).get(np);
+
+  const existed = !!lead;
+  const userId  = existed ? lead.user_id : `walkin_${crypto.randomUUID()}`;
+
+  const tx = db.transaction(() => {
+    if (existed) {
+      // Known customer walking in again — refresh + mark this visit.
+      db.prepare(`
+        UPDATE lead_profiles SET
+          first_name      = COALESCE(NULLIF(?,''), first_name),
+          last_category   = COALESCE(?, last_category),
+          campaign_source = COALESCE(campaign_source, ?),
+          lead_class      = CASE WHEN lead_class = 'purchased' THEN 'purchased' ELSE 'visited' END,
+          visit_confirmed = 1,
+          visit_at        = CASE WHEN visit_at IS NULL THEN datetime('now') ELSE visit_at END,
+          last_activity   = datetime('now')
+        WHERE user_id = ?
+      `).run(name, interestVal, sourceVal, userId);
+    } else {
+      db.prepare(`
+        INSERT INTO lead_profiles
+          (user_id, first_name, phone, preferred_branch, last_category,
+           campaign_source, lead_class, total_score, visit_confirmed, visit_at,
+           manychat_source, last_activity, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'visited', 30, 1, datetime('now'),
+                'walkin', datetime('now'), datetime('now'))
+      `).run(userId, name, np, branch, interestVal, sourceVal);
+    }
+
+    db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+
+    // A branch_selected event makes the walk-in show up everywhere online
+    // leads do (reception list, branch-manager customers, funnels).
+    db.prepare(`
+      INSERT INTO events
+        (event_id, user_id, first_name, event_type, event_value,
+         score_delta, current_score, branch, category)
+      VALUES (?, ?, ?, 'branch_selected', ?, 30, 30, ?, ?)
+    `).run(crypto.randomUUID(), userId, name, branch, branch, interestVal);
+
+    // Record the actual showroom visit.
+    db.prepare(`INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)`)
+      .run(userId, branch);
+  });
+  tx();
+
+  console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${sourceVal})`);
+
+  return res.json({
+    ok:              true,
+    user_id:         userId,
+    first_name:      name,
+    campaign_source: sourceVal,
+    branch,
+    lead_class:      'visited',
+    walk_in:         true,
+    existed,
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/sales/my — a salesperson's own customers + this-month KPIs.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
