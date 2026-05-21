@@ -794,8 +794,9 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
   // Hot/converted set is typically small so the full fetch is safe.
   const rawHotLeads = db.prepare(`
     SELECT user_id, first_name, total_score, lead_class,
-           preferred_branch, last_product, last_activity,
+           preferred_branch, last_product, last_category, last_activity,
            visit_confirmed, location_requested,
+           session_count, product_view_count, last_input_text,
            campaign_source, ad_id, visit_code, phone
     FROM lead_profiles
     WHERE lead_class IN ('hot', 'visited', 'purchased', 'converted')
@@ -2054,12 +2055,18 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
     SELECT
       req.user_id,
       lp.first_name,
+      lp.phone,
       COALESCE(lp.total_score, 0)    AS total_score,
       COALESCE(lp.lead_class, 'cold') AS lead_class,
       lp.last_activity,
       COALESCE(lp.visit_confirmed, 0) AS visit_confirmed,
       lp.last_product,
       lp.last_category,
+      COALESCE(lp.session_count, 0)      AS session_count,
+      COALESCE(lp.product_view_count, 0) AS product_view_count,
+      lp.campaign_source,
+      lp.ad_id,
+      lp.last_input_text,
       COALESCE(f.followed_up, 0)     AS followed_up,
       f.followed_up_at,
       f.followed_up_by,
