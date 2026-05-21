@@ -2499,6 +2499,111 @@ app.post('/api/purchases', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Re-visit follow-up — customers who visited the showroom but did NOT buy.
+// Three buckets:
+//   pending → still being followed up (visited, no purchase, not closed)
+//   bought  → visited AND later purchased (success)
+//   lost    → sales closed them ("won't buy" — e.g. bought elsewhere)
+// Scope: admin → all | branch_manager → own branch | sales → own customers.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const status = ['pending', 'bought', 'lost'].includes(req.query.status)
+    ? req.query.status : 'pending';
+  const db   = getDb();
+  const role = req.user?.role;
+
+  let statusWhere;
+  if (status === 'bought') {
+    statusWhere = `(lp.lead_class = 'purchased' OR lp.purchased_at IS NOT NULL)`;
+  } else if (status === 'lost') {
+    statusWhere = `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+                   AND lp.revisit_status = 'lost'`;
+  } else {
+    statusWhere = `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+                   AND (lp.revisit_status IS NULL OR lp.revisit_status = 'pending')`;
+  }
+
+  let rbacWhere = '1=1';
+  const params = [];
+  if (role === 'branch_manager') {
+    const b = req.user.branch || null;
+    if (!b) return res.status(400).json({ error: 'branch_required' });
+    rbacWhere = `(lp.preferred_branch = ?
+      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
+    params.push(b, b);
+  } else if (role === 'sales' || role === 'rep') {
+    const me = req.user.name;
+    rbacWhere = `(lp.assigned_rep = ?
+      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE sales_rep = ?))`;
+    params.push(me, me);
+  }
+
+  const customers = db.prepare(`
+    SELECT
+      lp.user_id, lp.first_name, lp.phone, lp.total_score, lp.lead_class,
+      lp.last_product, lp.last_category, lp.last_activity, lp.visit_at,
+      lp.campaign_source, lp.manychat_source, lp.preferred_branch,
+      lp.revisit_status, lp.revisit_note, lp.revisit_updated_by, lp.revisit_updated_at,
+      lp.purchased_at,
+      (SELECT v.branch    FROM lead_visits v WHERE v.user_id = lp.user_id
+         ORDER BY v.visited_at DESC LIMIT 1) AS branch,
+      (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id
+         ORDER BY v.visited_at DESC LIMIT 1) AS sales_rep,
+      (SELECT COALESCE(SUM(p.price), 0) FROM purchases p
+         WHERE p.user_id = lp.user_id)       AS purchase_total
+    FROM lead_profiles lp
+    WHERE lp.visit_confirmed = 1
+      AND ${statusWhere}
+      AND ${rbacWhere}
+    ORDER BY COALESCE(lp.revisit_updated_at, lp.purchased_at, lp.last_activity) DESC
+    LIMIT 300
+  `).all(...params);
+
+  return res.json({ status, count: customers.length, customers });
+});
+
+// POST /api/revisit/:userId/close — sales/manager closes a customer who won't
+// buy (e.g. bought elsewhere). Body: { note }.
+app.post('/api/revisit/:userId/close', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const { userId } = req.params;
+  const note = (req.body?.note && String(req.body.note).trim()) || null;
+  const db = getDb();
+  const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+
+  db.prepare(`
+    UPDATE lead_profiles SET
+      revisit_status     = 'lost',
+      revisit_note       = ?,
+      revisit_updated_by = ?,
+      revisit_updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(note, req.user?.name || null, userId);
+
+  console.log(`🚫 REVISIT CLOSED: ${userId} by ${req.user?.name || '?'} — ${note || 'no note'}`);
+  return res.json({ ok: true, revisit_status: 'lost' });
+});
+
+// POST /api/revisit/:userId/reopen — move a closed customer back to follow-up.
+app.post('/api/revisit/:userId/reopen', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const { userId } = req.params;
+  const db = getDb();
+  const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+
+  db.prepare(`
+    UPDATE lead_profiles SET
+      revisit_status     = NULL,
+      revisit_note       = NULL,
+      revisit_updated_by = ?,
+      revisit_updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(req.user?.name || null, userId);
+
+  return res.json({ ok: true, revisit_status: 'pending' });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/leads/:user_id/purchases — Purchase history for a lead
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {

@@ -189,6 +189,11 @@ function initializeDatabase() {
     { col: 'location_reminder_sent',  type: 'DATETIME' },
     { col: 'last_category',           type: 'TEXT'     }, // product category from ManyChat
     { col: 'phone',                   type: 'TEXT'     }, // normalized phone → reception lookup
+    // Re-visit follow-up — for customers who visited but did NOT buy.
+    { col: 'revisit_status',          type: 'TEXT'     }, // NULL=pending re-followup, 'lost'=closed
+    { col: 'revisit_note',            type: 'TEXT'     }, // free-text reason when closed
+    { col: 'revisit_updated_by',      type: 'TEXT'     },
+    { col: 'revisit_updated_at',      type: 'DATETIME' },
   ];
   for (const { col, type } of o2oColumns) {
     try {
