@@ -47,6 +47,34 @@ function normalizePhone(raw) {
   return d;
 }
 
+// ── Branch normalization ──────────────────────────────────────────────────────
+// ManyChat sends the same branch under inconsistent ids across different
+// External Request blocks (Arabic free text, English slug, alt spellings like
+// "fysal" vs "faisal"). Without this, one physical branch lands in the DB under
+// several keys and the dashboard counts it as multiple branches.
+// Maps any known variant → a single canonical slug. Unknown values pass through
+// unchanged so new branches still work without a code change.
+const BRANCH_ALIASES = {
+  nasr_city: ['nasr_city', 'nasrcity', 'nasr city', 'نصر سيتي', 'نصرسيتي', 'مدينة نصر'],
+  maadi:     ['maadi', 'el maadi', 'المعادي', 'معادي'],
+  helwan:    ['helwan', 'حلوان'],
+  faisal:    ['faisal', 'fysal', 'fysl', 'fisal', 'faysal', 'فيصل'],
+  ain_shams: ['ain_shams', 'ain shams', 'ainshams', 'ein shams', 'shams', 'عين شمس', 'عينشمس', 'شمس'],
+};
+const _branchAliasLookup = (() => {
+  const m = new Map();
+  for (const [canonical, aliases] of Object.entries(BRANCH_ALIASES)) {
+    for (const a of aliases) m.set(a.toLowerCase().replace(/\s+/g, ' ').trim(), canonical);
+  }
+  return m;
+})();
+function normalizeBranch(raw) {
+  if (raw == null) return null;
+  const key = String(raw).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!key) return null;
+  return _branchAliasLookup.get(key) || String(raw).trim();
+}
+
 // ── Auto-assignment ───────────────────────────────────────────────────────────
 // Assigns an unassigned lead to the rep with the FEWEST active leads
 // (active = not purchased/converted). Returns the rep name or null.
@@ -515,14 +543,14 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   //  - branch_selected → event_value IS the branch the customer picked
   //    (use it directly — works for ANY branch id, not a hardcoded list)
   //  - otherwise → try a known-id substring match, else keep existing
-  const BRANCHES = ['nasr_city', 'maadi', 'helwan', 'faisal', 'ain_shams'];
+  // Only treat event_value as a branch for location/branch events — for other
+  // events (e.g. product_details) event_value carries a product name, not a
+  // branch, so we keep the existing preferred_branch instead.
   const detectedBranch = visitPayload?.branch
-    ? visitPayload.branch
-    : (event_type === 'branch_selected' && event_value)
-      ? event_value.trim()
-      : event_value
-        ? BRANCHES.find(b => event_value.includes(b)) || profile.preferred_branch
-        : profile.preferred_branch;
+    ? normalizeBranch(visitPayload.branch)
+    : (isLocationEvent && event_value)
+      ? normalizeBranch(event_value)
+      : profile.preferred_branch;
 
   // Detect product from event_value (if it's a product event)
   const lastProduct = isProductEvent
@@ -737,12 +765,12 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
   // Group by the branch the customer actually picked (event_value).
   const branchDemand = db.prepare(`
     SELECT
-      COALESCE(NULLIF(event_value,''), branch) AS branch,
+      COALESCE(NULLIF(branch,''), event_value) AS branch,
       COUNT(DISTINCT user_id) AS requests
     FROM events
     WHERE event_type IN ('branch_selected', 'location_request')
-      AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
-    GROUP BY COALESCE(NULLIF(event_value,''), branch)
+      AND COALESCE(NULLIF(branch,''), event_value) IS NOT NULL
+    GROUP BY COALESCE(NULLIF(branch,''), event_value)
     ORDER BY requests DESC
   `).all();
 
@@ -974,11 +1002,11 @@ app.get('/api/leads', requireAuth, (req, res) => {
 
   const leads = db.prepare(`
     SELECT lead_profiles.*,
-      (SELECT COALESCE(NULLIF(e.event_value,''), e.branch)
+      (SELECT COALESCE(NULLIF(e.branch,''), e.event_value)
          FROM events e
          WHERE e.user_id = lead_profiles.user_id
            AND e.event_type = 'branch_selected'
-           AND COALESCE(NULLIF(e.event_value,''), e.branch) IS NOT NULL
+           AND COALESCE(NULLIF(e.branch,''), e.event_value) IS NOT NULL
          ORDER BY e.created_at DESC LIMIT 1) AS requested_branch
     FROM lead_profiles
     ${where}
@@ -1147,13 +1175,13 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
   // comparing 2 branches must show both, not just the latest preferred_branch.
   let requestedBranches = db.prepare(`
     SELECT
-      COALESCE(NULLIF(event_value,''), branch) AS branch,
+      COALESCE(NULLIF(branch,''), event_value) AS branch,
       MIN(created_at) AS first_at,
       MAX(created_at) AS last_at
     FROM events
     WHERE user_id = ? AND event_type = 'branch_selected'
-      AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
-    GROUP BY COALESCE(NULLIF(event_value,''), branch)
+      AND COALESCE(NULLIF(branch,''), event_value) IS NOT NULL
+    GROUP BY COALESCE(NULLIF(branch,''), event_value)
     ORDER BY last_at DESC
   `).all(user_id);
 
@@ -2659,10 +2687,10 @@ app.get('/api/branches', requireAuth, (req, res) => {
   // from what ManyChat sent (fysal vs faisal vs Arabic, etc.).
   try {
     const seen = db.prepare(`
-      SELECT DISTINCT COALESCE(NULLIF(event_value,''), branch) AS b
+      SELECT DISTINCT COALESCE(NULLIF(branch,''), event_value) AS b
       FROM events
       WHERE event_type = 'branch_selected'
-        AND COALESCE(NULLIF(event_value,''), branch) IS NOT NULL
+        AND COALESCE(NULLIF(branch,''), event_value) IS NOT NULL
     `).all().map(r => r.b);
     const known = new Set(branches.map(x => x.id));
     for (const b of seen) {
@@ -2918,6 +2946,60 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err && err.stack ? err.stack : err);
 });
+
+// ── One-time data migration: normalize historical branch ids ──────────────
+// Old rows stored the branch under whatever ManyChat sent (Arabic free text,
+// alt spellings) so one branch was counted as several. Collapse them all to
+// the canonical slug. Idempotent — safe to run on every startup.
+(function normalizeHistoricalBranches() {
+  try {
+    const db = getDb();
+
+    const eventRows = db.prepare(`
+      SELECT id, event_value, branch FROM events
+      WHERE event_type IN ('branch_selected', 'location_request', 'entry_location')
+    `).all();
+    const updEvent = db.prepare(`UPDATE events SET branch = ? WHERE id = ?`);
+    let eventsFixed = 0;
+    db.transaction(() => {
+      for (const r of eventRows) {
+        const source    = (r.branch && r.branch.trim()) || r.event_value;
+        const canonical = normalizeBranch(source);
+        if (canonical && canonical !== r.branch) { updEvent.run(canonical, r.id); eventsFixed++; }
+      }
+    })();
+
+    const visitRows = db.prepare(`SELECT id, branch FROM lead_visits WHERE branch IS NOT NULL`).all();
+    // OR REPLACE: if normalizing collapses two visit rows for the same user
+    // onto the same (user_id, branch) pair, drop the stale duplicate.
+    const updVisit  = db.prepare(`UPDATE OR REPLACE lead_visits SET branch = ? WHERE id = ?`);
+    let visitsFixed = 0;
+    db.transaction(() => {
+      for (const r of visitRows) {
+        const canonical = normalizeBranch(r.branch);
+        if (canonical && canonical !== r.branch) { updVisit.run(canonical, r.id); visitsFixed++; }
+      }
+    })();
+
+    const profileRows = db.prepare(
+      `SELECT user_id, preferred_branch FROM lead_profiles WHERE preferred_branch IS NOT NULL`
+    ).all();
+    const updProfile = db.prepare(`UPDATE lead_profiles SET preferred_branch = ? WHERE user_id = ?`);
+    let profilesFixed = 0;
+    db.transaction(() => {
+      for (const r of profileRows) {
+        const canonical = normalizeBranch(r.preferred_branch);
+        if (canonical && canonical !== r.preferred_branch) { updProfile.run(canonical, r.user_id); profilesFixed++; }
+      }
+    })();
+
+    if (eventsFixed || visitsFixed || profilesFixed) {
+      console.log(`✅ Migration: normalized branch ids — events:${eventsFixed} visits:${visitsFixed} profiles:${profilesFixed}`);
+    }
+  } catch (e) {
+    console.error('[migration] branch normalize failed:', e.message);
+  }
+})();
 
 // ── Start Server ──────────────────────────────────────────────────────────
 app.listen(PORT, () => {
