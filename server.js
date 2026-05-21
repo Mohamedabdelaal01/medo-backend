@@ -2820,6 +2820,50 @@ app.put('/api/branches', requireAuth, requireRole('admin'), (req, res) => {
   return res.json({ ok: true, branches });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/interests  — interest categories the reception desk offers when
+//                       registering a walk-in customer (any auth user).
+// PUT /api/interests  — replace the full list (admin only).
+// Stored in settings under 'interest_categories' as a JSON string[].
+// ════════════════════════════════════════════════════════════════════════════
+const DEFAULT_INTERESTS = [
+  'غرف النوم', 'السفرة', 'الانتريهات', 'غرف الأطفال',
+  'الركنات', 'المطابخ', 'المكاتب', 'أخرى',
+];
+
+app.get('/api/interests', requireAuth, (req, res) => {
+  const db  = getDb();
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'interest_categories'`).get();
+  let interests = null;
+  try {
+    const parsed = JSON.parse(row?.value || 'null');
+    if (Array.isArray(parsed)) {
+      interests = parsed.map(x => String(x).trim()).filter(Boolean);
+    }
+  } catch (_) { interests = null; }
+  // Fall back to defaults until the admin saves a custom list.
+  return res.json({ interests: interests && interests.length ? interests : DEFAULT_INTERESTS });
+});
+
+app.put('/api/interests', requireAuth, requireRole('admin'), (req, res) => {
+  const { interests } = req.body || {};
+  if (!Array.isArray(interests)) {
+    return res.status(400).json({ error: 'interests must be an array' });
+  }
+  // Normalise: trim, drop blanks, drop duplicates.
+  const clean = [];
+  for (const it of interests) {
+    const v = String(it ?? '').trim();
+    if (v && !clean.includes(v)) clean.push(v);
+  }
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES ('interest_categories', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(JSON.stringify(clean));
+  return res.json({ ok: true, interests: clean });
+});
+
 // Settings endpoints — GET /api/settings, PUT /api/settings/:key
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
