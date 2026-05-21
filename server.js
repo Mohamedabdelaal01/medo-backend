@@ -962,6 +962,8 @@ app.get('/api/leads', requireAuth, (req, res) => {
   const {
     class: leadClass,
     branch,
+    has_phone,        // 'yes' → left a phone | 'no' → never left one
+    registration,     // 'manual' → reception walk-in | 'online' → via ManyChat
     limit  = 50,
     page   = 1,
     search = '',
@@ -996,6 +998,21 @@ app.get('/api/leads', requireAuth, (req, res) => {
   if (search) {
     where += ` AND first_name LIKE ?`;
     params.push(`%${search}%`);
+  }
+  // Filter by whether the customer ever left a phone number — a phone on the
+  // profile OR any row in lead_phones counts as "left a phone".
+  if (has_phone === 'yes') {
+    where += ` AND ((phone IS NOT NULL AND phone != '')
+      OR user_id IN (SELECT user_id FROM lead_phones))`;
+  } else if (has_phone === 'no') {
+    where += ` AND (phone IS NULL OR phone = '')
+      AND user_id NOT IN (SELECT user_id FROM lead_phones)`;
+  }
+  // Filter by how the customer was registered — reception walk-in vs ManyChat.
+  if (registration === 'manual') {
+    where += ` AND manychat_source = 'walkin'`;
+  } else if (registration === 'online') {
+    where += ` AND (manychat_source IS NULL OR manychat_source != 'walkin')`;
   }
 
   // Total count for pagination metadata
@@ -2794,7 +2811,9 @@ app.get('/api/branches', requireAuth, (req, res) => {
     `).all().map(r => r.b);
     const known = new Set(branches.map(x => x.id));
     for (const b of seen) {
-      if (!known.has(b)) { branches.push({ id: b, name: b }); known.add(b); }
+      // Normalize so 'shams'/'عين شمس'/'ain_shams' don't appear as 3 branches.
+      const nb = normalizeBranch(b);
+      if (nb && !known.has(nb)) { branches.push({ id: nb, name: nb }); known.add(nb); }
     }
   } catch (_) { /* events table edge — ignore */ }
 
@@ -3137,8 +3156,37 @@ process.on('uncaughtException', (err) => {
       }
     })();
 
-    if (eventsFixed || visitsFixed || profilesFixed) {
-      console.log(`✅ Migration: normalized branch ids — events:${eventsFixed} visits:${visitsFixed} profiles:${profilesFixed}`);
+    // Normalize the configured branch list itself — if its ids aren't the
+    // canonical slugs, the branch filter shows a branch twice (once as the
+    // configured name, once as the raw event id).
+    let configFixed = 0;
+    const cfgRow = db.prepare(`SELECT value FROM settings WHERE key = 'active_branches'`).get();
+    if (cfgRow && cfgRow.value) {
+      try {
+        const parsed = JSON.parse(cfgRow.value);
+        if (Array.isArray(parsed)) {
+          const seenIds = new Set();
+          const fixed = [];
+          for (const b of parsed) {
+            const entry = typeof b === 'string' ? { id: b, name: b } : { ...b };
+            const canonical = normalizeBranch(entry.id);
+            if (canonical !== entry.id) configFixed++;
+            entry.id = canonical;
+            if (!seenIds.has(entry.id)) { seenIds.add(entry.id); fixed.push(entry); }
+          }
+          if (configFixed) {
+            db.prepare(`
+              INSERT INTO settings (key, value, updated_at)
+              VALUES ('active_branches', ?, datetime('now'))
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            `).run(JSON.stringify(fixed));
+          }
+        }
+      } catch (_) { /* malformed setting — leave it */ }
+    }
+
+    if (eventsFixed || visitsFixed || profilesFixed || configFixed) {
+      console.log(`✅ Migration: normalized branch ids — events:${eventsFixed} visits:${visitsFixed} profiles:${profilesFixed} config:${configFixed}`);
     }
   } catch (e) {
     console.error('[migration] branch normalize failed:', e.message);
