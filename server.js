@@ -2177,6 +2177,7 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       lp.campaign_source,
       lp.ad_id,
       lp.last_input_text,
+      lp.manychat_source,
       COALESCE(f.followed_up, 0)     AS followed_up,
       f.followed_up_at,
       f.followed_up_by,
