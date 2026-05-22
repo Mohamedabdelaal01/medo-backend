@@ -8,7 +8,7 @@ const cors     = require('cors');
 const crypto   = require('crypto'); // built-in — no install needed
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
-const { getDb }            = require('./db');
+const { getDb, getLiveDb, getDemoDb, wipeDemoDb, cloneLiveToDemo } = require('./db');
 const { processScore }     = require('./scoring');
 const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./services/scheduler');
 const { predict }          = require('./services/prediction');
@@ -322,7 +322,9 @@ app.post('/api/auth/login', (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password required' });
   }
-  const db   = getDb();
+  // demo_ accounts authenticate against the sandbox DB; everyone else live.
+  const isDemo = typeof email === 'string' && email.trim().toLowerCase().startsWith('demo_');
+  const db   = isDemo ? getDemoDb() : getLiveDb();
   const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(email);
 
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -3705,18 +3707,52 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Live / Demo sandbox switch. GET is open to any authenticated user (the demo
-// banner must show to everyone); toggling is admin-only.
+// Account-based cloned sandbox — interconnected demo_* training accounts.
+//   generate → clone production into grand_furniture_demo.db + (re)create the
+//              4 demo users INSIDE the demo DB only (production untouched).
+//   wipe     → delete the demo DB file entirely.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/admin/system-mode', requireAuth, (req, res) => {
-  return res.json({ mode: global.systemMode || 'live' });
+app.post('/api/admin/generate-demo-accounts', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    // Step A — fresh snapshot of production into the sandbox file.
+    await cloneLiveToDemo();
+
+    // Step B — (re)create the 4 cross-linked demo users INSIDE the demo DB.
+    const demo = getDemoDb();
+    const hash = bcrypt.hashSync('123', 10);
+    const accounts = [
+      { name: 'demo_admin',     email: 'demo_admin@demo.local',     role: 'admin',          branch: null },
+      { name: 'demo_manager',   email: 'demo_manager@demo.local',   role: 'branch_manager', branch: 'عين شمس' },
+      { name: 'demo_sales',     email: 'demo_sales@demo.local',     role: 'sales',          branch: 'عين شمس' },
+      { name: 'demo_reception', email: 'demo_reception@demo.local', role: 'reception',      branch: 'عين شمس' },
+    ];
+    const upsert = demo.prepare(`
+      INSERT INTO users (name, email, password_hash, role, branch, active)
+      VALUES (?, ?, ?, ?, ?, 1)
+      ON CONFLICT(email) DO UPDATE SET
+        name = excluded.name, password_hash = excluded.password_hash,
+        role = excluded.role, branch = excluded.branch, active = 1
+    `);
+    demo.transaction(() => {
+      for (const a of accounts) upsert.run(a.name, a.email, hash, a.role, a.branch);
+    })();
+
+    console.log('🧪 DEMO ACCOUNTS GENERATED (sandbox cloned + 4 demo users)');
+    return res.json({
+      ok: true,
+      password: '123',
+      accounts: accounts.map(a => ({ email: a.email, role: a.role })),
+    });
+  } catch (e) {
+    console.error('[demo] generate failed:', e.message);
+    return res.status(500).json({ error: 'generate_failed' });
+  }
 });
 
-app.post('/api/admin/toggle-system-mode', requireAuth, requireRole('admin'), (req, res) => {
-  global.systemMode = global.systemMode === 'demo' ? 'live' : 'demo';
-  getDb(); // force-init the target DB (creates + seeds the demo DB on first switch)
-  console.log(`🔀 SYSTEM MODE → ${global.systemMode}`);
-  return res.json({ ok: true, mode: global.systemMode });
+app.post('/api/admin/wipe-demo-accounts', requireAuth, requireRole('admin'), (req, res) => {
+  wipeDemoDb();
+  console.log('🗑️  DEMO SANDBOX WIPED');
+  return res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════════════════════

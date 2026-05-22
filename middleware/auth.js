@@ -2,7 +2,7 @@
 
 const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
-const { getDb } = require('../db');
+const { getDb, runWithDbContext } = require('../db');
 
 // ── Secret resolution (free, no env var required) ──────────────────────────
 // Priority: process.env.JWT_SECRET  →  persistent random secret in DB settings.
@@ -46,10 +46,14 @@ function requireAuth(req, res, next) {
 
   try {
     req.user = jwt.verify(token, getJwtSecret());
-    next();
   } catch {
     return res.status(401).json({ error: 'Token expired or invalid' });
   }
+
+  // Route the rest of this request to the sandbox DB for demo_ training
+  // accounts; everything else stays on production.
+  const isDemo = typeof req.user?.name === 'string' && req.user.name.startsWith('demo_');
+  return runWithDbContext(isDemo, () => next());
 }
 
 /**

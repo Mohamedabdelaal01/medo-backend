@@ -636,11 +636,14 @@ function initializeDatabase(dbPath = DB_PATH) {
   return db;
 }
 
-// ── Live / Demo sandbox ──────────────────────────────────────────────────────
-// global.systemMode = 'live' | 'demo'. In demo mode every getDb() call returns
-// a SEPARATE database file (grand_furniture_demo.db) so training/testing never
-// touches real data. The demo DB is created lazily on first use.
-global.systemMode = global.systemMode || 'live';
+// ── Account-based cloned sandbox ─────────────────────────────────────────────
+// Two physical DBs: production (grand_furniture.db) and a sandbox clone
+// (grand_furniture_demo.db). Routing is PER REQUEST via AsyncLocalStorage —
+// a request runs in the demo context only when the logged-in user's name
+// starts with `demo_`. Webhooks / background jobs / startup have no context
+// and always hit production. Existing getDb() call sites need no changes.
+const { AsyncLocalStorage } = require('async_hooks');
+const dbContext = new AsyncLocalStorage();
 
 const DEMO_DB_PATH = path.join(path.dirname(DB_PATH), 'grand_furniture_demo.db');
 
@@ -652,36 +655,39 @@ function getLiveDb() {
   return liveDbInstance;
 }
 
-// Copy a whole table from one DB connection to another (replaces dst contents).
-function copyTable(src, dst, table) {
-  const rows = src.prepare(`SELECT * FROM ${table}`).all();
-  dst.prepare(`DELETE FROM ${table}`).run();
-  if (!rows.length) return;
-  const cols = Object.keys(rows[0]);
-  const stmt = dst.prepare(
-    `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
-  );
-  const tx = dst.transaction(() => { for (const r of rows) stmt.run(...cols.map(c => r[c])); });
-  tx();
-}
-
 function getDemoDb() {
-  if (!demoDbInstance) {
-    const firstInit = !fs.existsSync(DEMO_DB_PATH);
-    demoDbInstance = initializeDatabase(DEMO_DB_PATH);
-    if (firstInit) {
-      // Fresh demo DB → copy real staff accounts + settings so people can log in.
-      const live = getLiveDb();
-      copyTable(live, demoDbInstance, 'users');
-      copyTable(live, demoDbInstance, 'settings');
-      console.log('🧪 Demo DB seeded with live users + settings');
-    }
-  }
+  if (!demoDbInstance) demoDbInstance = initializeDatabase(DEMO_DB_PATH);
   return demoDbInstance;
 }
 
+// getDb() — argument-free. Reads the per-request context set by requireAuth.
 function getDb() {
-  return global.systemMode === 'demo' ? getDemoDb() : getLiveDb();
+  const store = dbContext.getStore();
+  return store && store.demo ? getDemoDb() : getLiveDb();
 }
 
-module.exports = { getDb };
+// Runs `fn` (the rest of a request) inside a live/demo DB context.
+function runWithDbContext(isDemo, fn) {
+  return dbContext.run({ demo: !!isDemo }, fn);
+}
+
+// Releases the cached demo handle + deletes its files (.db / -wal / -shm).
+function wipeDemoDb() {
+  if (demoDbInstance) { try { demoDbInstance.close(); } catch (_) {} demoDbInstance = null; }
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { if (fs.existsSync(DEMO_DB_PATH + suffix)) fs.rmSync(DEMO_DB_PATH + suffix); }
+    catch (_) { /* best-effort */ }
+  }
+}
+
+// Clones a fresh snapshot of production into the demo DB file.
+async function cloneLiveToDemo() {
+  wipeDemoDb();                       // release handle + remove stale files
+  const live = getLiveDb();
+  await live.backup(DEMO_DB_PATH);    // online backup — safe while live is in use
+}
+
+module.exports = {
+  getDb, getLiveDb, getDemoDb, runWithDbContext,
+  wipeDemoDb, cloneLiveToDemo, DEMO_DB_PATH,
+};
