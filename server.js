@@ -3706,12 +3706,65 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   }
 
   const revenue = purRow.revenue || 0;
+
+  // ── Filtered chart datasets (so the dashboard charts honour the filters) ──
+  const evDate = dateRangeClause('created_at', startDate, endDate);
+
+  // Branch demand — customers who asked for each branch.
+  let bdWhere = `event_type IN ('branch_selected', 'location_request')
+    AND COALESCE(NULLIF(branch,''), event_value) IS NOT NULL` + evDate.clause;
+  const bdParams = [...evDate.params];
+  if (branch) { bdWhere += ` AND COALESCE(NULLIF(branch,''), event_value) = ?`; bdParams.push(branch); }
+  const branch_demand = db.prepare(`
+    SELECT COALESCE(NULLIF(branch,''), event_value) AS branch, COUNT(DISTINCT user_id) AS requests
+    FROM events WHERE ${bdWhere}
+    GROUP BY COALESCE(NULLIF(branch,''), event_value)
+    ORDER BY requests DESC
+  `).all(...bdParams);
+
+  // Branch visits — reception-confirmed arrivals per branch.
+  let bvWhere = 'branch IS NOT NULL' + visDate.clause;
+  const bvParams = [...visDate.params];
+  if (branch) { bvWhere += ' AND branch = ?'; bvParams.push(branch); }
+  const branch_visits = db.prepare(`
+    SELECT branch, COUNT(DISTINCT user_id) AS visits
+    FROM lead_visits WHERE ${bvWhere}
+    GROUP BY branch ORDER BY visits DESC
+  `).all(...bvParams);
+
+  // Funnel stages (date-filtered; branch filter skipped — early stages carry
+  // no branch and would zero-out the funnel).
+  const funnel_stages = db.prepare(`
+    SELECT event_type, COUNT(DISTINCT user_id) AS unique_users
+    FROM events
+    WHERE event_type IN (
+      'entry_catalog', 'entry_offer', 'entry_location',
+      'product_details', 'location_request',
+      'branch_selected', 'map_click', 'contact_request', 'visit_confirmed'
+    )${evDate.clause}
+    GROUP BY event_type ORDER BY unique_users DESC
+  `).all(...evDate.params);
+
+  // Lead distribution by class.
+  const ldDate = dateRangeClause('created_at', startDate, endDate);
+  let ldWhere = '1=1' + ldDate.clause;
+  const ldParams = [...ldDate.params];
+  if (branch) { ldWhere += ' AND preferred_branch = ?'; ldParams.push(branch); }
+  const lead_distribution = db.prepare(`
+    SELECT lead_class, COUNT(*) AS count FROM lead_profiles WHERE ${ldWhere}
+    GROUP BY lead_class
+  `).all(...ldParams);
+
   return res.json({
     total_revenue:    revenue,
     total_visits:     visits,
     closing_rate:     visits ? Math.round((purRow.buyers / visits) * 100) : 0,
     target,
     percent_achieved: pctAchieved(revenue, target),
+    funnel_stages,
+    lead_distribution,
+    branch_demand,
+    branch_visits,
   });
 });
 
