@@ -982,7 +982,10 @@ app.get('/api/leads', requireAuth, (req, res) => {
     params.push(req.user.name);
   }
 
-  if (leadClass) {
+  if (leadClass === 'lost') {
+    // 'lost' isn't a lead_class — it's the post-visit revisit status.
+    where += ` AND revisit_status = 'lost'`;
+  } else if (leadClass) {
     where += ` AND lead_class = ?`;
     params.push(leadClass);
   }
@@ -996,8 +999,23 @@ app.get('/api/leads', requireAuth, (req, res) => {
     params.push(branch, branch, branch);
   }
   if (search) {
-    where += ` AND first_name LIKE ?`;
-    params.push(`%${search}%`);
+    // Search by customer name OR contract number. Contract-number matches are
+    // RBAC-scoped: a sales rep only matches their OWN sales, a branch manager
+    // only their branch, an admin sees all.
+    const like = `%${search}%`;
+    let contractRbac = '';
+    const contractRbacParams = [];
+    if (req.user.role === 'branch_manager') {
+      contractRbac = ` AND branch = ?`;
+      contractRbacParams.push(req.user.branch || '');
+    } else if (req.user.role !== 'admin') {
+      contractRbac = ` AND rep = ?`;
+      contractRbacParams.push(req.user.name);
+    }
+    where += ` AND (first_name LIKE ? OR user_id IN (
+      SELECT user_id FROM purchases WHERE contract_number LIKE ?${contractRbac}
+    ))`;
+    params.push(like, like, ...contractRbacParams);
   }
   // Filter by whether the customer ever left a phone number — a phone on the
   // profile OR any row in lead_phones counts as "left a phone".
@@ -1775,9 +1793,13 @@ function computeScore(metrics, weights) {
 
 app.get('/api/admin/achievements/sales', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
-  const { branch } = req.query;
-  const branchClause = branch ? `AND f.branch = ?` : '';
-  const branchParam  = branch ? [branch] : [];
+  const { branch, rep } = req.query;
+  let scopeClause = '';
+  const scopeParams = [];
+  if (branch) { scopeClause += ` AND f.branch = ?`;          scopeParams.push(branch); }
+  if (rep)    { scopeClause += ` AND f.assigned_sales = ?`;  scopeParams.push(rep); }
+  const branchClause = scopeClause;
+  const branchParam  = scopeParams;
 
   // For each (sales_rep, branch): count phones_received, followups_done,
   // visits_done (by that rep at that branch), purchases_done (by that rep).
@@ -2203,9 +2225,17 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     if (!byName.has(s.sales_rep)) { byName.set(s.sales_rep, row); bySales.push(row); }
   }
 
+  // Attach each rep's individual sales target + achievement %.
+  for (const r of bySales) {
+    r.target     = getTarget(db, 'sales_rep', r.sales_rep);
+    r.target_pct = pctAchieved(r.total_sales, r.target);
+  }
+
   const served      = bySales.reduce((s, r) => s + r.served, 0);
   const bought      = bySales.reduce((s, r) => s + r.bought, 0);
   const totalSales  = bySales.reduce((s, r) => s + r.total_sales, 0);
+
+  const branchTarget = getTarget(db, 'branch', branch);
 
   return res.json({
     branch,
@@ -2215,6 +2245,8 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
       bought,
       total_sales: totalSales,
       close_rate: served ? Math.round((bought / served) * 100) : 0,
+      target:      branchTarget,
+      target_pct:  pctAchieved(totalSales, branchTarget),
     },
     bySales,
   });
@@ -2299,6 +2331,38 @@ function auditLog(db, operator, actionType, targetId, oldState) {
   } catch (e) {
     console.error('[audit] failed to log:', e.message);
   }
+}
+
+// Creates a backend notification for a role bucket (e.g. 'admin').
+function createNotification(db, audience, type, message) {
+  try {
+    db.prepare(
+      `INSERT INTO notifications (audience, type, message) VALUES (?, ?, ?)`
+    ).run(audience, type, message);
+  } catch (e) {
+    console.error('[notif] failed to create:', e.message);
+  }
+}
+
+// ── Sales-target helpers ────────────────────────────────────────────────────
+function getTarget(db, scopeType, scopeName) {
+  if (!scopeName) return 0;
+  const row = db.prepare(
+    `SELECT target_amount FROM sales_targets WHERE scope_type = ? AND scope_name = ?`
+  ).get(scopeType, scopeName);
+  return row ? (Number(row.target_amount) || 0) : 0;
+}
+function pctAchieved(actual, target) {
+  return target > 0 ? Math.round(((actual || 0) / target) * 100) : 0;
+}
+
+// Builds a SQL date-range clause for a column. Returns { clause, params }.
+function dateRangeClause(column, startDate, endDate) {
+  const parts = [];
+  const params = [];
+  if (startDate) { parts.push(`date(${column}) >= ?`); params.push(startDate); }
+  if (endDate)   { parts.push(`date(${column}) <= ?`); params.push(endDate); }
+  return { clause: parts.length ? ' AND ' + parts.join(' AND ') : '', params };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2581,6 +2645,12 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   `).run(user_id);
 
   console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}`);
+
+  // High-value deal → macro alert for the admin war-room.
+  if (Number(price) >= 100000) {
+    createNotification(db, 'admin', 'high_value_deal',
+      `إغلاق بيعة ضخمة بقيمة [${new Intl.NumberFormat('en-US').format(Number(price))}] بواسطة [${rep || '؟'}]`);
+  }
 
   // Event-Triggered Flow: Purchase Made
   const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();
@@ -2866,6 +2936,18 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     params.push(req.user.name);
   }
 
+  // Optional filters — date range, branch & rep (admin/manager scoping above
+  // already constrains non-admins, so these only narrow further).
+  const { startDate, endDate, branch: fBranch, rep: fRep } = req.query;
+  const dr = dateRangeClause('p.created_at', startDate, endDate);
+  where += dr.clause;
+  params.push(...dr.params);
+  if (fBranch && role === 'admin') { where += ' AND p.branch = ?'; params.push(fBranch); }
+  if (fRep && (role === 'admin' || role === 'branch_manager')) {
+    where += ' AND p.rep = ?';
+    params.push(fRep);
+  }
+
   const contracts = db.prepare(`
     SELECT p.id, p.user_id, p.price, p.contract_number, p.branch, p.rep,
            p.product_id, p.notes, p.created_at,
@@ -2882,24 +2964,30 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
 
 app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
   const db  = getDb();
-  const row = db.prepare(`SELECT id, branch FROM purchases WHERE id = ?`).get(req.params.id);
+  const row = db.prepare(`SELECT id, branch, contract_number FROM purchases WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'contract_not_found' });
   if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
     return res.status(403).json({ error: 'forbidden' });
   }
 
   const { price, contract_number } = req.body || {};
+  const newNumber = (contract_number && String(contract_number).trim()) || null;
   db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
     price != null && price !== '' ? Number(price) : null,
-    (contract_number && String(contract_number).trim()) || null,
+    newNumber,
     row.id
   );
+
+  // Macro alert for the admin war-room.
+  createNotification(db, 'admin', 'contract_modified',
+    `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]`);
+
   return res.json({ ok: true });
 });
 
 app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
   const db  = getDb();
-  const row = db.prepare(`SELECT id, user_id, branch FROM purchases WHERE id = ?`).get(req.params.id);
+  const row = db.prepare(`SELECT id, user_id, branch, contract_number FROM purchases WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'contract_not_found' });
   if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
     return res.status(403).json({ error: 'forbidden' });
@@ -2922,6 +3010,10 @@ app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_ma
     }
   });
   tx();
+
+  // Macro alert for the admin war-room.
+  createNotification(db, 'admin', 'contract_deleted',
+    `تم حذف تعاقد رقم [${row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]`);
 
   return res.json({ ok: true, reverted });
 });
@@ -3518,6 +3610,118 @@ app.post('/api/admin/toggle-system-mode', requireAuth, requireRole('admin'), (re
   getDb(); // force-init the target DB (creates + seeds the demo DB on first switch)
   console.log(`🔀 SYSTEM MODE → ${global.systemMode}`);
   return res.json({ ok: true, mode: global.systemMode });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Notifications — admin-only macro alerts (contracts changed, big deals).
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/notifications', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const notifications = db.prepare(`
+    SELECT id, type, message, read, created_at
+    FROM notifications
+    WHERE audience = 'admin'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 50
+  `).all();
+  const unread = notifications.filter(n => !n.read).length;
+  return res.json({ notifications, unread });
+});
+
+app.post('/api/notifications/read-all', requireAuth, requireRole('admin'), (req, res) => {
+  getDb().prepare(`UPDATE notifications SET read = 1 WHERE audience = 'admin' AND read = 0`).run();
+  return res.json({ ok: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sales targets — admin sets revenue goals per branch / per sales rep.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/targets', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+  const rows = getDb().prepare(
+    `SELECT scope_type, scope_name, target_amount FROM sales_targets`
+  ).all();
+  return res.json({ targets: rows });
+});
+
+app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => {
+  const { scope_type, scope_name, target_amount } = req.body || {};
+  if (!['branch', 'sales_rep'].includes(scope_type)) {
+    return res.status(400).json({ error: 'bad_scope_type' });
+  }
+  const name = (scope_name && String(scope_name).trim()) || '';
+  if (!name) return res.status(400).json({ error: 'scope_name_required' });
+  const amount = Number(target_amount);
+  if (!Number.isFinite(amount) || amount < 0) {
+    return res.status(400).json({ error: 'bad_target_amount' });
+  }
+  getDb().prepare(`
+    INSERT INTO sales_targets (scope_type, scope_name, target_amount)
+    VALUES (?, ?, ?)
+    ON CONFLICT(scope_type, scope_name) DO UPDATE SET target_amount = excluded.target_amount
+  `).run(scope_type, name, amount);
+  return res.json({ ok: true, scope_type, scope_name: name, target_amount: amount });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/kpis — filtered executive KPIs (revenue / visits / closing
+// rate) + target achievement. Filters: startDate, endDate, branch, rep.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const { startDate, endDate, branch, rep } = req.query;
+
+  // Revenue + buyer count from purchases.
+  const purDate = dateRangeClause('created_at', startDate, endDate);
+  let purWhere = '1=1' + purDate.clause;
+  const purParams = [...purDate.params];
+  if (branch) { purWhere += ' AND branch = ?'; purParams.push(branch); }
+  if (rep)    { purWhere += ' AND rep = ?';    purParams.push(rep); }
+  const purRow = db.prepare(`
+    SELECT COALESCE(SUM(price), 0) AS revenue, COUNT(DISTINCT user_id) AS buyers
+    FROM purchases WHERE ${purWhere}
+  `).get(...purParams);
+
+  // Visit count from lead_visits.
+  const visDate = dateRangeClause('visited_at', startDate, endDate);
+  let visWhere = '1=1' + visDate.clause;
+  const visParams = [...visDate.params];
+  if (branch) { visWhere += ' AND branch = ?';    visParams.push(branch); }
+  if (rep)    { visWhere += ' AND sales_rep = ?'; visParams.push(rep); }
+  const visits = db.prepare(
+    `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
+  ).get(...visParams).n;
+
+  // Target — rep-scoped, branch-scoped, or company-wide (sum of branch targets).
+  let target = 0;
+  if (rep)         target = getTarget(db, 'sales_rep', rep);
+  else if (branch) target = getTarget(db, 'branch', branch);
+  else {
+    target = db.prepare(
+      `SELECT COALESCE(SUM(target_amount), 0) AS t FROM sales_targets WHERE scope_type = 'branch'`
+    ).get().t || 0;
+  }
+
+  const revenue = purRow.revenue || 0;
+  return res.json({
+    total_revenue:    revenue,
+    total_visits:     visits,
+    closing_rate:     visits ? Math.round((purRow.buyers / visits) * 100) : 0,
+    target,
+    percent_achieved: pctAchieved(revenue, target),
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/my-target — a sales rep sees their OWN target + achievement.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/my-target', requireAuth, authorizeRoles('sales', 'rep'), (req, res) => {
+  const db = getDb();
+  const me = req.user.name;
+  const target  = getTarget(db, 'sales_rep', me);
+  const revenue = db.prepare(
+    `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE rep = ?`
+  ).get(me).r || 0;
+  return res.json({ target, revenue, percent: pctAchieved(revenue, target) });
 });
 
 // Also expose the dashboard summary's age buckets so the customers analytics

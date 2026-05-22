@@ -400,6 +400,30 @@ function initializeDatabase(dbPath = DB_PATH) {
     CREATE INDEX IF NOT EXISTS idx_audit_created ON system_audit_log(created_at DESC);
   `);
 
+  // notifications: backend-generated alerts. audience = role bucket ('admin').
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      audience    TEXT NOT NULL,
+      type        TEXT,
+      message     TEXT NOT NULL,
+      read        INTEGER NOT NULL DEFAULT 0,
+      created_at  DATETIME DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_audience ON notifications(audience, created_at DESC);
+  `);
+
+  // sales_targets: revenue goals per branch or per sales rep.
+  // scope_type = 'branch' | 'sales_rep' ; scope_name = the branch / rep name.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sales_targets (
+      scope_type    TEXT,
+      scope_name    TEXT,
+      target_amount REAL,
+      PRIMARY KEY (scope_type, scope_name)
+    );
+  `);
+
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
   // the scheduler resets sends_this_week to 0 when week_anchor < this week's Monday.
