@@ -2229,28 +2229,32 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     if (!byName.has(s.sales_rep)) { byName.set(s.sales_rep, row); bySales.push(row); }
   }
 
-  // Attach each rep's individual sales target + achievement %.
+  // Attach each rep's CURRENT-MONTH target + achievement (revenue this month).
   for (const r of bySales) {
     r.target     = getTarget(db, 'sales_rep', r.sales_rep);
-    r.target_pct = pctAchieved(r.total_sales, r.target);
+    r.target_pct = pctAchieved(monthRevenue(db, { rep: r.sales_rep }), r.target);
   }
 
   const served      = bySales.reduce((s, r) => s + r.served, 0);
   const bought      = bySales.reduce((s, r) => s + r.bought, 0);
   const totalSales  = bySales.reduce((s, r) => s + r.total_sales, 0);
 
+  // Branch target progress — current month's target vs this month's revenue.
   const branchTarget = getTarget(db, 'branch', branch);
+  const branchMonthRevenue = monthRevenue(db, { branch });
 
   return res.json({
     branch,
+    target_month: currentMonth(),
     kpis: {
       requested,
       visited,
       bought,
       total_sales: totalSales,
       close_rate: served ? Math.round((bought / served) * 100) : 0,
-      target:      branchTarget,
-      target_pct:  pctAchieved(totalSales, branchTarget),
+      target:        branchTarget,
+      month_revenue: branchMonthRevenue,
+      target_pct:    pctAchieved(branchMonthRevenue, branchTarget),
     },
     bySales,
   });
@@ -2349,13 +2353,33 @@ function createNotification(db, audience, type, message) {
 }
 
 // ── Sales-target helpers ────────────────────────────────────────────────────
-function getTarget(db, scopeType, scopeName) {
+// Current calendar month as 'YYYY-MM'.
+function currentMonth() {
+  return new Date().toISOString().slice(0, 7);
+}
+
+// Monthly target for a scope. `month` defaults to the current calendar month.
+function getTarget(db, scopeType, scopeName, month) {
   if (!scopeName) return 0;
-  const row = db.prepare(
-    `SELECT target_amount FROM sales_targets WHERE scope_type = ? AND scope_name = ?`
-  ).get(scopeType, scopeName);
+  const row = db.prepare(`
+    SELECT target_amount FROM sales_targets
+    WHERE scope_type = ? AND scope_name = ? AND target_month = ?
+  `).get(scopeType, scopeName, month || currentMonth());
   return row ? (Number(row.target_amount) || 0) : 0;
 }
+
+// Revenue (SUM of purchase price) generated WITHIN a calendar month, optionally
+// scoped to a branch or a sales rep. `month` defaults to the current month.
+function monthRevenue(db, { branch, rep, month } = {}) {
+  let where = `strftime('%Y-%m', created_at) = ?`;
+  const params = [month || currentMonth()];
+  if (branch) { where += ` AND branch = ?`; params.push(branch); }
+  if (rep)    { where += ` AND rep = ?`;    params.push(rep); }
+  return db.prepare(
+    `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${where}`
+  ).get(...params).r || 0;
+}
+
 function pctAchieved(actual, target) {
   return target > 0 ? Math.round(((actual || 0) / target) * 100) : 0;
 }
@@ -2650,11 +2674,11 @@ app.post('/api/purchases', requireAuth, (req, res) => {
 
   console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}`);
 
-  // High-value deal → macro alert for the admin war-room.
-  if (Number(price) >= 100000) {
-    createNotification(db, 'admin', 'high_value_deal',
-      `إغلاق بيعة ضخمة بقيمة [${new Intl.NumberFormat('en-US').format(Number(price))}] بواسطة [${rep || '؟'}]`);
-  }
+  // Every purchase → macro alert for the admin war-room.
+  createNotification(db, 'admin', 'new_purchase',
+    `🎉 تم إغلاق تعاقد جديد (عقد: ${contract_number || '—'}) بقيمة ` +
+    `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
+    `${rep || '؟'} في فرع ${branch || '—'}`);
 
   // Event-Triggered Flow: Purchase Made
   const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();
@@ -3641,14 +3665,17 @@ app.post('/api/notifications/read-all', requireAuth, requireRole('admin'), (req,
 // Sales targets — admin sets revenue goals per branch / per sales rep.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/admin/targets', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
-  const rows = getDb().prepare(
-    `SELECT scope_type, scope_name, target_amount FROM sales_targets`
-  ).all();
-  return res.json({ targets: rows });
+  // Defaults to the current calendar month when ?month is not given.
+  const month = (req.query.month && String(req.query.month).trim()) || currentMonth();
+  const rows = getDb().prepare(`
+    SELECT scope_type, scope_name, target_month, target_amount
+    FROM sales_targets WHERE target_month = ?
+  `).all(month);
+  return res.json({ month, targets: rows });
 });
 
 app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => {
-  const { scope_type, scope_name, target_amount } = req.body || {};
+  const { scope_type, scope_name, target_amount, target_month } = req.body || {};
   if (!['branch', 'sales_rep'].includes(scope_type)) {
     return res.status(400).json({ error: 'bad_scope_type' });
   }
@@ -3658,12 +3685,17 @@ app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => 
   if (!Number.isFinite(amount) || amount < 0) {
     return res.status(400).json({ error: 'bad_target_amount' });
   }
+  // Default to the current calendar month; validate the 'YYYY-MM' shape.
+  let month = (target_month && String(target_month).trim()) || currentMonth();
+  if (!/^\d{4}-\d{2}$/.test(month)) month = currentMonth();
+
   getDb().prepare(`
-    INSERT INTO sales_targets (scope_type, scope_name, target_amount)
-    VALUES (?, ?, ?)
-    ON CONFLICT(scope_type, scope_name) DO UPDATE SET target_amount = excluded.target_amount
-  `).run(scope_type, name, amount);
-  return res.json({ ok: true, scope_type, scope_name: name, target_amount: amount });
+    INSERT INTO sales_targets (scope_type, scope_name, target_month, target_amount)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(scope_type, scope_name, target_month)
+      DO UPDATE SET target_amount = excluded.target_amount
+  `).run(scope_type, name, month, amount);
+  return res.json({ ok: true, scope_type, scope_name: name, target_month: month, target_amount: amount });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3695,15 +3727,19 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
     `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
   ).get(...visParams).n;
 
-  // Target — rep-scoped, branch-scoped, or company-wide (sum of branch targets).
+  // Target progress — strictly the CURRENT calendar month: this month's
+  // target vs revenue generated this month (independent of the filter range).
+  const curMonth = currentMonth();
   let target = 0;
   if (rep)         target = getTarget(db, 'sales_rep', rep);
   else if (branch) target = getTarget(db, 'branch', branch);
   else {
-    target = db.prepare(
-      `SELECT COALESCE(SUM(target_amount), 0) AS t FROM sales_targets WHERE scope_type = 'branch'`
-    ).get().t || 0;
+    target = db.prepare(`
+      SELECT COALESCE(SUM(target_amount), 0) AS t
+      FROM sales_targets WHERE scope_type = 'branch' AND target_month = ?
+    `).get(curMonth).t || 0;
   }
+  const monthRev = monthRevenue(db, { branch, rep, month: curMonth });
 
   const revenue = purRow.revenue || 0;
 
@@ -3760,7 +3796,9 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
     total_visits:     visits,
     closing_rate:     visits ? Math.round((purRow.buyers / visits) * 100) : 0,
     target,
-    percent_achieved: pctAchieved(revenue, target),
+    target_month:     curMonth,
+    month_revenue:    monthRev,
+    percent_achieved: pctAchieved(monthRev, target),
     funnel_stages,
     lead_distribution,
     branch_demand,
@@ -3774,11 +3812,15 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
 app.get('/api/sales/my-target', requireAuth, authorizeRoles('sales', 'rep'), (req, res) => {
   const db = getDb();
   const me = req.user.name;
+  // Current calendar month: this month's target vs this month's revenue.
   const target  = getTarget(db, 'sales_rep', me);
-  const revenue = db.prepare(
-    `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE rep = ?`
-  ).get(me).r || 0;
-  return res.json({ target, revenue, percent: pctAchieved(revenue, target) });
+  const revenue = monthRevenue(db, { rep: me });
+  return res.json({
+    target,
+    revenue,
+    percent:      pctAchieved(revenue, target),
+    target_month: currentMonth(),
+  });
 });
 
 // Also expose the dashboard summary's age buckets so the customers analytics

@@ -413,16 +413,49 @@ function initializeDatabase(dbPath = DB_PATH) {
     CREATE INDEX IF NOT EXISTS idx_notif_audience ON notifications(audience, created_at DESC);
   `);
 
-  // sales_targets: revenue goals per branch or per sales rep.
-  // scope_type = 'branch' | 'sales_rep' ; scope_name = the branch / rep name.
+  // sales_targets: MONTHLY revenue goals per branch / per sales rep.
+  // scope_type = 'branch' | 'sales_rep' ; scope_name = branch / rep name ;
+  // target_month = 'YYYY-MM'. One target per (scope, month).
   db.exec(`
     CREATE TABLE IF NOT EXISTS sales_targets (
       scope_type    TEXT,
       scope_name    TEXT,
+      target_month  TEXT,
       target_amount REAL,
-      PRIMARY KEY (scope_type, scope_name)
+      PRIMARY KEY (scope_type, scope_name, target_month)
     );
   `);
+
+  // Migrate a pre-monthly sales_targets table (no target_month column) →
+  // recreate with the monthly schema, stamping old rows with the current month.
+  try {
+    const stCols = db.prepare(`PRAGMA table_info(sales_targets)`).all().map(c => c.name);
+    if (!stCols.includes('target_month')) {
+      const curMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+      db.exec(`ALTER TABLE sales_targets RENAME TO sales_targets_legacy`);
+      db.exec(`
+        CREATE TABLE sales_targets (
+          scope_type    TEXT,
+          scope_name    TEXT,
+          target_month  TEXT,
+          target_amount REAL,
+          PRIMARY KEY (scope_type, scope_name, target_month)
+        );
+      `);
+      const legacy = db.prepare(
+        `SELECT scope_type, scope_name, target_amount FROM sales_targets_legacy`
+      ).all();
+      const ins = db.prepare(`
+        INSERT OR REPLACE INTO sales_targets (scope_type, scope_name, target_month, target_amount)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const r of legacy) ins.run(r.scope_type, r.scope_name, curMonth, r.target_amount);
+      db.exec(`DROP TABLE sales_targets_legacy`);
+      console.log(`✅ Migration: sales_targets → monthly schema (${legacy.length} rows kept)`);
+    }
+  } catch (e) {
+    console.error('[migration] sales_targets monthly:', e.message);
+  }
 
   // follow_up_state: per-lead weekly send counter.
   // week_anchor is the ISO date of the Monday the counter belongs to;
