@@ -1793,11 +1793,15 @@ function computeScore(metrics, weights) {
 
 app.get('/api/admin/achievements/sales', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
-  const { branch, rep } = req.query;
+  const { branch, rep, startDate, endDate } = req.query;
   let scopeClause = '';
   const scopeParams = [];
   if (branch) { scopeClause += ` AND f.branch = ?`;          scopeParams.push(branch); }
   if (rep)    { scopeClause += ` AND f.assigned_sales = ?`;  scopeParams.push(rep); }
+  // Date range bounds the cohort by when the customer was assigned to the rep.
+  const dr = dateRangeClause('f.assigned_at', startDate, endDate);
+  scopeClause += dr.clause;
+  scopeParams.push(...dr.params);
   const branchClause = scopeClause;
   const branchParam  = scopeParams;
 
