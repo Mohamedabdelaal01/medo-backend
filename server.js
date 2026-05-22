@@ -1331,6 +1331,14 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     console.warn('[Event-Trigger] ⚠️ Visit confirmed but manychat_visit_flow is empty — no message sent. Set it in Settings → API.');
   }
 
+  // Who followed this lead up online before the visit — so reception can see
+  // the pre-visit rep but still pick the actual showroom rep manually.
+  const preVisitRow = visitBranch
+    ? db.prepare(
+        `SELECT assigned_sales FROM branch_customer_followups WHERE user_id = ? AND branch = ?`
+      ).get(lead.user_id, visitBranch)
+    : null;
+
   return res.json({
     ok:              true,
     user_id:         lead.user_id,
@@ -1338,6 +1346,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     campaign_source: lead.campaign_source || null,
     branch:          visitBranch || null,
     lead_class:      newClass,
+    pre_visit_rep:   preVisitRow?.assigned_sales || null,
   });
 });
 
@@ -1369,14 +1378,18 @@ app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'
       (SELECT v.visited_at FROM lead_visits v
          WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS visited_at,
       (SELECT v.sales_rep FROM lead_visits v
-         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS sales_rep
+         WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS sales_rep,
+      f.assigned_sales AS pre_visit_rep,
+      f.followed_up
     FROM events e
     JOIN lead_profiles lp ON lp.user_id = e.user_id
+    LEFT JOIN branch_customer_followups f
+      ON f.user_id = lp.user_id AND f.branch = ?
     WHERE e.event_type = 'branch_selected'
       AND (e.event_value = ? OR e.branch = ?)
     GROUP BY lp.user_id
     ORDER BY (visited_at IS NOT NULL) ASC, last_requested DESC
-  `).all(branch, branch, branch, branch);
+  `).all(branch, branch, branch, branch, branch);
 
   // total branch_selected events for this branch (helps the admin debug
   // an id mismatch between ManyChat / Settings / the reception account)
@@ -1416,20 +1429,46 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const db = getDb();
-  // Attach to the existing visit row for this branch; create it if the
-  // salesperson is being set without a prior confirm (robust).
+
+  // Step A — who followed this lead up online BEFORE the visit.
+  const fuRow = db.prepare(
+    `SELECT assigned_sales FROM branch_customer_followups WHERE user_id = ? AND branch = ?`
+  ).get(user_id, branch);
+  const preVisitRep = fuRow?.assigned_sales || null;
+
+  // Step B — store BOTH the showroom rep and the pre-visit rep on the visit.
+  // Create the row if the salesperson is set without a prior confirm (robust).
   const existing = db.prepare(
     `SELECT id FROM lead_visits WHERE user_id=? AND branch=?`
   ).get(user_id, branch);
   if (existing) {
-    db.prepare(`UPDATE lead_visits SET sales_rep=? WHERE id=?`).run(sales_rep, existing.id);
+    db.prepare(`UPDATE lead_visits SET sales_rep=?, pre_visit_rep=? WHERE id=?`)
+      .run(sales_rep, preVisitRep, existing.id);
   } else {
     db.prepare(
-      `INSERT INTO lead_visits (user_id, branch, sales_rep) VALUES (?,?,?)`
-    ).run(user_id, branch, sales_rep);
+      `INSERT INTO lead_visits (user_id, branch, sales_rep, pre_visit_rep) VALUES (?,?,?,?)`
+    ).run(user_id, branch, sales_rep, preVisitRep);
   }
-  console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${sales_rep}`);
-  return res.json({ ok: true, user_id, branch, sales_rep });
+
+  // Step C — handoff: the pre-visit rep is NOT the showroom rep. Log the
+  // handoff and move the follow-up record over to the showroom rep.
+  if (preVisitRep && preVisitRep !== sales_rep) {
+    const logSummary = `العميل زار الفرع. تابعه قبل الزيارة [${preVisitRep}]، ولكن استقبله في الصالة [${sales_rep}].`;
+    logFollowup(db, branch, user_id, sales_rep, logSummary);
+    db.prepare(`
+      UPDATE branch_customer_followups SET
+        assigned_sales = ?,
+        assigned_by    = ?,
+        followed_up    = 0,
+        followed_up_at = NULL,
+        call_summary   = ?
+      WHERE branch = ? AND user_id = ?
+    `).run(sales_rep, req.user?.name || null, logSummary, branch, user_id);
+  }
+
+  console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${sales_rep}` +
+    (preVisitRep && preVisitRep !== sales_rep ? ` (pre-visit: ${preVisitRep})` : ''));
+  return res.json({ ok: true, user_id, branch, sales_rep, pre_visit_rep: preVisitRep });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1714,7 +1753,8 @@ app.get('/api/admin/achievements/sales', requireAuth, requireRole('admin'), (req
       COUNT(DISTINCT CASE WHEN ph.user_id IS NOT NULL THEN f.user_id END)   AS phones_received,
       SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END)                    AS followups_done,
       (SELECT COUNT(DISTINCT v.user_id) FROM lead_visits v
-        WHERE v.sales_rep = f.assigned_sales AND v.branch = f.branch)       AS visits_done,
+        WHERE (v.sales_rep = f.assigned_sales OR v.pre_visit_rep = f.assigned_sales)
+          AND v.branch = f.branch)                                         AS visits_done,
       (SELECT COUNT(DISTINCT p.user_id) FROM purchases p
         WHERE p.rep = f.assigned_sales AND p.branch = f.branch)             AS purchases_done
     FROM branch_customer_followups f

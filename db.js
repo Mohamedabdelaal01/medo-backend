@@ -306,6 +306,16 @@ function initializeDatabase() {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_sales ON lead_visits(sales_rep)`);
 
+  // pre_visit_rep — the rep who followed the lead up ONLINE before the visit
+  // (may differ from sales_rep, the showroom rep who actually served them).
+  try {
+    db.exec(`ALTER TABLE lead_visits ADD COLUMN pre_visit_rep TEXT`);
+    console.log('✅ Migration: pre_visit_rep column added to lead_visits');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_prerep ON lead_visits(pre_visit_rep)`);
+
   // branch_customer_followups: live follow-up state per (branch, user_id).
   // The branch manager assigns the customer to a sales rep; that sales rep
   // (or the manager) then marks the follow-up done and writes a call summary.
