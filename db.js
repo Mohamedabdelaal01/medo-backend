@@ -28,8 +28,8 @@ function resolveDbPath() {
 const DB_PATH = resolveDbPath();
 const DB_PERSISTENT = !!process.env.DB_PATH || DB_PATH.startsWith('/data');
 
-function initializeDatabase() {
-  const db = new Database(DB_PATH);
+function initializeDatabase(dbPath = DB_PATH) {
+  const db = new Database(dbPath);
 
   // Enable WAL mode for better performance
   db.pragma('journal_mode = WAL');
@@ -235,6 +235,14 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_purchases_product ON purchases(product_id);
   `);
 
+  // purchases.contract_number — the paper/contract reference for the sale.
+  try {
+    db.exec(`ALTER TABLE purchases ADD COLUMN contract_number TEXT`);
+    console.log('✅ Migration: contract_number column added to purchases');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
   // ── Intelligence layer — additive tables ─────────────────────────────────
   // messages_sent: every ManyChat flow we trigger is recorded here for audit
   // and to drive the weekly send counter. Joined back to lead_profiles by user_id.
@@ -376,6 +384,20 @@ function initializeDatabase() {
       created_at     DATETIME NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_revisit_fu_user ON revisit_followups(user_id, created_at DESC);
+  `);
+
+  // system_audit_log: an undo ledger for admin/manager assignment actions.
+  // old_state stores the pre-change row as JSON so the action can be reverted.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS system_audit_log (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      operator_name TEXT,
+      action_type   TEXT,
+      target_id     TEXT,
+      old_state     TEXT,
+      created_at    DATETIME DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON system_audit_log(created_at DESC);
   `);
 
   // follow_up_state: per-lead weekly send counter.
@@ -547,7 +569,7 @@ function initializeDatabase() {
     } catch (_) {}
   }
 
-  console.log('✅ Database initialized at:', DB_PATH);
+  console.log('✅ Database initialized at:', dbPath);
   if (DB_PERSISTENT) {
     console.log('💾 Storage: PERSISTENT — data survives redeploys ✅');
   } else {
@@ -557,14 +579,52 @@ function initializeDatabase() {
   return db;
 }
 
-// Singleton pattern — same DB instance across app
-let dbInstance = null;
+// ── Live / Demo sandbox ──────────────────────────────────────────────────────
+// global.systemMode = 'live' | 'demo'. In demo mode every getDb() call returns
+// a SEPARATE database file (grand_furniture_demo.db) so training/testing never
+// touches real data. The demo DB is created lazily on first use.
+global.systemMode = global.systemMode || 'live';
+
+const DEMO_DB_PATH = path.join(path.dirname(DB_PATH), 'grand_furniture_demo.db');
+
+let liveDbInstance = null;
+let demoDbInstance = null;
+
+function getLiveDb() {
+  if (!liveDbInstance) liveDbInstance = initializeDatabase(DB_PATH);
+  return liveDbInstance;
+}
+
+// Copy a whole table from one DB connection to another (replaces dst contents).
+function copyTable(src, dst, table) {
+  const rows = src.prepare(`SELECT * FROM ${table}`).all();
+  dst.prepare(`DELETE FROM ${table}`).run();
+  if (!rows.length) return;
+  const cols = Object.keys(rows[0]);
+  const stmt = dst.prepare(
+    `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+  );
+  const tx = dst.transaction(() => { for (const r of rows) stmt.run(...cols.map(c => r[c])); });
+  tx();
+}
+
+function getDemoDb() {
+  if (!demoDbInstance) {
+    const firstInit = !fs.existsSync(DEMO_DB_PATH);
+    demoDbInstance = initializeDatabase(DEMO_DB_PATH);
+    if (firstInit) {
+      // Fresh demo DB → copy real staff accounts + settings so people can log in.
+      const live = getLiveDb();
+      copyTable(live, demoDbInstance, 'users');
+      copyTable(live, demoDbInstance, 'settings');
+      console.log('🧪 Demo DB seeded with live users + settings');
+    }
+  }
+  return demoDbInstance;
+}
 
 function getDb() {
-  if (!dbInstance) {
-    dbInstance = initializeDatabase();
-  }
-  return dbInstance;
+  return global.systemMode === 'demo' ? getDemoDb() : getLiveDb();
 }
 
 module.exports = { getDb };

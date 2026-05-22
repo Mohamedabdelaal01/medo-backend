@@ -87,7 +87,7 @@ function autoAssignLead(db, userId, leadName) {
            WHERE lp.assigned_rep = u.name
              AND lp.lead_class NOT IN ('purchased','converted')) AS load
       FROM users u
-      WHERE u.role != 'admin'
+      WHERE u.role IN ('sales', 'rep')
       ORDER BY load ASC, u.name ASC
       LIMIT 1
     `).get();
@@ -1320,6 +1320,22 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     `).run(lead.user_id, visitBranch);
   }
 
+  // Resurrect a "lost" lead — they were closed in the re-visit funnel but
+  // walked back into the showroom, so put them back in the follow-up queue.
+  const revisitRow = db.prepare(
+    `SELECT revisit_status FROM lead_profiles WHERE user_id = ?`
+  ).get(lead.user_id);
+  const wasLostAndReturned = revisitRow?.revisit_status === 'lost';
+  if (wasLostAndReturned) {
+    db.prepare(`
+      UPDATE lead_profiles SET
+        revisit_status     = NULL,
+        revisit_note       = 'العميل عاد وزار المعرض مرة أخرى بعد إغلاقه',
+        revisit_updated_at = datetime('now')
+      WHERE user_id = ?
+    `).run(lead.user_id);
+  }
+
   console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${visitBranch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
   // Event-Triggered Flow: Visit Confirmed
@@ -1339,14 +1355,23 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       ).get(lead.user_id, visitBranch)
     : null;
 
+  // The showroom rep who served this customer on their most recent prior visit.
+  const lastShowroomRow = db.prepare(`
+    SELECT sales_rep FROM lead_visits
+    WHERE user_id = ? AND sales_rep IS NOT NULL
+    ORDER BY visited_at DESC LIMIT 1
+  `).get(lead.user_id);
+
   return res.json({
-    ok:              true,
-    user_id:         lead.user_id,
-    first_name:      lead.first_name || 'غير معروف',
-    campaign_source: lead.campaign_source || null,
-    branch:          visitBranch || null,
-    lead_class:      newClass,
-    pre_visit_rep:   preVisitRow?.assigned_sales || null,
+    ok:                   true,
+    user_id:              lead.user_id,
+    first_name:           lead.first_name || 'غير معروف',
+    campaign_source:      lead.campaign_source || null,
+    branch:               visitBranch || null,
+    lead_class:           newClass,
+    pre_visit_rep:        preVisitRow?.assigned_sales || null,
+    last_showroom_rep:    lastShowroomRow?.sales_rep || null,
+    was_lost_and_returned: wasLostAndReturned,
   });
 });
 
@@ -1380,7 +1405,10 @@ app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'
       (SELECT v.sales_rep FROM lead_visits v
          WHERE v.user_id = lp.user_id AND v.branch = ? LIMIT 1)        AS sales_rep,
       f.assigned_sales AS pre_visit_rep,
-      f.followed_up
+      f.followed_up,
+      (SELECT v2.sales_rep FROM lead_visits v2
+         WHERE v2.user_id = lp.user_id AND v2.sales_rep IS NOT NULL
+         ORDER BY v2.visited_at DESC LIMIT 1)                          AS last_showroom_rep
     FROM events e
     JOIN lead_profiles lp ON lp.user_id = e.user_id
     LEFT JOIN branch_customer_followups f
@@ -1438,8 +1466,9 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
 
   // Step B — store BOTH the showroom rep and the pre-visit rep on the visit.
   // Create the row if the salesperson is set without a prior confirm (robust).
+  // Full old row captured for the audit/undo ledger.
   const existing = db.prepare(
-    `SELECT id FROM lead_visits WHERE user_id=? AND branch=?`
+    `SELECT * FROM lead_visits WHERE user_id=? AND branch=?`
   ).get(user_id, branch);
   if (existing) {
     db.prepare(`UPDATE lead_visits SET sales_rep=?, pre_visit_rep=? WHERE id=?`)
@@ -1465,6 +1494,12 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
       WHERE branch = ? AND user_id = ?
     `).run(sales_rep, req.user?.name || null, logSummary, branch, user_id);
   }
+
+  auditLog(db, req.user?.name, 'set_sales', user_id, {
+    table: 'lead_visits',
+    where: { user_id, branch },
+    row:   existing || null,
+  });
 
   console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${sales_rep}` +
     (preVisitRep && preVisitRep !== sales_rep ? ` (pre-visit: ${preVisitRep})` : ''));
@@ -2253,6 +2288,19 @@ function logFollowup(db, branch, userId, sales, summary) {
   `).run(branch, userId, sales || null, (summary && String(summary).trim()) || null);
 }
 
+// Records an admin/manager action in the undo ledger. `oldState` describes how
+// to restore the affected row: { table, where: {...}, row: {...}|null }.
+function auditLog(db, operator, actionType, targetId, oldState) {
+  try {
+    db.prepare(`
+      INSERT INTO system_audit_log (operator_name, action_type, target_id, old_state)
+      VALUES (?, ?, ?, ?)
+    `).run(operator || null, actionType, String(targetId), JSON.stringify(oldState));
+  } catch (e) {
+    console.error('[audit] failed to log:', e.message);
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PATCH /api/branch/customers/:userId/assign — manager hands a customer to a
 // sales rep. Reassigning to a DIFFERENT sales rep resets the follow-up so the
@@ -2271,8 +2319,9 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
   if (!sales) return res.status(400).json({ error: 'sales_required' });
 
   const db  = getDb();
+  // Full old row — kept for the audit/undo ledger.
   const cur = db.prepare(
-    `SELECT assigned_sales, followed_up FROM branch_customer_followups WHERE branch = ? AND user_id = ?`
+    `SELECT * FROM branch_customer_followups WHERE branch = ? AND user_id = ?`
   ).get(branch, userId);
 
   // Changing the owner → start a brand-new follow-up cycle.
@@ -2292,6 +2341,12 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
       followed_up_by = NULL,
       call_summary   = NULL` : ''}
   `).run(branch, userId, sales, req.user?.name || null);
+
+  auditLog(db, req.user?.name, 'assign_customer', userId, {
+    table: 'branch_customer_followups',
+    where: { branch, user_id: userId },
+    row:   cur || null,
+  });
 
   return res.json({ ok: true, assigned_sales: sales, reset: !!resetCycle });
 });
@@ -2500,7 +2555,7 @@ app.delete('/api/branch/sales/:id', requireAuth, (req, res) => {
 // Returns: { ok, purchase_id, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/purchases', requireAuth, (req, res) => {
-  const { user_id, product_id, price, branch, notes } = req.body || {};
+  const { user_id, product_id, price, branch, notes, contract_number } = req.body || {};
   if (!user_id || typeof user_id !== 'string') {
     return res.status(400).json({ error: 'user_id is required' });
   }
@@ -2511,9 +2566,10 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
 
   const result = db.prepare(`
-    INSERT INTO purchases (user_id, product_id, price, branch, notes, rep)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(user_id, product_id || null, price || null, branch || null, notes || null, rep);
+    INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(user_id, product_id || null, price || null, branch || null, notes || null, rep,
+         (contract_number && String(contract_number).trim()) || null);
 
   // Mark lead as purchased (terminal state — won't be overridden by scoring)
   db.prepare(`
@@ -2785,6 +2841,89 @@ app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
     SELECT * FROM purchases WHERE user_id = ? ORDER BY created_at DESC
   `).all(req.params.user_id);
   return res.json({ purchases });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Contracts module — purchases viewed as contracts.
+//   GET    /api/contracts      — RBAC: sales→own, branch_manager→branch, admin→all
+//   PUT    /api/contracts/:id  — admin / branch_manager (manager → own branch)
+//   DELETE /api/contracts/:id  — admin / branch_manager (manager → own branch)
+//                                + smart reversion when a customer's last
+//                                  purchase is removed.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
+  const db   = getDb();
+  const role = req.user?.role;
+  let where = '1=1';
+  const params = [];
+  if (role === 'branch_manager') {
+    const b = req.user.branch || null;
+    if (!b) return res.status(400).json({ error: 'branch_required' });
+    where = 'p.branch = ?';
+    params.push(b);
+  } else if (role === 'sales' || role === 'rep') {
+    where = 'p.rep = ?';
+    params.push(req.user.name);
+  }
+
+  const contracts = db.prepare(`
+    SELECT p.id, p.user_id, p.price, p.contract_number, p.branch, p.rep,
+           p.product_id, p.notes, p.created_at,
+           lp.first_name, lp.phone
+    FROM purchases p
+    LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
+    WHERE ${where}
+    ORDER BY p.created_at DESC
+    LIMIT 500
+  `).all(...params);
+
+  return res.json({ contracts });
+});
+
+app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+  const db  = getDb();
+  const row = db.prepare(`SELECT id, branch FROM purchases WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'contract_not_found' });
+  if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const { price, contract_number } = req.body || {};
+  db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
+    price != null && price !== '' ? Number(price) : null,
+    (contract_number && String(contract_number).trim()) || null,
+    row.id
+  );
+  return res.json({ ok: true });
+});
+
+app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+  const db  = getDb();
+  const row = db.prepare(`SELECT id, user_id, branch FROM purchases WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'contract_not_found' });
+  if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  let reverted = false;
+  const tx = db.transaction(() => {
+    db.prepare(`DELETE FROM purchases WHERE id = ?`).run(row.id);
+    // Smart reversion — if this was the customer's last purchase, send them
+    // back into the post-visit follow-up queue.
+    const remaining = db.prepare(
+      `SELECT COUNT(*) AS n FROM purchases WHERE user_id = ?`
+    ).get(row.user_id).n;
+    if (remaining === 0) {
+      db.prepare(`
+        UPDATE lead_profiles SET lead_class = 'visited', purchased_at = NULL
+        WHERE user_id = ?
+      `).run(row.user_id);
+      reverted = true;
+    }
+  });
+  tx();
+
+  return res.json({ ok: true, reverted });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3286,6 +3425,99 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
 
   db.prepare(`DELETE FROM users WHERE id = ?`).run(targetId);
   return res.json({ ok: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// DELETE /api/admin/users/sales-rep/:name — remove a sales rep AND scrub every
+// reference to them across the system, in a single transaction. Used to keep
+// the data clean after a salesperson leaves.
+// ════════════════════════════════════════════════════════════════════════════
+app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin'), (req, res) => {
+  const name = String(req.params.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name_required' });
+
+  const db   = getDb();
+  const user = db.prepare(`SELECT id FROM users WHERE role = 'sales' AND name = ?`).get(name);
+  if (!user) return res.status(404).json({ error: 'sales_rep_not_found' });
+
+  const scrub = db.transaction(() => {
+    db.prepare(`DELETE FROM users WHERE role = 'sales' AND name = ?`).run(name);
+    db.prepare(`UPDATE lead_profiles SET assigned_rep = NULL WHERE assigned_rep = ?`).run(name);
+    db.prepare(`UPDATE lead_visits SET sales_rep = NULL WHERE sales_rep = ?`).run(name);
+    db.prepare(
+      `UPDATE branch_customer_followups SET assigned_sales = NULL, followed_up = 0 WHERE assigned_sales = ?`
+    ).run(name);
+    db.prepare(`UPDATE purchases SET rep = NULL WHERE rep = ?`).run(name);
+    db.prepare(`DELETE FROM followup_log WHERE sales = ?`).run(name);
+    db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
+  });
+  scrub();
+
+  console.log(`🗑️  SALES REP DELETED + SCRUBBED: ${name}`);
+  return res.json({ ok: true, name });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Admin undo ledger — list recent assignment actions and revert human errors.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/audit-logs', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const logs = db.prepare(`
+    SELECT id, operator_name, action_type, target_id, old_state, created_at
+    FROM system_audit_log
+    ORDER BY created_at DESC, id DESC
+    LIMIT 200
+  `).all();
+  return res.json({ logs });
+});
+
+app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), (req, res) => {
+  const db  = getDb();
+  const log = db.prepare(`SELECT * FROM system_audit_log WHERE id = ?`).get(req.params.id);
+  if (!log) return res.status(404).json({ error: 'log_not_found' });
+
+  let state;
+  try { state = JSON.parse(log.old_state || 'null'); } catch (_) { state = null; }
+  if (!state || !state.table) return res.status(400).json({ error: 'bad_old_state' });
+
+  // Whitelist the tables the ledger is allowed to touch.
+  const ALLOWED = ['branch_customer_followups', 'lead_visits'];
+  if (!ALLOWED.includes(state.table)) {
+    return res.status(400).json({ error: 'table_not_revertable' });
+  }
+
+  const whereKeys = Object.keys(state.where || {});
+  const whereSql  = whereKeys.map(k => `${k} = ?`).join(' AND ');
+  const whereVals = whereKeys.map(k => state.where[k]);
+
+  if (!state.row) {
+    // The row did not exist before the action → undo = delete it.
+    db.prepare(`DELETE FROM ${state.table} WHERE ${whereSql}`).run(...whereVals);
+  } else {
+    // Restore the row exactly as it was (row includes the primary key).
+    const cols = Object.keys(state.row);
+    db.prepare(
+      `INSERT OR REPLACE INTO ${state.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+    ).run(...cols.map(c => state.row[c]));
+  }
+
+  console.log(`↩️  AUDIT REVERT: log#${log.id} (${log.action_type}) by ${req.user?.name}`);
+  return res.json({ ok: true, reverted: log.action_type, target_id: log.target_id });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Live / Demo sandbox switch. GET is open to any authenticated user (the demo
+// banner must show to everyone); toggling is admin-only.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/system-mode', requireAuth, (req, res) => {
+  return res.json({ mode: global.systemMode || 'live' });
+});
+
+app.post('/api/admin/toggle-system-mode', requireAuth, requireRole('admin'), (req, res) => {
+  global.systemMode = global.systemMode === 'demo' ? 'live' : 'demo';
+  getDb(); // force-init the target DB (creates + seeds the demo DB on first switch)
+  console.log(`🔀 SYSTEM MODE → ${global.systemMode}`);
+  return res.json({ ok: true, mode: global.systemMode });
 });
 
 // Also expose the dashboard summary's age buckets so the customers analytics
