@@ -3521,16 +3521,32 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   return res.json({ ok: true });
 });
 
+// Scrub every reference to a (departed) sales / call rep. Visits and purchases
+// are real events — they're KEPT but un-attributed (rep column set to NULL),
+// so the departed rep stops appearing in performance analytics.
+function scrubRepReferences(db, name) {
+  db.prepare(`UPDATE lead_profiles SET assigned_rep = NULL WHERE assigned_rep = ?`).run(name);
+  db.prepare(`UPDATE lead_visits   SET sales_rep = NULL    WHERE sales_rep = ?`).run(name);
+  db.prepare(`UPDATE lead_visits   SET pre_visit_rep = NULL WHERE pre_visit_rep = ?`).run(name);
+  db.prepare(
+    `UPDATE branch_customer_followups SET assigned_sales = NULL, followed_up = 0 WHERE assigned_sales = ?`
+  ).run(name);
+  db.prepare(`UPDATE purchases SET rep = NULL WHERE rep = ?`).run(name);
+  db.prepare(`DELETE FROM followup_log      WHERE sales = ?`).run(name);
+  db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
+  db.prepare(`DELETE FROM sales_targets WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(name);
+}
+
 // DELETE /api/users/:id — admin removes a user account permanently.
 // Safety: admin cannot delete their OWN account (prevents self-lockout).
-// Returns 404 if the user doesn't exist, 400 if attempting self-deletion.
+// If the user was a sales/call rep, their footprint is scrubbed too.
 app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   const targetId = parseInt(req.params.id, 10);
   if (!Number.isFinite(targetId)) return res.status(400).json({ error: 'bad_id' });
   if (targetId === req.user.id)   return res.status(400).json({ error: 'cannot_delete_self' });
 
   const db = getDb();
-  const row = db.prepare(`SELECT id, role FROM users WHERE id = ?`).get(targetId);
+  const row = db.prepare(`SELECT id, role, name FROM users WHERE id = ?`).get(targetId);
   if (!row) return res.status(404).json({ error: 'user_not_found' });
 
   // Safety: never delete the last admin account.
@@ -3543,14 +3559,19 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
     }
   }
 
-  db.prepare(`DELETE FROM users WHERE id = ?`).run(targetId);
+  db.transaction(() => {
+    db.prepare(`DELETE FROM users WHERE id = ?`).run(targetId);
+    // A departed sales / call rep → scrub their footprint so they vanish
+    // from performance analytics.
+    if (['sales', 'rep'].includes(row.role)) scrubRepReferences(db, row.name);
+  })();
+
   return res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 // DELETE /api/admin/users/sales-rep/:name — remove a sales rep AND scrub every
-// reference to them across the system, in a single transaction. Used to keep
-// the data clean after a salesperson leaves.
+// reference to them across the system, in a single transaction.
 // ════════════════════════════════════════════════════════════════════════════
 app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin'), (req, res) => {
   const name = String(req.params.name || '').trim();
@@ -3560,21 +3581,44 @@ app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin')
   const user = db.prepare(`SELECT id FROM users WHERE role = 'sales' AND name = ?`).get(name);
   if (!user) return res.status(404).json({ error: 'sales_rep_not_found' });
 
-  const scrub = db.transaction(() => {
+  db.transaction(() => {
     db.prepare(`DELETE FROM users WHERE role = 'sales' AND name = ?`).run(name);
-    db.prepare(`UPDATE lead_profiles SET assigned_rep = NULL WHERE assigned_rep = ?`).run(name);
-    db.prepare(`UPDATE lead_visits SET sales_rep = NULL WHERE sales_rep = ?`).run(name);
-    db.prepare(
-      `UPDATE branch_customer_followups SET assigned_sales = NULL, followed_up = 0 WHERE assigned_sales = ?`
-    ).run(name);
-    db.prepare(`UPDATE purchases SET rep = NULL WHERE rep = ?`).run(name);
-    db.prepare(`DELETE FROM followup_log WHERE sales = ?`).run(name);
-    db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
-  });
-  scrub();
+    scrubRepReferences(db, name);
+  })();
 
   console.log(`🗑️  SALES REP DELETED + SCRUBBED: ${name}`);
   return res.json({ ok: true, name });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/admin/cleanup-orphan-reps — scrub leftover data from sales/call
+// reps who were deleted WITHOUT scrubbing (e.g. via the old plain delete).
+// Finds rep names referenced in the data that no longer exist as users.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/cleanup-orphan-reps', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const valid = new Set(
+    db.prepare(`SELECT name FROM users WHERE role IN ('sales', 'rep')`).all().map(r => r.name)
+  );
+  const referenced = new Set();
+  const sources = [
+    `SELECT DISTINCT sales_rep      AS n FROM lead_visits WHERE sales_rep IS NOT NULL`,
+    `SELECT DISTINCT pre_visit_rep  AS n FROM lead_visits WHERE pre_visit_rep IS NOT NULL`,
+    `SELECT DISTINCT rep            AS n FROM purchases   WHERE rep IS NOT NULL`,
+    `SELECT DISTINCT assigned_sales AS n FROM branch_customer_followups WHERE assigned_sales IS NOT NULL`,
+    `SELECT DISTINCT assigned_rep   AS n FROM lead_profiles WHERE assigned_rep IS NOT NULL`,
+  ];
+  for (const q of sources) {
+    for (const r of db.prepare(q).all()) if (r.n) referenced.add(r.n);
+  }
+  const orphans = [...referenced].filter(n => !valid.has(n));
+
+  db.transaction(() => {
+    for (const n of orphans) scrubRepReferences(db, n);
+  })();
+
+  console.log(`🧹 ORPHAN REP CLEANUP: ${orphans.length} — ${orphans.join(', ') || 'none'}`);
+  return res.json({ ok: true, cleaned_count: orphans.length, cleaned: orphans });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
