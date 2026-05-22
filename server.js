@@ -3618,12 +3618,55 @@ app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin')
     return res.json({ ok: true, mode: 'archive', name });
   }
 
-  // Hard scrub — delete the user and nullify all their history.
+  // Hard scrub — full destructive reset: delete the rep's visits & purchases,
+  // reset every affected customer back to a fresh state, delete the user.
   db.transaction(() => {
+    // Capture customers who visited via this rep BEFORE deleting their visits.
+    const visitedByRep = db.prepare(
+      `SELECT DISTINCT user_id FROM lead_visits WHERE sales_rep = ? OR pre_visit_rep = ?`
+    ).all(name, name).map(r => r.user_id);
+
+    // 1. Delete the rep's visits entirely.
+    db.prepare(`DELETE FROM lead_visits WHERE sales_rep = ? OR pre_visit_rep = ?`).run(name, name);
+
+    // 2. Reset the rep's ASSIGNED leads back to a cold/new state.
+    db.prepare(`
+      UPDATE lead_profiles
+      SET assigned_rep = NULL, lead_class = 'cold', purchased_at = NULL, revisit_status = NULL
+      WHERE assigned_rep = ?
+    `).run(name);
+
+    // 2b. Customers who VISITED with this rep but now have NO visits left →
+    //     clear their visit state so the dashboards/analytics truly reset.
+    const clearVisit = db.prepare(`
+      UPDATE lead_profiles
+      SET visit_confirmed = 0, visit_at = NULL, revisit_status = NULL,
+          lead_class = CASE WHEN lead_class IN ('visited','purchased') THEN 'cold' ELSE lead_class END
+      WHERE user_id = ?
+    `);
+    for (const uid of visitedByRep) {
+      const stillHasVisit = db.prepare(`SELECT 1 FROM lead_visits WHERE user_id = ? LIMIT 1`).get(uid);
+      if (!stillHasVisit) clearVisit.run(uid);
+    }
+
+    // 3. Delete the rep's purchases entirely.
+    db.prepare(`DELETE FROM purchases WHERE rep = ?`).run(name);
+
+    // 4. Reset follow-ups they owned.
+    db.prepare(
+      `UPDATE branch_customer_followups SET assigned_sales = NULL, followed_up = 0 WHERE assigned_sales = ?`
+    ).run(name);
+
+    // 5. Delete their logs + monthly target.
+    db.prepare(`DELETE FROM followup_log      WHERE sales = ?`).run(name);
+    db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
+    db.prepare(`DELETE FROM sales_targets WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(name);
+
+    // 6. Delete the user.
     db.prepare(`DELETE FROM users WHERE name = ? AND role != 'admin'`).run(name);
-    scrubRepReferences(db, name);
   })();
-  console.log(`🗑️  USER SCRUBBED: ${name}`);
+
+  console.log(`🗑️  USER SCRUBBED (hard reset): ${name}`);
   return res.json({ ok: true, mode: 'scrub', name });
 });
 
@@ -3664,7 +3707,7 @@ app.post('/api/admin/cleanup-orphan-reps', requireAuth, requireRole('admin'), (r
 app.get('/api/admin/audit-logs', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
   const logs = db.prepare(`
-    SELECT id, operator_name, action_type, target_id, old_state, created_at
+    SELECT id, operator_name, action_type, target_id, old_state, created_at, reverted
     FROM system_audit_log
     ORDER BY created_at DESC, id DESC
     LIMIT 200
@@ -3676,6 +3719,7 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
   const db  = getDb();
   const log = db.prepare(`SELECT * FROM system_audit_log WHERE id = ?`).get(req.params.id);
   if (!log) return res.status(404).json({ error: 'log_not_found' });
+  if (log.reverted) return res.status(400).json({ error: 'already_reverted' });
 
   let state;
   try { state = JSON.parse(log.old_state || 'null'); } catch (_) { state = null; }
@@ -3691,16 +3735,20 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
   const whereSql  = whereKeys.map(k => `${k} = ?`).join(' AND ');
   const whereVals = whereKeys.map(k => state.where[k]);
 
-  if (!state.row) {
-    // The row did not exist before the action → undo = delete it.
-    db.prepare(`DELETE FROM ${state.table} WHERE ${whereSql}`).run(...whereVals);
-  } else {
-    // Restore the row exactly as it was (row includes the primary key).
-    const cols = Object.keys(state.row);
-    db.prepare(
-      `INSERT OR REPLACE INTO ${state.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
-    ).run(...cols.map(c => state.row[c]));
-  }
+  db.transaction(() => {
+    if (!state.row) {
+      // The row did not exist before the action → undo = delete it.
+      db.prepare(`DELETE FROM ${state.table} WHERE ${whereSql}`).run(...whereVals);
+    } else {
+      // Restore the row exactly as it was (row includes the primary key).
+      const cols = Object.keys(state.row);
+      db.prepare(
+        `INSERT OR REPLACE INTO ${state.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+      ).run(...cols.map(c => state.row[c]));
+    }
+    // Mark the ledger entry as reverted so the UI reflects it.
+    db.prepare(`UPDATE system_audit_log SET reverted = 1 WHERE id = ?`).run(log.id);
+  })();
 
   console.log(`↩️  AUDIT REVERT: log#${log.id} (${log.action_type}) by ${req.user?.name}`);
   return res.json({ ok: true, reverted: log.action_type, target_id: log.target_id });

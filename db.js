@@ -399,6 +399,12 @@ function initializeDatabase(dbPath = DB_PATH) {
     );
     CREATE INDEX IF NOT EXISTS idx_audit_created ON system_audit_log(created_at DESC);
   `);
+  // reverted — 1 once the action has been undone (so the UI can show it).
+  try {
+    db.exec(`ALTER TABLE system_audit_log ADD COLUMN reverted INTEGER NOT NULL DEFAULT 0`);
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
 
   // notifications: backend-generated alerts. audience = role bucket ('admin').
   db.exec(`
