@@ -87,7 +87,7 @@ function autoAssignLead(db, userId, leadName) {
            WHERE lp.assigned_rep = u.name
              AND lp.lead_class NOT IN ('purchased','converted')) AS load
       FROM users u
-      WHERE u.role IN ('sales', 'rep')
+      WHERE u.role IN ('sales', 'rep') AND u.active = 1
       ORDER BY load ASC, u.name ASC
       LIMIT 1
     `).get();
@@ -1456,8 +1456,8 @@ app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sa
   const branch = role === 'reception' ? (req.user.branch || null) : (req.query.branch || null);
   const db = getDb();
   const rows = branch
-    ? db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND branch=? ORDER BY name`).all(branch)
-    : db.prepare(`SELECT name, branch FROM users WHERE role='sales' ORDER BY name`).all();
+    ? db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND active=1 AND branch=? ORDER BY name`).all(branch)
+    : db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND active=1 ORDER BY name`).all();
   return res.json({ reps: rows });
 });
 
@@ -2642,6 +2642,30 @@ app.delete('/api/branch/sales/:id', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/branch/users/:id/toggle-active — flip a user's active flag.
+// Admin → any non-admin user. Branch manager → users in their own branch only.
+// This is the ONLY way a branch manager can "remove" a user (soft, reversible).
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/branch/users/:id/toggle-active', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+  const db = getDb();
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad_id' });
+  if (id === req.user.id)   return res.status(400).json({ error: 'cannot_toggle_self' });
+
+  const u = db.prepare(`SELECT id, role, branch, active FROM users WHERE id = ?`).get(id);
+  if (!u) return res.status(404).json({ error: 'user_not_found' });
+  if (u.role === 'admin') return res.status(403).json({ error: 'cannot_toggle_admin' });
+  if (req.user.role === 'branch_manager' && u.branch !== req.user.branch) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const next = u.active ? 0 : 1;
+  db.prepare(`UPDATE users SET active = ? WHERE id = ?`).run(next, id);
+  console.log(`🔄 USER ${next ? 'ACTIVATED' : 'DEACTIVATED'}: id:${id} by ${req.user?.name}`);
+  return res.json({ ok: true, id, active: next });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/purchases — Sales rep records an offline purchase for a lead.
 // Body: { user_id, product_id?, price?, branch?, notes? }
 // Returns: { ok, purchase_id, lead_class }
@@ -3310,13 +3334,13 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
 
 // ════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/reps — Returns name list of all sales reps (role != admin).
-// Accessible to ALL authenticated users (reps need it for RepSelector + leaderboard).
+// GET /api/reps — Returns name list of ACTIVE sales reps (role != admin).
+// Deactivated reps are excluded so they no longer receive new leads.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/reps', requireAuth, (req, res) => {
   const db   = getDb();
   const reps = db.prepare(
-    `SELECT name FROM users WHERE role != 'admin' ORDER BY name`
+    `SELECT name FROM users WHERE role != 'admin' AND active = 1 ORDER BY name`
   ).all().map(r => r.name);
   return res.json({ reps });
 });
@@ -3570,24 +3594,35 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// DELETE /api/admin/users/sales-rep/:name — remove a sales rep AND scrub every
-// reference to them across the system, in a single transaction.
+// DELETE /api/admin/users/sales-rep/:name?mode=archive|scrub
+//   archive (default, SAFE) → just set active = 0. No leads/visits/purchases
+//                             are touched — full history is preserved.
+//   scrub   (DESTRUCTIVE)   → hard-delete the user + nullify all their history.
 // ════════════════════════════════════════════════════════════════════════════
 app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin'), (req, res) => {
   const name = String(req.params.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name_required' });
+  const mode = req.query.mode === 'scrub' ? 'scrub' : 'archive'; // default = safe archive
 
   const db   = getDb();
-  const user = db.prepare(`SELECT id FROM users WHERE role = 'sales' AND name = ?`).get(name);
-  if (!user) return res.status(404).json({ error: 'sales_rep_not_found' });
+  const user = db.prepare(`SELECT id, role FROM users WHERE name = ?`).get(name);
+  if (!user) return res.status(404).json({ error: 'user_not_found' });
+  if (user.role === 'admin') return res.status(403).json({ error: 'cannot_offboard_admin' });
 
+  if (mode === 'archive') {
+    // Soft offboarding — disable login only, keep every record intact.
+    db.prepare(`UPDATE users SET active = 0 WHERE name = ? AND role != 'admin'`).run(name);
+    console.log(`📦 USER ARCHIVED: ${name}`);
+    return res.json({ ok: true, mode: 'archive', name });
+  }
+
+  // Hard scrub — delete the user and nullify all their history.
   db.transaction(() => {
-    db.prepare(`DELETE FROM users WHERE role = 'sales' AND name = ?`).run(name);
+    db.prepare(`DELETE FROM users WHERE name = ? AND role != 'admin'`).run(name);
     scrubRepReferences(db, name);
   })();
-
-  console.log(`🗑️  SALES REP DELETED + SCRUBBED: ${name}`);
-  return res.json({ ok: true, name });
+  console.log(`🗑️  USER SCRUBBED: ${name}`);
+  return res.json({ ok: true, mode: 'scrub', name });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
