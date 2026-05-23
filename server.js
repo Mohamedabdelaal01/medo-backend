@@ -3862,6 +3862,40 @@ app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/admin/reset-visits — hard-reset all visit data: removes every
+// visit_confirmed event, clears visit flags on lead_profiles, and wipes the
+// follow_up_state for affected leads so they re-enter the funnel as new.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/reset-visits', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const d1 = db.prepare(`
+    DELETE FROM events
+    WHERE event_type = 'visit_confirmed'
+      AND user_id IN (SELECT user_id FROM lead_profiles WHERE visit_confirmed = 1)
+  `).run();
+  const d2 = db.prepare(`
+    UPDATE lead_profiles
+    SET visit_confirmed     = 0,
+        lead_class          = 'new',
+        total_score         = 0,
+        visit_at            = NULL,
+        visit_code          = NULL,
+        revisit_status      = NULL,
+        revisit_note        = NULL,
+        revisit_updated_by  = NULL,
+        revisit_updated_at  = NULL
+    WHERE visit_confirmed = 1
+  `).run();
+  const d3 = db.prepare(`
+    DELETE FROM follow_up_state
+    WHERE user_id IN (SELECT user_id FROM lead_profiles WHERE lead_class = 'new')
+  `).run();
+  const d4 = db.prepare(`DELETE FROM lead_visits`).run();
+  console.log(`🔄 RESET-VISITS: events=${d1.changes} profiles=${d2.changes} follow_up=${d3.changes} lead_visits=${d4.changes}`);
+  return res.json({ ok: true, events_deleted: d1.changes, profiles_reset: d2.changes, follow_up_cleared: d3.changes, lead_visits_cleared: d4.changes });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/admin/kpis — filtered executive KPIs (revenue / visits / closing
 // rate) + target achievement. Filters: startDate, endDate, branch, rep.
 // ════════════════════════════════════════════════════════════════════════════
@@ -4066,6 +4100,184 @@ setTimeout(() => {
   runAbandonedIntentJob();
   setInterval(runAbandonedIntentJob, 60 * 60 * 1000);
 }, 5000);
+
+// ── MCP Cloud SSE Server ──────────────────────────────────────────────────────
+// Exposes the CRM to Claude Desktop via HTTP Server-Sent Events.
+// No local script, no bridge — Claude connects directly to the live Railway DB.
+// Auth: every request must carry  x-mcp-key: <MCP_SECRET_KEY>  in its headers.
+(function setupMcpSseServer() {
+  let McpServerCls, SSEServerTransport, z;
+  try {
+    McpServerCls       = require('@modelcontextprotocol/sdk/server/mcp.js').McpServer;
+    SSEServerTransport = require('@modelcontextprotocol/sdk/server/sse.js').SSEServerTransport;
+    z                  = require('zod').z;
+  } catch (e) {
+    console.error('[MCP] SDK missing — SSE endpoint disabled:', e.message);
+    return;
+  }
+
+  // sessionId → SSEServerTransport  (one entry per open Claude Desktop tab)
+  const mcpSessions = new Map();
+
+  // Auth guard — 401 if header is absent or wrong
+  function mcpAuth(req, res, next) {
+    const expected = process.env.MCP_SECRET_KEY;
+    if (!expected) {
+      return res.status(503).json({ error: 'MCP_SECRET_KEY not configured on server.' });
+    }
+    if (req.headers['x-mcp-key'] !== expected) {
+      return res.status(401).json({ error: 'Unauthorized: invalid or missing x-mcp-key header.' });
+    }
+    next();
+  }
+
+  // Build a fresh McpServer + register all 4 CRM tools
+  function buildMcpServer() {
+    const srv = new McpServerCls({ name: 'grand-furniture-crm', version: '1.0.0' });
+    const db  = getDb();
+    const currentMonth = () => new Date().toISOString().slice(0, 7);
+    const ok  = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
+    const fail = (msg) => ({ content: [{ type: 'text', text: 'خطأ: ' + msg }], isError: true });
+
+    // ── Tool A: Branch KPIs ─────────────────────────────────────────────────
+    srv.registerTool('get_branch_kpis', {
+      description: 'مؤشرات أداء فرع: إجمالي المبيعات، عدد الزيارات، ونسبة تحقيق المستهدف لشهر معيّن.',
+      inputSchema: {
+        branch:       z.string().optional().describe('اسم/مُعرّف الفرع — فارغ = كل الفروع'),
+        target_month: z.string().optional().describe('الشهر YYYY-MM (افتراضي: الشهر الحالي)'),
+      },
+    }, async ({ branch, target_month }) => {
+      try {
+        const month = (target_month && /^\d{4}-\d{2}$/.test(target_month))
+          ? target_month : currentMonth();
+
+        let revWhere = `strftime('%Y-%m', created_at) = ?`;
+        const revP = [month];
+        if (branch) { revWhere += ' AND branch = ?'; revP.push(branch); }
+        const revenue = db.prepare(
+          `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${revWhere}`
+        ).get(...revP).r;
+
+        let visWhere = `strftime('%Y-%m', visited_at) = ?`;
+        const visP = [month];
+        if (branch) { visWhere += ' AND branch = ?'; visP.push(branch); }
+        const visits = db.prepare(
+          `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
+        ).get(...visP).n;
+
+        const target = branch
+          ? (() => {
+              const r = db.prepare(
+                `SELECT target_amount FROM sales_targets WHERE scope_type='branch' AND scope_name=? AND target_month=?`
+              ).get(branch, month);
+              return r ? Number(r.target_amount) || 0 : 0;
+            })()
+          : (db.prepare(
+              `SELECT COALESCE(SUM(target_amount), 0) AS t FROM sales_targets WHERE scope_type='branch' AND target_month=?`
+            ).get(month).t || 0);
+
+        return ok({
+          branch: branch || 'كل الفروع',
+          target_month: month,
+          total_revenue: revenue,
+          visit_count: visits,
+          target_amount: target,
+          target_achievement_pct: target > 0 ? Math.round((revenue / target) * 100) : 0,
+        });
+      } catch (e) { return fail(e.message); }
+    });
+
+    // ── Tool B: Leads by status ─────────────────────────────────────────────
+    srv.registerTool('get_leads_by_status', {
+      description: 'قائمة العملاء (id/name/phone/class) مع فلترة بالمندوب أو التصنيف.',
+      inputSchema: {
+        assigned_rep: z.string().optional().describe('فلترة بالمندوب المسؤول'),
+        lead_class:   z.string().optional().describe('cold / warm / hot / visited / purchased'),
+      },
+    }, async ({ assigned_rep, lead_class }) => {
+      try {
+        let where = '1=1'; const params = [];
+        if (assigned_rep) { where += ' AND assigned_rep = ?'; params.push(assigned_rep); }
+        if (lead_class)   { where += ' AND lead_class = ?';   params.push(lead_class); }
+        const leads = db.prepare(`
+          SELECT user_id AS id, first_name AS name, phone,
+                 lead_class AS class, assigned_rep, revisit_status
+          FROM lead_profiles WHERE ${where}
+          ORDER BY last_activity DESC LIMIT 300
+        `).all(...params);
+        return ok({ count: leads.length, leads });
+      } catch (e) { return fail(e.message); }
+    });
+
+    // ── Tool C: SELECT SQL ──────────────────────────────────────────────────
+    srv.registerTool('run_select_sql', {
+      description: 'تنفيذ استعلام SELECT للقراءة وتحليل البيانات.',
+      inputSchema: { sql_query: z.string().describe('استعلام SELECT فقط') },
+    }, async ({ sql_query }) => {
+      try {
+        const q = String(sql_query || '').trim();
+        if (!/^select\b/i.test(q))
+          return fail('هذه الأداة للقراءة فقط — يجب أن يبدأ الاستعلام بـ SELECT.');
+        const rows = db.prepare(q).all();
+        return ok({ row_count: rows.length, rows: rows.slice(0, 500) });
+      } catch (e) { return fail(e.message); }
+    });
+
+    // ── Tool D: Write SQL ───────────────────────────────────────────────────
+    srv.registerTool('execute_write_sql', {
+      description: 'INSERT / UPDATE / DELETE لإصلاح البيانات. راجع WHERE بدقة قبل التنفيذ.',
+      inputSchema: { sql_query: z.string().describe('INSERT أو UPDATE أو DELETE') },
+    }, async ({ sql_query }) => {
+      try {
+        const q = String(sql_query || '').trim();
+        if (!/^(insert|update|delete|replace)\b/i.test(q))
+          return fail('يُقبل INSERT / UPDATE / DELETE / REPLACE فقط.');
+        if (/\b(drop|alter|truncate|attach|detach|vacuum)\b/i.test(q))
+          return fail('أوامر تعديل الهيكل (DROP/ALTER/TRUNCATE…) محظورة.');
+        const info = db.prepare(q).run();
+        console.error(`[mcp][WRITE] rows_affected=${info.changes} :: ${q}`);
+        return ok({ rows_affected: info.changes, last_insert_rowid: info.lastInsertRowid });
+      } catch (e) { return fail(e.message); }
+    });
+
+    return srv;
+  }
+
+  // GET /api/mcp/sse — Claude Desktop connects here to open the SSE stream
+  app.get('/api/mcp/sse', mcpAuth, async (req, res) => {
+    try {
+      const transport = new SSEServerTransport('/api/mcp/messages', res);
+      const mcpServer = buildMcpServer();
+      mcpSessions.set(transport.sessionId, transport);
+      transport.onclose = () => {
+        mcpSessions.delete(transport.sessionId);
+        console.log(`[MCP] session closed: ${transport.sessionId}`);
+      };
+      console.log(`[MCP] new session: ${transport.sessionId}`);
+      await mcpServer.connect(transport);
+    } catch (e) {
+      console.error('[MCP SSE] connection error:', e.message);
+      if (!res.headersSent) res.status(500).json({ error: 'MCP server error.' });
+    }
+  });
+
+  // POST /api/mcp/messages — receives JSON-RPC messages from Claude Desktop
+  app.post('/api/mcp/messages', mcpAuth, async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = mcpSessions.get(sessionId);
+    if (!transport) {
+      return res.status(404).json({ error: 'MCP session not found. Re-open the SSE connection.' });
+    }
+    try {
+      await transport.handlePostMessage(req, res, req.body);
+    } catch (e) {
+      console.error('[MCP SSE] message error:', e.message);
+      if (!res.headersSent) res.status(500).json({ error: 'MCP message handling error.' });
+    }
+  });
+
+  console.log('🤖 MCP SSE endpoint ready → /api/mcp/sse  (auth: x-mcp-key header)');
+})();
 
 // ── Global Error Handler ──────────────────────────────────────────────────
 // Any error thrown/forwarded in a route lands here → clean JSON, no crash.
