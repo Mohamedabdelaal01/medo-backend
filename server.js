@@ -3755,6 +3755,177 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// seedDemoData — fills the عين شمس demo branch with realistic fake data.
+// Called every time demo accounts are (re)generated — fully idempotent.
+// ════════════════════════════════════════════════════════════════════════════
+function seedDemoData(db) {
+  const BRANCH   = 'عين شمس';
+  const SALES    = 'demo_sales';
+  const MANAGER  = 'demo_manager';
+  const PREFIX   = 'dmol_';            // demo-lead prefix — easy to spot
+  const NOW      = new Date();
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  const iso = (d) => d.toISOString().replace('T', ' ').slice(0, 19);
+  const daysAgo  = (n) => { const d = new Date(NOW); d.setDate(d.getDate() - n); return d; };
+  const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
+
+  // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
+  db.prepare(`DELETE FROM lead_profiles WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM lead_phones   WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM lead_visits   WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM purchases     WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM branch_customer_followups WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM tasks         WHERE lead_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM sales_targets WHERE scope_name IN (?, ?) AND scope_type IN ('branch','sales_rep')`, ).run(BRANCH, SALES);
+
+  // ── 1. Lead profiles ────────────────────────────────────────────────────
+  const leads = [
+    // Cold — just registered
+    { id: `${PREFIX}01`, name: 'محمود سامي',    cls: 'cold',      score: 22, phone: '01001234567', product: 'غرفة نوم كلاسيك',    cat: 'غرف النوم',   src: 'فيسبوك',    views: 2,  sessions: 1 },
+    { id: `${PREFIX}02`, name: 'رنا عبد الله',   cls: 'cold',      score: 18, phone: null,          product: 'كنبة ركنة إل',        cat: 'الانتريهات', src: 'إنستجرام',  views: 1,  sessions: 1 },
+    { id: `${PREFIX}03`, name: 'يوسف طارق',     cls: 'cold',      score: 30, phone: '01112223334', product: 'طقم سفرة 6 كراسي',   cat: 'السفرة',     src: 'تيك توك',   views: 3,  sessions: 2 },
+    // Warm — engaged, viewed multiple products
+    { id: `${PREFIX}04`, name: 'سلمى حسين',     cls: 'warm',      score: 55, phone: '01223344556', product: 'غرفة نوم مودرن',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 6,  sessions: 3 },
+    { id: `${PREFIX}05`, name: 'عمر فاروق',     cls: 'warm',      score: 62, phone: '01334455667', product: 'انتريه 5 مقاعد',      cat: 'الانتريهات', src: 'فيسبوك',    views: 5,  sessions: 4 },
+    { id: `${PREFIX}06`, name: 'دينا مصطفى',   cls: 'warm',      score: 48, phone: null,          product: 'مطبخ أكريليك أبيض',   cat: 'المطابخ',    src: 'إنستجرام',  views: 4,  sessions: 2 },
+    { id: `${PREFIX}07`, name: 'كريم وليد',     cls: 'warm',      score: 70, phone: '01445566778', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 7,  sessions: 4 },
+    // Hot — high intent, asked about prices or details
+    { id: `${PREFIX}08`, name: 'نور الدين أحمد',cls: 'hot',       score: 88, phone: '01556677889', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 12, sessions: 6 },
+    { id: `${PREFIX}09`, name: 'هبة رضا',       cls: 'hot',       score: 91, phone: '01667788990', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 9,  sessions: 5 },
+    { id: `${PREFIX}10`, name: 'أيمن خالد',     cls: 'hot',       score: 85, phone: '01778899001', product: 'كنبة 4 مقاعد جلد',    cat: 'الانتريهات', src: 'تيك توك',   views: 11, sessions: 7 },
+    // Visited — came to showroom, assigned to demo_sales
+    { id: `${PREFIX}11`, name: 'فاطمة عزيز',    cls: 'visited',   score: 74, phone: '01889900112', product: 'غرفة نوم مودرن',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 8,  sessions: 5 },
+    { id: `${PREFIX}12`, name: 'باسم جمال',     cls: 'visited',   score: 66, phone: '01990011223', product: 'انتريه كلاسيك',       cat: 'الانتريهات', src: 'إنستجرام',  views: 6,  sessions: 3 },
+    { id: `${PREFIX}13`, name: 'شيماء علي',     cls: 'visited',   score: 79, phone: '01101122334', product: 'طقم سفرة زان طبيعي',  cat: 'السفرة',     src: 'فيسبوك',    views: 10, sessions: 6 },
+    { id: `${PREFIX}14`, name: 'مصطفى حسن',    cls: 'visited',   score: 58, phone: '01201234560', product: 'مطبخ خشب بلوط',       cat: 'المطابخ',    src: 'تيك توك',   views: 5,  sessions: 4 },
+    { id: `${PREFIX}15`, name: 'إيمان صالح',    cls: 'visited',   score: 82, phone: '01311234561', product: 'غرفة نوم كلاسيك',     cat: 'غرف النوم',   src: 'فيسبوك',    views: 9,  sessions: 5 },
+    // Purchased — completed sales
+    { id: `${PREFIX}16`, name: 'حسام عبد الغني',cls: 'purchased', score: 95, phone: '01421234562', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 14, sessions: 8 },
+    { id: `${PREFIX}17`, name: 'ريم محمود',     cls: 'purchased', score: 93, phone: '01531234563', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 11, sessions: 6 },
+    { id: `${PREFIX}18`, name: 'عادل منصور',    cls: 'purchased', score: 89, phone: '01641234564', product: 'كنبة 4 مقاعد جلد',    cat: 'الانتريهات', src: 'فيسبوك',    views: 10, sessions: 7 },
+    // Extra warm — for pre-visit followup assignment
+    { id: `${PREFIX}19`, name: 'سارة نبيل',     cls: 'warm',      score: 67, phone: '01751234565', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 6,  sessions: 3 },
+    { id: `${PREFIX}20`, name: 'تامر فتحي',     cls: 'hot',       score: 84, phone: '01861234566', product: 'غرفة نوم مودرن كاملة', cat: 'غرف النوم',  src: 'إنستجرام',  views: 10, sessions: 6 },
+  ];
+
+  const insLead = db.prepare(`
+    INSERT OR REPLACE INTO lead_profiles
+      (user_id, first_name, total_score, lead_class, preferred_branch,
+       last_product, last_category, product_view_count, session_count,
+       campaign_source, last_activity, created_at)
+    VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?)
+  `);
+  const insPhone = db.prepare(`
+    INSERT OR IGNORE INTO lead_phones (user_id, phone, created_at)
+    VALUES (?,?,?)
+  `);
+
+  db.transaction(() => {
+    for (const l of leads) {
+      insLead.run(
+        l.id, l.name, l.score, l.cls, BRANCH,
+        l.product, l.cat, l.views, l.sessions,
+        l.src,
+        iso(daysAgo(Math.floor(Math.random() * 5) + 1)),
+        iso(daysAgo(Math.floor(Math.random() * 14) + 7))
+      );
+      if (l.phone) insPhone.run(l.id, l.phone, iso(daysAgo(10)));
+    }
+  })();
+
+  // ── 2. Lead visits — visited leads came to the showroom ─────────────────
+  const visitedIds = [`${PREFIX}11`, `${PREFIX}12`, `${PREFIX}13`, `${PREFIX}14`, `${PREFIX}15`];
+  const purchasedIds = [`${PREFIX}16`, `${PREFIX}17`, `${PREFIX}18`];
+  const allVisited = [...visitedIds, ...purchasedIds];
+
+  const insVisit = db.prepare(`
+    INSERT INTO lead_visits (user_id, branch, visited_at, sales_rep, pre_visit_rep)
+    VALUES (?,?,?,?,?)
+  `);
+  const visitDaysAgo = [2, 3, 4, 5, 6, 8, 10, 12];
+  db.transaction(() => {
+    allVisited.forEach((uid, i) => {
+      insVisit.run(uid, BRANCH, iso(daysAgo(visitDaysAgo[i] || 7)), SALES, null);
+    });
+  })();
+
+  // ── 3. Purchases — 3 completed sales by demo_sales ──────────────────────
+  const purchaseData = [
+    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش' },
+    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور' },
+    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد — دفع كاش' },
+  ];
+  const insPurchase = db.prepare(`
+    INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
+    VALUES (?,?,?,?,?,?,?)
+  `);
+  db.transaction(() => {
+    purchaseData.forEach((p, i) => {
+      insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, iso(daysAgo(purchaseData.length - i + 3)), p.contract);
+    });
+  })();
+
+  // ── 4. Pre-visit follow-up assignments (branch_customer_followups) ───────
+  // 2 pending (not yet followed up) + 2 done (followed up + visited / not visited)
+  const fupData = [
+    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, visited: false, assignedAgo: 6,  summary: null },
+    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, visited: false, assignedAgo: 4,  summary: null },
+    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
+    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
+  ];
+  const insFup = db.prepare(`
+    INSERT OR REPLACE INTO branch_customer_followups
+      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `);
+  db.transaction(() => {
+    for (const f of fupData) {
+      insFup.run(
+        BRANCH, f.uid,
+        f.fu ? 1 : 0,
+        f.fu ? iso(daysAgo(f.visitedAgo ? f.visitedAgo + 2 : 3)) : null,
+        f.fu ? SALES : null,
+        SALES,
+        iso(daysAgo(f.assignedAgo)),
+        MANAGER,
+        f.summary
+      );
+      // if visited after followup, also update lead_profiles
+      if (f.visited) {
+        db.prepare(`UPDATE lead_profiles SET lead_class='visited' WHERE user_id=?`).run(f.uid);
+        insVisit.run(f.uid, BRANCH, iso(daysAgo(f.visitedAgo || 3)), SALES, SALES);
+      }
+    }
+  })();
+
+  // ── 5. Sales targets for this month ─────────────────────────────────────
+  const insTarget = db.prepare(`
+    INSERT OR REPLACE INTO sales_targets (scope_type, scope_name, target_month, target_amount)
+    VALUES (?,?,?,?)
+  `);
+  db.transaction(() => {
+    insTarget.run('branch',     BRANCH, month, 400000);   // branch target
+    insTarget.run('sales_rep',  SALES,  month,  80000);   // personal target for demo_sales
+    insTarget.run('branch_manager', MANAGER, month, 400000);
+  })();
+
+  // ── 6. Pending tasks for demo_sales ─────────────────────────────────────
+  const today = ymd(NOW);
+  const tomorrow = ymd(daysAgo(-1));
+  const insTask = db.prepare(`
+    INSERT INTO tasks (lead_id, lead_name, rep_name, due_at, note, source, status, created_at)
+    VALUES (?,?,?,?,?,?,?,?)
+  `);
+  db.transaction(() => {
+    insTask.run(`${PREFIX}08`, 'نور الدين أحمد', SALES, today,    'تابعه واسأله عن ميعاد الزيارة — مهتم جداً بغرفة النوم', 'manager', 'pending', iso(daysAgo(5)));
+    insTask.run(`${PREFIX}20`, 'تامر فتحي',      SALES, today,    'اتصل وأكّد إنه مهتم وحاول تحجزله موعد', 'manager', 'pending', iso(daysAgo(4)));
+    insTask.run(`${PREFIX}09`, 'هبة رضا',        SALES, tomorrow, 'متابعة بعد المكالمة — وعدت تزور الأسبوع الجاي', 'reschedule', 'pending', iso(daysAgo(3)));
+  })();
+
+  console.log(`🌱 Demo seed: ${leads.length} leads, ${allVisited.length} visits, 3 purchases, 4 fup assignments, 3 tasks — branch: ${BRANCH}`);
+}
+
 // Account-based cloned sandbox — interconnected demo_* training accounts.
 //   generate → clone production into grand_furniture_demo.db + (re)create the
 //              4 demo users INSIDE the demo DB only (production untouched).
@@ -3785,7 +3956,11 @@ app.post('/api/admin/generate-demo-accounts', requireAuth, requireRole('admin'),
       for (const a of accounts) upsert.run(a.name, a.email, hash, a.role, a.branch);
     })();
 
-    console.log('🧪 DEMO ACCOUNTS GENERATED (sandbox cloned + 4 demo users)');
+    // Step C — seed realistic fake data for the عين شمس demo branch.
+    // We wipe any previous demo-seed rows first (idempotent re-runs).
+    seedDemoData(demo);
+
+    console.log('🧪 DEMO ACCOUNTS GENERATED (sandbox cloned + 4 demo users + seed data)');
     return res.json({
       ok: true,
       password: '123',
