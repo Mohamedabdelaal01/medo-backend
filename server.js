@@ -140,6 +140,7 @@ setInterval(() => {
 // FRONTEND_URL env var can add an extra explicit origin if ever needed.
 const ALLOWED_ORIGINS = [
   'https://dashboard-frontend-last.vercel.app',
+  'https://portal.grandfurnitureeg.com',  // Production subdomain (GoDaddy → Vercel)
   'http://localhost:5173',
   'http://localhost:3000',
   process.env.FRONTEND_URL,
