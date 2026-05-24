@@ -3773,13 +3773,14 @@ function seedDemoData(db) {
   const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
 
   // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
-  db.prepare(`DELETE FROM events        WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_profiles WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_phones   WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_visits   WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM purchases     WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM events             WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM lead_profiles      WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM lead_phones        WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM lead_visits        WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM purchases          WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM branch_customer_followups WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM tasks         WHERE lead_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM revisit_followups  WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM tasks              WHERE lead_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM sales_targets WHERE scope_name IN (?, ?) AND scope_type IN ('branch','sales_rep')`).run(BRANCH, SALES);
 
   // ── 1. Lead profiles ────────────────────────────────────────────────────
@@ -3961,7 +3962,32 @@ function seedDemoData(db) {
     insTask.run(`${PREFIX}09`, 'هبة رضا',        SALES, tomorrow, 'متابعة بعد المكالمة — وعدت تزور الأسبوع الجاي', 'reschedule', 'pending', iso(daysAgo(3)));
   })();
 
-  console.log(`🌱 Demo seed: ${leads.length} leads + events, ${allVisited.length} visits, 3 purchases, 4 fup assignments, 3 tasks — branch: ${BRANCH}`);
+  // ── 7. Revisit follow-up log — post-visit calls demo_sales made ──────────
+  // 2 leads followed up (فاطمة وباسم), rest still pending — shows manager
+  // who the sales rep is actively tracking and who hasn't been called yet.
+  const insRevisitFu = db.prepare(`
+    INSERT INTO revisit_followups (user_id, followed_up_by, note, created_at)
+    VALUES (?,?,?,?)
+  `);
+  db.transaction(() => {
+    insRevisitFu.run(
+      `${PREFIX}11`, SALES,
+      'اتصلت بيها، قالت لسه مش متأكدة — هتتكلم مع جوزها وترد الأسبوع الجاي',
+      iso(daysAgo(1))
+    );
+    insRevisitFu.run(
+      `${PREFIX}12`, SALES,
+      'مش بيرد على التليفون — هحاول تاني بكره',
+      iso(daysAgo(2))
+    );
+    insRevisitFu.run(
+      `${PREFIX}12`, SALES,
+      'رد وقال مش مهتم دلوقتي، ممكن بعد شهر لما يعدي الصيف',
+      iso(daysAgo(0))
+    );
+  })();
+
+  console.log(`🌱 Demo seed: ${leads.length} leads+events, ${allVisited.length} visits, 3 purchases, 4 pre-visit fups, 3 revisit logs, 3 tasks — branch: ${BRANCH}`);
 }
 
 // Account-based cloned sandbox — interconnected demo_* training accounts.
