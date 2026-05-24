@@ -1624,8 +1624,11 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
 // GET /api/sales/my — a salesperson's own customers + this-month KPIs.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
-  const me = req.user.name;
-  const db = getDb();
+  const me    = req.user.name;
+  const today = req.query.today === '1';
+  const db    = getDb();
+
+  const todayFilter = today ? `AND date(v.visited_at) = date('now')` : '';
 
   const customers = db.prepare(`
     SELECT
@@ -1640,6 +1643,7 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
     FROM lead_visits v
     JOIN lead_profiles lp ON lp.user_id = v.user_id
     WHERE v.sales_rep = ?
+      ${todayFilter}
     ORDER BY (my_purchases > 0) ASC, v.visited_at DESC
   `).all(me, me, me);
 
