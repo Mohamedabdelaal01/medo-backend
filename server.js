@@ -1435,6 +1435,7 @@ app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'
       ON f.user_id = lp.user_id AND f.branch = ?
     WHERE e.event_type = 'branch_selected'
       AND (e.event_value = ? OR e.branch = ?)
+      AND EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = lp.user_id)
     GROUP BY lp.user_id
     ORDER BY (visited_at IS NOT NULL) ASC, last_requested DESC
   `).all(branch, branch, branch, branch, branch);
@@ -2303,10 +2304,11 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       f.call_summary,
       CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited
     FROM (
-      SELECT DISTINCT user_id
-      FROM events
-      WHERE event_type = 'branch_selected'
-        AND (event_value = ? OR branch = ?)
+      SELECT DISTINCT e.user_id
+      FROM events e
+      WHERE e.event_type = 'branch_selected'
+        AND (e.event_value = ? OR e.branch = ?)
+        AND EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = e.user_id)
     ) req
     LEFT JOIN lead_profiles lp ON lp.user_id = req.user_id
     LEFT JOIN branch_customer_followups f
@@ -3782,30 +3784,30 @@ function seedDemoData(db) {
 
   // ── 1. Lead profiles ────────────────────────────────────────────────────
   const leads = [
-    // Cold — just registered
-    { id: `${PREFIX}01`, name: 'محمود سامي',    cls: 'cold',      score: 22, phone: '01001234567', product: 'غرفة نوم كلاسيك',    cat: 'غرف النوم',   src: 'فيسبوك',    views: 2,  sessions: 1 },
-    { id: `${PREFIX}02`, name: 'رنا عبد الله',   cls: 'cold',      score: 18, phone: null,          product: 'كنبة ركنة إل',        cat: 'الانتريهات', src: 'إنستجرام',  views: 1,  sessions: 1 },
-    { id: `${PREFIX}03`, name: 'يوسف طارق',     cls: 'cold',      score: 30, phone: '01112223334', product: 'طقم سفرة 6 كراسي',   cat: 'السفرة',     src: 'تيك توك',   views: 3,  sessions: 2 },
+    // Cold — just registered, left phone, picked branch
+    { id: `${PREFIX}01`, name: 'محمود سامي',    cls: 'cold',      score: 22, phone: '01001234567', product: 'غرفة نوم كلاسيك',     cat: 'غرف النوم',   src: 'فيسبوك',    views: 2,  sessions: 1 },
+    { id: `${PREFIX}02`, name: 'رنا عبد الله',   cls: 'cold',      score: 18, phone: '01022334455', product: 'كنبة ركنة إل',         cat: 'الانتريهات', src: 'إنستجرام',  views: 1,  sessions: 1 },
+    { id: `${PREFIX}03`, name: 'يوسف طارق',     cls: 'cold',      score: 30, phone: '01112223334', product: 'طقم سفرة 6 كراسي',    cat: 'السفرة',     src: 'تيك توك',   views: 3,  sessions: 2 },
     // Warm — engaged, viewed multiple products
-    { id: `${PREFIX}04`, name: 'سلمى حسين',     cls: 'warm',      score: 55, phone: '01223344556', product: 'غرفة نوم مودرن',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 6,  sessions: 3 },
-    { id: `${PREFIX}05`, name: 'عمر فاروق',     cls: 'warm',      score: 62, phone: '01334455667', product: 'انتريه 5 مقاعد',      cat: 'الانتريهات', src: 'فيسبوك',    views: 5,  sessions: 4 },
-    { id: `${PREFIX}06`, name: 'دينا مصطفى',   cls: 'warm',      score: 48, phone: null,          product: 'مطبخ أكريليك أبيض',   cat: 'المطابخ',    src: 'إنستجرام',  views: 4,  sessions: 2 },
+    { id: `${PREFIX}04`, name: 'سلمى حسين',     cls: 'warm',      score: 55, phone: '01223344556', product: 'غرفة نوم مودرن',       cat: 'غرف النوم',   src: 'فيسبوك',    views: 6,  sessions: 3 },
+    { id: `${PREFIX}05`, name: 'عمر فاروق',     cls: 'warm',      score: 62, phone: '01334455667', product: 'انتريه 5 مقاعد',       cat: 'الانتريهات', src: 'فيسبوك',    views: 5,  sessions: 4 },
+    { id: `${PREFIX}06`, name: 'دينا مصطفى',   cls: 'warm',      score: 48, phone: '01366778899', product: 'مطبخ أكريليك أبيض',    cat: 'المطابخ',    src: 'إنستجرام',  views: 4,  sessions: 2 },
     { id: `${PREFIX}07`, name: 'كريم وليد',     cls: 'warm',      score: 70, phone: '01445566778', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 7,  sessions: 4 },
-    // Hot — high intent, asked about prices or details
+    // Hot — high intent
     { id: `${PREFIX}08`, name: 'نور الدين أحمد',cls: 'hot',       score: 88, phone: '01556677889', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 12, sessions: 6 },
     { id: `${PREFIX}09`, name: 'هبة رضا',       cls: 'hot',       score: 91, phone: '01667788990', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 9,  sessions: 5 },
-    { id: `${PREFIX}10`, name: 'أيمن خالد',     cls: 'hot',       score: 85, phone: '01778899001', product: 'كنبة 4 مقاعد جلد',    cat: 'الانتريهات', src: 'تيك توك',   views: 11, sessions: 7 },
+    { id: `${PREFIX}10`, name: 'أيمن خالد',     cls: 'hot',       score: 85, phone: '01778899001', product: 'كنبة 4 مقاعد جلد',     cat: 'الانتريهات', src: 'تيك توك',   views: 11, sessions: 7 },
     // Visited — came to showroom, assigned to demo_sales
-    { id: `${PREFIX}11`, name: 'فاطمة عزيز',    cls: 'visited',   score: 74, phone: '01889900112', product: 'غرفة نوم مودرن',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 8,  sessions: 5 },
-    { id: `${PREFIX}12`, name: 'باسم جمال',     cls: 'visited',   score: 66, phone: '01990011223', product: 'انتريه كلاسيك',       cat: 'الانتريهات', src: 'إنستجرام',  views: 6,  sessions: 3 },
-    { id: `${PREFIX}13`, name: 'شيماء علي',     cls: 'visited',   score: 79, phone: '01101122334', product: 'طقم سفرة زان طبيعي',  cat: 'السفرة',     src: 'فيسبوك',    views: 10, sessions: 6 },
-    { id: `${PREFIX}14`, name: 'مصطفى حسن',    cls: 'visited',   score: 58, phone: '01201234560', product: 'مطبخ خشب بلوط',       cat: 'المطابخ',    src: 'تيك توك',   views: 5,  sessions: 4 },
-    { id: `${PREFIX}15`, name: 'إيمان صالح',    cls: 'visited',   score: 82, phone: '01311234561', product: 'غرفة نوم كلاسيك',     cat: 'غرف النوم',   src: 'فيسبوك',    views: 9,  sessions: 5 },
+    { id: `${PREFIX}11`, name: 'فاطمة عزيز',    cls: 'visited',   score: 74, phone: '01889900112', product: 'غرفة نوم مودرن',       cat: 'غرف النوم',   src: 'فيسبوك',    views: 8,  sessions: 5 },
+    { id: `${PREFIX}12`, name: 'باسم جمال',     cls: 'visited',   score: 66, phone: '01990011223', product: 'انتريه كلاسيك',        cat: 'الانتريهات', src: 'إنستجرام',  views: 6,  sessions: 3 },
+    { id: `${PREFIX}13`, name: 'شيماء علي',     cls: 'visited',   score: 79, phone: '01101122334', product: 'طقم سفرة زان طبيعي',   cat: 'السفرة',     src: 'فيسبوك',    views: 10, sessions: 6 },
+    { id: `${PREFIX}14`, name: 'مصطفى حسن',    cls: 'visited',   score: 58, phone: '01201234560', product: 'مطبخ خشب بلوط',        cat: 'المطابخ',    src: 'تيك توك',   views: 5,  sessions: 4 },
+    { id: `${PREFIX}15`, name: 'إيمان صالح',    cls: 'visited',   score: 82, phone: '01311234561', product: 'غرفة نوم كلاسيك',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 9,  sessions: 5 },
     // Purchased — completed sales
     { id: `${PREFIX}16`, name: 'حسام عبد الغني',cls: 'purchased', score: 95, phone: '01421234562', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 14, sessions: 8 },
     { id: `${PREFIX}17`, name: 'ريم محمود',     cls: 'purchased', score: 93, phone: '01531234563', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 11, sessions: 6 },
-    { id: `${PREFIX}18`, name: 'عادل منصور',    cls: 'purchased', score: 89, phone: '01641234564', product: 'كنبة 4 مقاعد جلد',    cat: 'الانتريهات', src: 'فيسبوك',    views: 10, sessions: 7 },
-    // Extra warm — for pre-visit followup assignment
+    { id: `${PREFIX}18`, name: 'عادل منصور',    cls: 'purchased', score: 89, phone: '01641234564', product: 'كنبة 4 مقاعد جلد',     cat: 'الانتريهات', src: 'فيسبوك',    views: 10, sessions: 7 },
+    // Extra — for pre-visit followup
     { id: `${PREFIX}19`, name: 'سارة نبيل',     cls: 'warm',      score: 67, phone: '01751234565', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 6,  sessions: 3 },
     { id: `${PREFIX}20`, name: 'تامر فتحي',     cls: 'hot',       score: 84, phone: '01861234566', product: 'غرفة نوم مودرن كاملة', cat: 'غرف النوم',  src: 'إنستجرام',  views: 10, sessions: 6 },
   ];
