@@ -3871,23 +3871,33 @@ function seedDemoData(db) {
   const visitDaysAgo = [2, 3, 4, 5, 6, 8, 10, 12];
   db.transaction(() => {
     allVisited.forEach((uid, i) => {
-      insVisit.run(uid, BRANCH, iso(daysAgo(visitDaysAgo[i] || 7)), SALES, null);
+      const vDate = iso(daysAgo(visitDaysAgo[i] || 7));
+      insVisit.run(uid, BRANCH, vDate, SALES, null);
+      // mark visit_confirmed = 1 so the lead appears in "متابعة ما بعد الزيارة"
+      db.prepare(`
+        UPDATE lead_profiles SET visit_confirmed = 1, visit_at = ? WHERE user_id = ?
+      `).run(vDate, uid);
     });
   })();
 
   // ── 3. Purchases — 3 completed sales by demo_sales ──────────────────────
   const purchaseData = [
-    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش' },
-    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور' },
-    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد — دفع كاش' },
+    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش',        daysAgoN: 6 },
+    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور', daysAgoN: 8 },
+    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد — دفع كاش',            daysAgoN: 10 },
   ];
   const insPurchase = db.prepare(`
     INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
     VALUES (?,?,?,?,?,?,?)
   `);
   db.transaction(() => {
-    purchaseData.forEach((p, i) => {
-      insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, iso(daysAgo(purchaseData.length - i + 3)), p.contract);
+    purchaseData.forEach((p) => {
+      const pDate = iso(daysAgo(p.daysAgoN));
+      insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
+      // set purchased_at so the "اشتروا" tab in revisit works
+      db.prepare(`
+        UPDATE lead_profiles SET purchased_at = ? WHERE user_id = ?
+      `).run(pDate, p.uid);
     });
   })();
 
@@ -3918,8 +3928,11 @@ function seedDemoData(db) {
       );
       // if visited after followup, also update lead_profiles
       if (f.visited) {
-        db.prepare(`UPDATE lead_profiles SET lead_class='visited' WHERE user_id=?`).run(f.uid);
-        insVisit.run(f.uid, BRANCH, iso(daysAgo(f.visitedAgo || 3)), SALES, SALES);
+        const vDate = iso(daysAgo(f.visitedAgo || 3));
+        db.prepare(`
+          UPDATE lead_profiles SET lead_class='visited', visit_confirmed=1, visit_at=? WHERE user_id=?
+        `).run(vDate, f.uid);
+        insVisit.run(f.uid, BRANCH, vDate, SALES, SALES);
       }
     }
   })();
