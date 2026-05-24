@@ -3771,13 +3771,14 @@ function seedDemoData(db) {
   const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
 
   // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
+  db.prepare(`DELETE FROM events        WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_profiles WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_phones   WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_visits   WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM purchases     WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM branch_customer_followups WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM tasks         WHERE lead_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM sales_targets WHERE scope_name IN (?, ?) AND scope_type IN ('branch','sales_rep')`, ).run(BRANCH, SALES);
+  db.prepare(`DELETE FROM sales_targets WHERE scope_name IN (?, ?) AND scope_type IN ('branch','sales_rep')`).run(BRANCH, SALES);
 
   // ── 1. Lead profiles ────────────────────────────────────────────────────
   const leads = [
@@ -3821,16 +3822,38 @@ function seedDemoData(db) {
     VALUES (?,?,?)
   `);
 
+  const insEvent = db.prepare(`
+    INSERT INTO events (user_id, first_name, event_type, event_value, score_delta,
+                        session_count, current_score, branch, product_id, created_at)
+    VALUES (?,?,?,?,?, ?,?,?,?,?)
+  `);
+
   db.transaction(() => {
     for (const l of leads) {
+      const createdAgo = Math.floor(Math.random() * 14) + 7;
+      const actAgo     = Math.floor(Math.random() * 5) + 1;
       insLead.run(
         l.id, l.name, l.score, l.cls, BRANCH,
         l.product, l.cat, l.views, l.sessions,
         l.src,
-        iso(daysAgo(Math.floor(Math.random() * 5) + 1)),
-        iso(daysAgo(Math.floor(Math.random() * 14) + 7))
+        iso(daysAgo(actAgo)),
+        iso(daysAgo(createdAgo))
       );
       if (l.phone) insPhone.run(l.id, l.phone, iso(daysAgo(10)));
+
+      // branch_selected event — makes the lead appear in the reception queue
+      insEvent.run(
+        l.id, l.name, 'branch_selected', BRANCH, 5,
+        l.sessions, l.score, BRANCH, null,
+        iso(daysAgo(createdAgo + 1))
+      );
+
+      // product_view events (one per "views" count — simplified to one aggregate event)
+      insEvent.run(
+        l.id, l.name, 'product_details', l.product, 3,
+        l.sessions, l.score, BRANCH, null,
+        iso(daysAgo(actAgo))
+      );
     }
   })();
 
@@ -3923,7 +3946,7 @@ function seedDemoData(db) {
     insTask.run(`${PREFIX}09`, 'هبة رضا',        SALES, tomorrow, 'متابعة بعد المكالمة — وعدت تزور الأسبوع الجاي', 'reschedule', 'pending', iso(daysAgo(3)));
   })();
 
-  console.log(`🌱 Demo seed: ${leads.length} leads, ${allVisited.length} visits, 3 purchases, 4 fup assignments, 3 tasks — branch: ${BRANCH}`);
+  console.log(`🌱 Demo seed: ${leads.length} leads + events, ${allVisited.length} visits, 3 purchases, 4 fup assignments, 3 tasks — branch: ${BRANCH}`);
 }
 
 // Account-based cloned sandbox — interconnected demo_* training accounts.
