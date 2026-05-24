@@ -1511,9 +1511,39 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
         assigned_by    = ?,
         followed_up    = 0,
         followed_up_at = NULL,
-        call_summary   = ?
+        call_summary   = ?,
+        auto_assigned  = 1
       WHERE branch = ? AND user_id = ?
     `).run(sales_rep, req.user?.name || null, logSummary, branch, user_id);
+  } else {
+    // Step C′ — no pre-visit rep (or same rep). The customer is now linked to a
+    // showroom rep, so AUTO-assign them in the branch follow-up queue so the
+    // manager doesn't have to distribute them manually. auto_assigned=1 lets
+    // the UI show a "اسناد تلقائي" tag. Don't overwrite a manual manager
+    // assignment (auto_assigned=0 AND assigned_sales set).
+    const bcf = db.prepare(
+      `SELECT id, assigned_sales, auto_assigned FROM branch_customer_followups
+         WHERE branch=? AND user_id=?`
+    ).get(branch, user_id);
+    const manualAlreadySet = bcf && bcf.assigned_sales && bcf.auto_assigned === 0;
+    if (!manualAlreadySet) {
+      if (bcf) {
+        db.prepare(`
+          UPDATE branch_customer_followups SET
+            assigned_sales = ?,
+            assigned_at    = datetime('now'),
+            assigned_by    = ?,
+            auto_assigned  = 1
+          WHERE id = ?
+        `).run(sales_rep, req.user?.name || 'reception', bcf.id);
+      } else {
+        db.prepare(`
+          INSERT INTO branch_customer_followups
+            (branch, user_id, assigned_sales, assigned_at, assigned_by, auto_assigned)
+          VALUES (?, ?, ?, datetime('now'), ?, 1)
+        `).run(branch, user_id, sales_rep, req.user?.name || 'reception');
+      }
+    }
   }
 
   auditLog(db, req.user?.name, 'set_sales', user_id, {
@@ -2306,7 +2336,9 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       f.assigned_sales,
       f.assigned_by,
       f.call_summary,
-      CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited
+      COALESCE(f.auto_assigned, 0) AS auto_assigned,
+      CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited,
+      lv.sales_rep AS showroom_rep
     FROM (
       SELECT DISTINCT e.user_id
       FROM events e
@@ -2318,7 +2350,7 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
     LEFT JOIN branch_customer_followups f
       ON f.user_id = req.user_id AND f.branch = ?
     LEFT JOIN (
-      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
+      SELECT user_id, sales_rep FROM lead_visits WHERE branch = ?
     ) lv ON lv.user_id = req.user_id
     ORDER BY COALESCE(lp.total_score, 0) DESC, lp.last_activity DESC
     LIMIT 200
@@ -2429,12 +2461,13 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
 
   db.prepare(`
     INSERT INTO branch_customer_followups
-      (branch, user_id, assigned_sales, assigned_at, assigned_by, followed_up, followed_up_at, followed_up_by, call_summary)
-    VALUES (?, ?, ?, datetime('now'), ?, 0, NULL, NULL, NULL)
+      (branch, user_id, assigned_sales, assigned_at, assigned_by, followed_up, followed_up_at, followed_up_by, call_summary, auto_assigned)
+    VALUES (?, ?, ?, datetime('now'), ?, 0, NULL, NULL, NULL, 0)
     ON CONFLICT(branch, user_id) DO UPDATE SET
       assigned_sales = excluded.assigned_sales,
       assigned_at    = excluded.assigned_at,
-      assigned_by    = excluded.assigned_by
+      assigned_by    = excluded.assigned_by,
+      auto_assigned  = 0
       ${resetCycle ? `,
       followed_up    = 0,
       followed_up_at = NULL,

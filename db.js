@@ -342,11 +342,14 @@ function initializeDatabase(dbPath = DB_PATH) {
 
   // Assignment + call-summary columns (idempotent migration).
   // assigned_sales: the sales rep the manager handed this customer to.
+  // auto_assigned : 1 → reception auto-assigned (the rep stood with the customer
+  //                 in the showroom before the manager distributed). 0 → manual.
   for (const { col, type } of [
-    { col: 'assigned_sales', type: 'TEXT'     },
-    { col: 'assigned_at',    type: 'DATETIME' },
-    { col: 'assigned_by',    type: 'TEXT'     },
-    { col: 'call_summary',   type: 'TEXT'     },
+    { col: 'assigned_sales', type: 'TEXT'                       },
+    { col: 'assigned_at',    type: 'DATETIME'                   },
+    { col: 'assigned_by',    type: 'TEXT'                       },
+    { col: 'call_summary',   type: 'TEXT'                       },
+    { col: 'auto_assigned',  type: 'INTEGER NOT NULL DEFAULT 0' },
   ]) {
     try {
       db.exec(`ALTER TABLE branch_customer_followups ADD COLUMN ${col} ${type}`);
@@ -356,6 +359,32 @@ function initializeDatabase(dbPath = DB_PATH) {
     }
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bcf_assigned ON branch_customer_followups(assigned_sales)`);
+
+  // Backfill — for any customer whose reception linked them to a sales rep
+  // (lead_visits.sales_rep) but the branch manager never distributed them,
+  // create a branch_customer_followups row flagged auto_assigned=1 so the
+  // manager sees the auto-assignment tag instead of "مش متوزّع".
+  try {
+    const backfilled = db.prepare(`
+      INSERT INTO branch_customer_followups
+        (branch, user_id, assigned_sales, assigned_at, assigned_by, auto_assigned)
+      SELECT v.branch, v.user_id, v.sales_rep,
+             COALESCE(v.visited_at, datetime('now')),
+             'reception_backfill', 1
+      FROM lead_visits v
+      WHERE v.sales_rep IS NOT NULL
+        AND v.branch    IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM branch_customer_followups f
+          WHERE f.branch = v.branch AND f.user_id = v.user_id
+        )
+    `).run();
+    if (backfilled.changes > 0) {
+      console.log(`✅ Backfill: ${backfilled.changes} reception-assigned customers auto-distributed`);
+    }
+  } catch (e) {
+    console.warn('[backfill auto_assigned] skipped:', e.message);
+  }
 
   // followup_log: append-only history. One row per COMPLETED follow-up so
   // reassigning a customer to another sales rep never erases what was done
