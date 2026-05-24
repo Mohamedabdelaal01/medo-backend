@@ -1515,6 +1515,13 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
         auto_assigned  = 1
       WHERE branch = ? AND user_id = ?
     `).run(sales_rep, req.user?.name || null, logSummary, branch, user_id);
+
+    // Transfer primary ownership of the lead to the showroom rep so the
+    // pre-visit rep STOPS seeing this customer in /revisit (post-visit
+    // follow-up). Their pre-visit work is still preserved in followup_log
+    // and lead_visits.pre_visit_rep — this only stops new responsibility.
+    db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
+      .run(sales_rep, user_id);
   } else {
     // Step C′ — no pre-visit rep (or same rep). The customer is now linked to a
     // showroom rep, so AUTO-assign them in the branch follow-up queue so the
