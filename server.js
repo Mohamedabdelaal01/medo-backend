@@ -2261,6 +2261,7 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     ...r,
     not_bought: r.served - r.bought,
     close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
+    assigned: 0, followup_rate: 0,
     followed_up: 0, fu_visited: 0, fu_not_visited: 0,
   }));
 
@@ -2279,22 +2280,43 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     GROUP BY f.assigned_sales
   `).all(branch, branch);
 
+  const blankRow = (name) => ({
+    sales_rep: name, served: 0, bought: 0, not_bought: 0,
+    close_rate: 0, total_sales: 0, assigned: 0, followup_rate: 0,
+    followed_up: 0, fu_visited: 0, fu_not_visited: 0,
+  });
+
   const byName = new Map(bySales.map(r => [r.sales_rep, r]));
   for (const s of fuStats) {
-    const row = byName.get(s.sales_rep) || {
-      sales_rep: s.sales_rep, served: 0, bought: 0, not_bought: 0,
-      close_rate: 0, total_sales: 0, followed_up: 0, fu_visited: 0, fu_not_visited: 0,
-    };
+    const row = byName.get(s.sales_rep) || blankRow(s.sales_rep);
     row.followed_up    = s.followed_up;
     row.fu_visited     = s.fu_visited;
     row.fu_not_visited = s.followed_up - s.fu_visited;
     if (!byName.has(s.sales_rep)) { byName.set(s.sales_rep, row); bySales.push(row); }
   }
 
-  // Attach each rep's CURRENT-MONTH target + achievement (revenue this month).
+  // Total customers ASSIGNED to each rep (regardless of follow-up). This is what
+  // lets the manager see, per rep: "assigned N → followed up M (rate %)". Reps
+  // with assignments but no visit/follow-up yet still surface here. TRIM keeps it
+  // resilient to any stray whitespace in the stored name.
+  const assignedStats = db.prepare(`
+    SELECT TRIM(assigned_sales) AS sales_rep, COUNT(*) AS assigned
+    FROM branch_customer_followups
+    WHERE branch = ? AND assigned_sales IS NOT NULL AND TRIM(assigned_sales) <> ''
+    GROUP BY TRIM(assigned_sales)
+  `).all(branch);
+  for (const a of assignedStats) {
+    const row = byName.get(a.sales_rep) || blankRow(a.sales_rep);
+    row.assigned = a.assigned;
+    if (!byName.has(a.sales_rep)) { byName.set(a.sales_rep, row); bySales.push(row); }
+  }
+
+  // Attach each rep's CURRENT-MONTH target + achievement (revenue this month),
+  // and the follow-up rate (followed-up ÷ assigned).
   for (const r of bySales) {
-    r.target     = getTarget(db, 'sales_rep', r.sales_rep);
-    r.target_pct = pctAchieved(monthRevenue(db, { rep: r.sales_rep }), r.target);
+    r.target       = getTarget(db, 'sales_rep', r.sales_rep);
+    r.target_pct   = pctAchieved(monthRevenue(db, { rep: r.sales_rep }), r.target);
+    r.followup_rate = r.assigned ? Math.round((r.followed_up / r.assigned) * 100) : 0;
   }
 
   const served      = bySales.reduce((s, r) => s + r.served, 0);
@@ -2377,7 +2399,10 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
     LEFT JOIN (
       SELECT user_id, sales_rep FROM lead_visits WHERE branch = ?
     ) lv ON lv.user_id = req.user_id
-    ORDER BY COALESCE(lp.total_score, 0) DESC, lp.last_activity DESC
+    -- Newest-activity first (by time), not by score. SQLite sorts NULLs last in
+    -- DESC, so leads without a profile row fall to the bottom. Score is only a
+    -- tie-breaker now.
+    ORDER BY lp.last_activity DESC, COALESCE(lp.total_score, 0) DESC
     LIMIT 200
   `).all(branch, branch, branch, branch);
 
