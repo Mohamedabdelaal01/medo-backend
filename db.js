@@ -194,6 +194,9 @@ function initializeDatabase(dbPath = DB_PATH) {
     { col: 'revisit_note',            type: 'TEXT'     }, // free-text reason when closed
     { col: 'revisit_updated_by',      type: 'TEXT'     },
     { col: 'revisit_updated_at',      type: 'DATETIME' },
+    // platform: which ManyChat channel the lead first contacted us on
+    // ('instagram' | 'facebook'). Set once on first event and preserved.
+    { col: 'platform',                type: 'TEXT'     },
   ];
   for (const { col, type } of o2oColumns) {
     try {
@@ -202,6 +205,19 @@ function initializeDatabase(dbPath = DB_PATH) {
     } catch (e) {
       if (!e.message.includes('duplicate column name')) throw e;
     }
+  }
+
+  // ── One-time backfill: existing leads predate the Instagram flow, so all
+  // historic ManyChat leads came from Facebook. Idempotent — only fills NULLs.
+  // Walk-ins (manychat_source = 'walkin') are skipped so they stay platform-less.
+  const backfill = db.prepare(`
+    UPDATE lead_profiles
+    SET    platform = 'facebook'
+    WHERE  platform IS NULL
+      AND  (manychat_source IS NULL OR manychat_source != 'walkin')
+  `).run();
+  if (backfill.changes > 0) {
+    console.log(`✅ Backfill: ${backfill.changes} legacy leads marked as platform='facebook'`);
   }
 
   // Unique partial index on visit_code — skips NULLs so old rows are unaffected
@@ -241,6 +257,97 @@ function initializeDatabase(dbPath = DB_PATH) {
     console.log('✅ Migration: contract_number column added to purchases');
   } catch (e) {
     if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // ── Product catalog — categories + products + per-purchase line items ────
+  // The catalog is admin/branch-manager managed. Sales reps pick from it when
+  // recording a purchase. A single contract can include multiple products, so
+  // purchase_items is a many-to-many join between purchases and products.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS product_categories (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      active      INTEGER NOT NULL DEFAULT 1,
+      created_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      category_id  INTEGER NOT NULL,
+      name         TEXT NOT NULL,
+      active       INTEGER NOT NULL DEFAULT 1,
+      created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (category_id) REFERENCES product_categories(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
+
+    CREATE TABLE IF NOT EXISTS purchase_items (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      purchase_id   INTEGER NOT NULL,
+      product_id    INTEGER NOT NULL,
+      created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (purchase_id) REFERENCES purchases(id) ON DELETE CASCADE,
+      FOREIGN KEY (product_id)  REFERENCES products(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
+    CREATE INDEX IF NOT EXISTS idx_purchase_items_product  ON purchase_items(product_id);
+  `);
+
+  // ── One-time seed: backfill catalog from historical events ───────────────
+  // The events table has been tracking (category, event_value=product name)
+  // pairs from ManyChat product views for months — that's the merchant's
+  // implicit catalog. Hydrate the new explicit tables from it on first run
+  // so the admin doesn't have to retype everything. Idempotent: only inserts
+  // names that aren't already there.
+  const catalogIsEmpty = db.prepare(`SELECT COUNT(*) AS n FROM product_categories`).get().n === 0;
+  if (catalogIsEmpty) {
+    const distinctCats = db.prepare(`
+      SELECT category, COUNT(*) AS n
+      FROM events
+      WHERE event_type IN ('product_details', 'category_request')
+        AND category IS NOT NULL AND category != ''
+      GROUP BY category
+      ORDER BY n DESC
+    `).all();
+
+    const seed = db.transaction(() => {
+      const insertCat = db.prepare(`
+        INSERT INTO product_categories (name, sort_order) VALUES (?, ?)
+      `);
+      const insertProd = db.prepare(`
+        INSERT INTO products (category_id, name) VALUES (?, ?)
+      `);
+
+      let totalCats = 0, totalProducts = 0;
+      let sortOrder = 0;
+      for (const { category } of distinctCats) {
+        const catResult = insertCat.run(category, sortOrder++);
+        totalCats++;
+        const catId = catResult.lastInsertRowid;
+
+        const products = db.prepare(`
+          SELECT event_value, COUNT(*) AS n
+          FROM events
+          WHERE event_type = 'product_details'
+            AND category = ?
+            AND event_value IS NOT NULL AND event_value != ''
+          GROUP BY event_value
+          ORDER BY n DESC
+        `).all(category);
+
+        for (const { event_value } of products) {
+          insertProd.run(catId, event_value);
+          totalProducts++;
+        }
+      }
+      return { totalCats, totalProducts };
+    });
+
+    const { totalCats, totalProducts } = seed();
+    if (totalCats > 0) {
+      console.log(`✅ Catalog seed: ${totalCats} categories + ${totalProducts} products imported from events history`);
+    }
   }
 
   // ── Intelligence layer — additive tables ─────────────────────────────────

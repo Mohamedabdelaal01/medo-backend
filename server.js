@@ -385,7 +385,16 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     subscribed_at,
     growth_tool_id,
     source: manychat_source,
+    // platform: 'instagram' or 'facebook' — set per-flow in ManyChat
+    platform: rawPlatform,
   } = req.body;
+
+  // Normalize platform: lowercase, only accept known values
+  const normalizedPlatform = (() => {
+    if (!rawPlatform || typeof rawPlatform !== 'string') return null;
+    const v = rawPlatform.trim().toLowerCase();
+    return (v === 'instagram' || v === 'facebook') ? v : null;
+  })();
 
   // Detect unresolved ManyChat user_field placeholders (e.g. "{{cuf_14597615}}")
   // — these mean the External Request reference is wrong on the ManyChat side
@@ -408,7 +417,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     'user_id','first_name','event_type','event_value','session_count','current_score',
     'campaign_source','ad_id','visit_code','phone','product','category',
     'last_name','gender','locale','timezone','last_input_text','subscribed_at',
-    'growth_tool_id','source','branch','event_id',
+    'growth_tool_id','source','branch','event_id','platform',
   ]);
   const extraFields = {};
   for (const k of Object.keys(req.body || {})) {
@@ -473,9 +482,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   if (!profile) {
     db.prepare(`
-      INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(user_id, first_name || 'Unknown', cleanCampaignSource || null, cleanAdId || null, cleanVisitCode || null, normPhone || null);
+      INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone, platform)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(user_id, first_name || 'Unknown', cleanCampaignSource || null, cleanAdId || null, cleanVisitCode || null, normPhone || null, normalizedPlatform);
 
     profile = db.prepare(`
       SELECT * FROM lead_profiles WHERE user_id = ?
@@ -590,6 +599,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       subscribed_at       = COALESCE(subscribed_at, ?),
       growth_tool_id      = COALESCE(growth_tool_id, ?),
       manychat_source     = COALESCE(?, manychat_source),
+      platform            = COALESCE(platform, ?),
       extra_fields        = COALESCE(?, extra_fields),
       last_activity       = datetime('now')
     WHERE user_id = ?
@@ -618,6 +628,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     subscribed_at || null,
     growth_tool_id || null,
     manychat_source || null,
+    normalizedPlatform,
     extraFieldsJson,
     user_id
   );
@@ -967,6 +978,7 @@ app.get('/api/leads', requireAuth, (req, res) => {
     branch,
     has_phone,        // 'yes' → left a phone | 'no' → never left one
     registration,     // 'manual' → reception walk-in | 'online' → via ManyChat
+    platform,         // 'instagram' | 'facebook' — ManyChat source channel
     limit  = 50,
     page   = 1,
     search = '',
@@ -1034,6 +1046,11 @@ app.get('/api/leads', requireAuth, (req, res) => {
     where += ` AND manychat_source = 'walkin'`;
   } else if (registration === 'online') {
     where += ` AND (manychat_source IS NULL OR manychat_source != 'walkin')`;
+  }
+  // Filter by ManyChat source channel — Instagram vs Facebook flow.
+  if (platform === 'instagram' || platform === 'facebook') {
+    where += ` AND platform = ?`;
+    params.push(platform);
   }
 
   // Total count for pagination metadata
@@ -2535,8 +2552,12 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, authorizeRoles(
 app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res) => {
   const me     = req.user.name;
   const branch = req.user.branch || null;
-  if (!branch) return res.status(400).json({ error: 'branch_required' });
 
+  // A rep's customers are identified by WHO they're assigned to (assigned_sales),
+  // NOT by the rep's current branch string. Matching on the rep's branch used to
+  // silently hide customers whenever the branch was stored with a slightly
+  // different spelling (e.g. "المعادي" vs "المعادى") on the rep vs the assignment
+  // row. The `visited` flag is correlated to each row's OWN branch instead.
   const db = getDb();
   const customers = db.prepare(`
     SELECT
@@ -2552,34 +2573,35 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       f.assigned_at,
       (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
          WHERE ph.user_id = f.user_id)                              AS phones,
-      CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END            AS visited
+      CASE WHEN EXISTS (
+        SELECT 1 FROM lead_visits v
+         WHERE v.user_id = f.user_id AND v.branch = f.branch
+      ) THEN 1 ELSE 0 END                                          AS visited
     FROM branch_customer_followups f
     LEFT JOIN lead_profiles lp ON lp.user_id = f.user_id
-    LEFT JOIN (
-      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
-    ) lv ON lv.user_id = f.user_id
-    WHERE f.branch = ? AND f.assigned_sales = ?
+    WHERE TRIM(f.assigned_sales) = TRIM(?)
     ORDER BY f.followed_up ASC, f.assigned_at DESC
-  `).all(branch, branch, me);
+  `).all(me);
 
   return res.json({ branch, customers });
 });
 
 app.patch('/api/sales/followups/:userId', requireAuth, authorizeRoles('sales'), (req, res) => {
   const me     = req.user.name;
-  const branch = req.user.branch || null;
-  if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const { userId } = req.params;
   const { followed_up, call_summary } = req.body || {};
   const newVal = followed_up ? 1 : 0;
 
+  // Match by assignee (resilient to branch-spelling drift); take the branch from
+  // the matched row itself for the follow-up log.
   const db  = getDb();
   const own = db.prepare(`
-    SELECT id FROM branch_customer_followups
-    WHERE branch = ? AND user_id = ? AND assigned_sales = ?
-  `).get(branch, userId, me);
+    SELECT branch FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
   if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+  const branch = own.branch;
 
   const summary = newVal ? (call_summary && String(call_summary).trim()) || null : null;
   db.prepare(`
@@ -2588,8 +2610,8 @@ app.patch('/api/sales/followups/:userId', requireAuth, authorizeRoles('sales'), 
       followed_up_at = ?,
       followed_up_by = ?,
       call_summary   = ?
-    WHERE branch = ? AND user_id = ?
-  `).run(newVal, newVal ? new Date().toISOString() : null, newVal ? me : null, summary, branch, userId);
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).run(newVal, newVal ? new Date().toISOString() : null, newVal ? me : null, summary, userId, me);
 
   if (newVal) logFollowup(db, branch, userId, me, summary);
 
@@ -2626,10 +2648,14 @@ app.get('/api/branch/sales', requireAuth, (req, res) => {
 app.post('/api/branch/sales', requireAuth, (req, res) => {
   const scope = resolveBranchScope(req);
   if (scope.error) return res.status(scope.error === 'forbidden' ? 403 : 400).json({ error: scope.error });
-  const { name, email, password } = req.body || {};
+  let { name, email, password } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'الاسم والإيميل والباسورد مطلوبين' });
   }
+  // Trim the name — a trailing/leading space silently breaks every name-based
+  // match later (assignments store the trimmed value, so a padded users.name
+  // would never equal it and the rep "loses" all their customers).
+  name = String(name).trim();
   const db = getDb();
   try {
     const result = db.prepare(
@@ -2659,7 +2685,9 @@ app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
   if (!loadOwnedSales(db, req.params.id, scope.branch)) {
     return res.status(404).json({ error: 'الحساب مش موجود في فرعك' });
   }
-  const { name, email, password, active } = req.body || {};
+  const cur = db.prepare(`SELECT name FROM users WHERE id = ?`).get(req.params.id);
+  let { name, email, password, active } = req.body || {};
+  if (name != null) name = String(name).trim();
   const updates = [];
   const params  = [];
   if (name)               { updates.push('name = ?');          params.push(name); }
@@ -2669,7 +2697,11 @@ app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
   if (!updates.length) return res.status(400).json({ error: 'مفيش حاجة تتعدّل' });
   params.push(req.params.id);
   try {
-    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    // Renaming a rep must carry their assignments with them, or they orphan.
+    db.transaction(() => {
+      db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+      if (name && cur && name !== cur.name) renameRepReferences(db, cur.name, name);
+    })();
   } catch (e) {
     if (e.message.includes('UNIQUE')) {
       return res.status(409).json({ error: 'البريد الإلكتروني مستخدم مسبقاً' });
@@ -2720,7 +2752,7 @@ app.patch('/api/branch/users/:id/toggle-active', requireAuth, authorizeRoles('ad
 // Returns: { ok, purchase_id, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/purchases', requireAuth, (req, res) => {
-  const { user_id, product_id, price, branch, notes, contract_number } = req.body || {};
+  const { user_id, product_id, product_ids, price, branch, notes, contract_number } = req.body || {};
   if (!user_id || typeof user_id !== 'string') {
     return res.status(400).json({ error: 'user_id is required' });
   }
@@ -2730,11 +2762,35 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
 
+  // Normalize product_ids: accept array of numeric IDs from the new catalog.
+  const productIds = Array.isArray(product_ids)
+    ? product_ids.map(v => parseInt(v, 10)).filter(n => Number.isFinite(n) && n > 0)
+    : [];
+
+  // Legacy product_id text field is kept for backward compat; for new flows
+  // we store the first selected product's name there so old reports still work.
+  let legacyProductLabel = product_id || null;
+  if (!legacyProductLabel && productIds.length) {
+    const firstProduct = db.prepare(`SELECT name FROM products WHERE id = ?`).get(productIds[0]);
+    if (firstProduct) legacyProductLabel = firstProduct.name;
+  }
+
   const result = db.prepare(`
     INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(user_id, product_id || null, price || null, branch || null, notes || null, rep,
+  `).run(user_id, legacyProductLabel, price || null, branch || null, notes || null, rep,
          (contract_number && String(contract_number).trim()) || null);
+
+  // Link the catalog products to this purchase (many-to-many).
+  if (productIds.length) {
+    const insertItem = db.prepare(`
+      INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)
+    `);
+    const insertMany = db.transaction((ids) => {
+      for (const pid of ids) insertItem.run(result.lastInsertRowid, pid);
+    });
+    insertMany(productIds);
+  }
 
   // Mark lead as purchased (terminal state — won't be overridden by scoring)
   db.prepare(`
@@ -3011,6 +3067,25 @@ app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
   const purchases = db.prepare(`
     SELECT * FROM purchases WHERE user_id = ? ORDER BY created_at DESC
   `).all(req.params.user_id);
+
+  // Attach catalog items to each purchase (may be empty for legacy rows).
+  if (purchases.length) {
+    const itemsByPurchase = db.prepare(`
+      SELECT pi.purchase_id, p.id, p.name, c.name AS category_name
+      FROM purchase_items pi
+      JOIN products p             ON p.id = pi.product_id
+      JOIN product_categories c   ON c.id = p.category_id
+      WHERE pi.purchase_id IN (${purchases.map(() => '?').join(',')})
+      ORDER BY c.sort_order, p.name
+    `).all(...purchases.map(p => p.id));
+    const grouped = {};
+    for (const it of itemsByPurchase) {
+      if (!grouped[it.purchase_id]) grouped[it.purchase_id] = [];
+      grouped[it.purchase_id].push({ id: it.id, name: it.name, category_name: it.category_name });
+    }
+    for (const p of purchases) p.items = grouped[p.id] || [];
+  }
+
   return res.json({ purchases });
 });
 
@@ -3368,6 +3443,22 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     ORDER BY leads DESC
   `).all(fromDate, toDate, ...campaignParam);
 
+  // Platform breakdown — Instagram vs Facebook performance side-by-side.
+  // Only counts leads with a known platform (legacy walk-ins are excluded).
+  const platforms = db.prepare(`
+    SELECT
+      lp.platform                                                                            AS platform,
+      COUNT(DISTINCT lp.user_id)                                                             AS leads,
+      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END) AS visits,
+      SUM(CASE WHEN lp.lead_class = 'purchased'                          THEN 1 ELSE 0 END) AS purchases
+    FROM lead_profiles lp
+    WHERE lp.platform IN ('instagram','facebook')
+      AND date(lp.created_at) BETWEEN ? AND ?
+      ${branchClause} ${campaignClause}
+    GROUP BY lp.platform
+    ORDER BY leads DESC
+  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+
   return res.json({
     eventsSeries,
     funnel:      funnel || { total_leads: 0, hot: 0, visited: 0, purchased: 0 },
@@ -3377,6 +3468,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     campaigns,
     adFunnel,
     branches,
+    platforms,
     meta: { from: fromDate, to: toDate, branch: branch || null, campaign: campaign || null },
   });
 });
@@ -3551,10 +3643,11 @@ app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
-  const { name, email, password, role = 'rep', branch } = req.body || {};
+  let { name, email, password, role = 'rep', branch } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
+  name = String(name).trim(); // padded names break name-based assignment matching
   // Branch only meaningful for reception accounts
   const branchVal = ['reception', 'sales', 'branch_manager'].includes(role) ? (branch || null) : null;
   const db   = getDb();
@@ -3573,7 +3666,8 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
-  const { name, email, role, password, branch } = req.body || {};
+  let { name, email, role, password, branch } = req.body || {};
+  if (name != null) name = String(name).trim();
   const db      = getDb();
   const updates = [];
   const params  = [];
@@ -3589,8 +3683,13 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (!updates.length) {
     return res.status(400).json({ error: 'Nothing to update' });
   }
+  const cur = db.prepare(`SELECT name FROM users WHERE id = ?`).get(req.params.id);
   params.push(req.params.id);
-  db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  // Renaming a rep must carry their assignments/history with them, or they orphan.
+  db.transaction(() => {
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    if (name && cur && name !== cur.name) renameRepReferences(db, cur.name, name);
+  })();
   return res.json({ ok: true });
 });
 
@@ -3608,6 +3707,25 @@ function scrubRepReferences(db, name) {
   db.prepare(`DELETE FROM followup_log      WHERE sales = ?`).run(name);
   db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
   db.prepare(`DELETE FROM sales_targets WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(name);
+}
+
+// Cascade a sales / call-rep RENAME across every table that references the rep
+// by their display name. Without this, renaming an account ORPHANS all of that
+// rep's work: the rows keep the old name while the rep now logs in under the new
+// one, so they suddenly "lose" every assigned customer. Mirrors the table set in
+// scrubRepReferences (history-carrying columns updated too, not deleted).
+function renameRepReferences(db, oldName, newName) {
+  if (!oldName || !newName || oldName === newName) return;
+  db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE assigned_rep = ?`).run(newName, oldName);
+  db.prepare(`UPDATE lead_visits   SET sales_rep = ?    WHERE sales_rep = ?`).run(newName, oldName);
+  db.prepare(`UPDATE lead_visits   SET pre_visit_rep = ? WHERE pre_visit_rep = ?`).run(newName, oldName);
+  db.prepare(`UPDATE branch_customer_followups SET assigned_sales = ? WHERE assigned_sales = ?`).run(newName, oldName);
+  db.prepare(`UPDATE branch_customer_followups SET assigned_by = ?    WHERE assigned_by = ?`).run(newName, oldName);
+  db.prepare(`UPDATE branch_customer_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
+  db.prepare(`UPDATE purchases SET rep = ? WHERE rep = ?`).run(newName, oldName);
+  db.prepare(`UPDATE followup_log SET sales = ? WHERE sales = ?`).run(newName, oldName);
+  db.prepare(`UPDATE revisit_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
+  db.prepare(`UPDATE sales_targets SET scope_name = ? WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(newName, oldName);
 }
 
 // DELETE /api/users/:id — admin removes a user account permanently.
@@ -3818,6 +3936,8 @@ function seedDemoData(db) {
   const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
 
   // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
+  // Order matters: purchase_items has FK → purchases, so clear children first.
+  db.prepare(`DELETE FROM purchase_items WHERE purchase_id IN (SELECT id FROM purchases WHERE user_id LIKE '${PREFIX}%')`).run();
   db.prepare(`DELETE FROM events             WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_profiles      WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_phones        WHERE user_id LIKE '${PREFIX}%'`).run();
@@ -3862,9 +3982,18 @@ function seedDemoData(db) {
     INSERT OR REPLACE INTO lead_profiles
       (user_id, first_name, total_score, lead_class, preferred_branch,
        last_product, last_category, product_view_count, session_count,
-       campaign_source, last_activity, created_at)
-    VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?)
+       campaign_source, platform, last_activity, created_at)
+    VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?)
   `);
+
+  // Map the demo's Arabic src label to the canonical platform column value.
+  // TikTok stays NULL because the platform field only tracks the ManyChat
+  // channels (Instagram/Facebook) where DMs come in.
+  const srcToPlatform = (src) => {
+    if (src === 'فيسبوك')   return 'facebook';
+    if (src === 'إنستجرام') return 'instagram';
+    return null;
+  };
   const insPhone = db.prepare(`
     INSERT OR IGNORE INTO lead_phones (user_id, phone, created_at)
     VALUES (?,?,?)
@@ -3883,7 +4012,7 @@ function seedDemoData(db) {
       insLead.run(
         l.id, l.name, l.score, l.cls, BRANCH,
         l.product, l.cat, l.views, l.sessions,
-        l.src,
+        l.src, srcToPlatform(l.src),
         iso(daysAgo(actAgo)),
         iso(daysAgo(createdAgo))
       );
@@ -3936,10 +4065,27 @@ function seedDemoData(db) {
     INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
     VALUES (?,?,?,?,?,?,?)
   `);
+  const insPurchaseItem = db.prepare(`
+    INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)
+  `);
+  // Pick a couple of real catalog products per demo contract so the new
+  // multi-select UI on the lead profile shows realistic items.
+  const pickRandomProducts = (n) => {
+    const rows = db.prepare(`SELECT id FROM products WHERE active = 1`).all();
+    if (!rows.length) return [];
+    const shuffled = rows.slice().sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, Math.min(n, rows.length)).map(r => r.id);
+  };
   db.transaction(() => {
     purchaseData.forEach((p) => {
       const pDate = iso(daysAgo(p.daysAgoN));
-      insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
+      const result = insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
+      const purchaseId = result.lastInsertRowid;
+
+      // 1–3 random catalog products per demo contract
+      const productIds = pickRandomProducts(1 + Math.floor(Math.random() * 3));
+      for (const pid of productIds) insPurchaseItem.run(purchaseId, pid);
+
       // set purchased_at so the "اشتروا" tab in revisit works
       db.prepare(`
         UPDATE lead_profiles SET purchased_at = ? WHERE user_id = ?
@@ -4342,6 +4488,133 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     version:   BUILD_VERSION,
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Product catalog — categories & products
+// Read endpoints are open to any authenticated user (sales reps need to see
+// the catalog when recording a purchase). Write endpoints are restricted to
+// admin and branch_manager.
+// ════════════════════════════════════════════════════════════════════════════
+const canEditCatalog = authorizeRoles('admin', 'branch_manager');
+
+// ─── Categories ─────────────────────────────────────────────────────────────
+app.get('/api/products/categories', requireAuth, (_req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT c.id, c.name, c.sort_order, c.active,
+           (SELECT COUNT(*) FROM products p WHERE p.category_id = c.id AND p.active = 1) AS product_count
+    FROM product_categories c
+    WHERE c.active = 1
+    ORDER BY c.sort_order, c.name
+  `).all();
+  return res.json({ categories: rows });
+});
+
+app.post('/api/products/categories', requireAuth, canEditCatalog, (req, res) => {
+  const name = (req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name_required' });
+  const db = getDb();
+  const result = db.prepare(`
+    INSERT INTO product_categories (name) VALUES (?)
+  `).run(name);
+  return res.json({ ok: true, id: result.lastInsertRowid, name });
+});
+
+app.put('/api/products/categories/:id', requireAuth, canEditCatalog, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const name = (req.body?.name || '').trim();
+  if (!id || !name) return res.status(400).json({ error: 'id_and_name_required' });
+  const db = getDb();
+  const result = db.prepare(`
+    UPDATE product_categories SET name = ? WHERE id = ? AND active = 1
+  `).run(name, id);
+  if (result.changes === 0) return res.status(404).json({ error: 'category_not_found' });
+  return res.json({ ok: true });
+});
+
+app.delete('/api/products/categories/:id', requireAuth, canEditCatalog, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'id_required' });
+  const db = getDb();
+  // Soft-delete: archive the category AND archive its products so historical
+  // purchase_items references stay intact (no FK cascade pain).
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE product_categories SET active = 0 WHERE id = ?`).run(id);
+    db.prepare(`UPDATE products SET active = 0 WHERE category_id = ?`).run(id);
+  });
+  tx();
+  return res.json({ ok: true });
+});
+
+// ─── Products ───────────────────────────────────────────────────────────────
+app.get('/api/products', requireAuth, (req, res) => {
+  const db = getDb();
+  const categoryId = req.query.category_id ? parseInt(req.query.category_id, 10) : null;
+  let where = `WHERE p.active = 1 AND c.active = 1`;
+  const params = [];
+  if (categoryId) {
+    where += ` AND p.category_id = ?`;
+    params.push(categoryId);
+  }
+  const rows = db.prepare(`
+    SELECT p.id, p.name, p.category_id, c.name AS category_name
+    FROM products p
+    JOIN product_categories c ON c.id = p.category_id
+    ${where}
+    ORDER BY c.sort_order, c.name, p.name
+  `).all(...params);
+  return res.json({ products: rows });
+});
+
+app.post('/api/products', requireAuth, canEditCatalog, (req, res) => {
+  const { category_id, name } = req.body || {};
+  const catId = parseInt(category_id, 10);
+  const trimmed = (name || '').trim();
+  if (!catId || !trimmed) return res.status(400).json({ error: 'category_id_and_name_required' });
+  const db = getDb();
+  const cat = db.prepare(`SELECT id FROM product_categories WHERE id = ? AND active = 1`).get(catId);
+  if (!cat) return res.status(404).json({ error: 'category_not_found' });
+  const result = db.prepare(`
+    INSERT INTO products (category_id, name) VALUES (?, ?)
+  `).run(catId, trimmed);
+  return res.json({ ok: true, id: result.lastInsertRowid });
+});
+
+app.put('/api/products/:id', requireAuth, canEditCatalog, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { name, category_id } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'id_required' });
+  const db = getDb();
+  const sets = [];
+  const params = [];
+  if (typeof name === 'string' && name.trim()) {
+    sets.push('name = ?');
+    params.push(name.trim());
+  }
+  if (category_id) {
+    const catId = parseInt(category_id, 10);
+    if (catId) {
+      sets.push('category_id = ?');
+      params.push(catId);
+    }
+  }
+  if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
+  params.push(id);
+  const result = db.prepare(
+    `UPDATE products SET ${sets.join(', ')} WHERE id = ? AND active = 1`
+  ).run(...params);
+  if (result.changes === 0) return res.status(404).json({ error: 'product_not_found' });
+  return res.json({ ok: true });
+});
+
+app.delete('/api/products/:id', requireAuth, canEditCatalog, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'id_required' });
+  const db = getDb();
+  // Soft-delete keeps historical purchase_items links intact.
+  db.prepare(`UPDATE products SET active = 0 WHERE id = ?`).run(id);
+  return res.json({ ok: true });
 });
 
 // ── Background Jobs ───────────────────────────────────────────────────────
