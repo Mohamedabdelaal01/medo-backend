@@ -2557,7 +2557,13 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
   // NOT by the rep's current branch string. Matching on the rep's branch used to
   // silently hide customers whenever the branch was stored with a slightly
   // different spelling (e.g. "المعادي" vs "المعادى") on the rep vs the assignment
-  // row. The `visited` flag is correlated to each row's OWN branch instead.
+  // row.
+  //
+  // This is the PRE-visit list: it only holds customers who have NOT visited yet
+  // (visit_confirmed = 0). Once a customer visits, visit_confirmed flips to 1 and
+  // they move out of here into the post-visit "متابعة بعد الزيارة" (revisit) flow
+  // — which selects on exactly the same `visit_confirmed = 1`, so the two lists
+  // are clean complements and no customer ever shows in both.
   const db = getDb();
   const customers = db.prepare(`
     SELECT
@@ -2580,6 +2586,7 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
     FROM branch_customer_followups f
     LEFT JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
+      AND COALESCE(lp.visit_confirmed, 0) = 0
     ORDER BY f.followed_up ASC, f.assigned_at DESC
   `).all(me);
 
