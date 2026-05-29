@@ -457,6 +457,11 @@ function initializeDatabase(dbPath = DB_PATH) {
     { col: 'assigned_by',    type: 'TEXT'                       },
     { col: 'call_summary',   type: 'TEXT'                       },
     { col: 'auto_assigned',  type: 'INTEGER NOT NULL DEFAULT 0' },
+    // sent: the rep ticked "بعت" — they sent the first outreach message (e.g.
+    // WhatsApp) to this customer. A lightweight step BEFORE a full "تابعت", so
+    // the rep can see who they've already messaged vs not. Distinct from followed_up.
+    { col: 'sent',           type: 'INTEGER NOT NULL DEFAULT 0' },
+    { col: 'sent_at',        type: 'DATETIME'                   },
   ]) {
     try {
       db.exec(`ALTER TABLE branch_customer_followups ADD COLUMN ${col} ${type}`);

@@ -2602,6 +2602,8 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       f.followed_up_at,
       f.call_summary,
       f.assigned_at,
+      f.sent,
+      f.sent_at,
       (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
          WHERE ph.user_id = f.user_id)                              AS phones,
       CASE WHEN EXISTS (
@@ -2648,6 +2650,33 @@ app.patch('/api/sales/followups/:userId', requireAuth, authorizeRoles('sales'), 
   if (newVal) logFollowup(db, branch, userId, me, summary);
 
   return res.json({ ok: true, followed_up: newVal });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/sales/followups/:userId/sent — the rep ticks/unticks "بعت" (sent the
+// first outreach message). A lightweight marker, separate from followed_up, so
+// the rep can track who they've already messaged. Matched by assignee (TRIM) so
+// branch-spelling drift doesn't hide it.
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/sales/followups/:userId/sent', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me        = req.user.name;
+  const { userId } = req.params;
+  const sent      = req.body?.sent ? 1 : 0;
+
+  const db  = getDb();
+  const own = db.prepare(`
+    SELECT 1 FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+
+  db.prepare(`
+    UPDATE branch_customer_followups
+       SET sent = ?, sent_at = ?
+     WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).run(sent, sent ? new Date().toISOString() : null, userId, me);
+
+  return res.json({ ok: true, sent });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4127,16 +4156,18 @@ function seedDemoData(db) {
 
   // ── 4. Pre-visit follow-up assignments (branch_customer_followups) ───────
   // 2 pending (not yet followed up) + 2 done (followed up + visited / not visited)
+  // `sent` = the rep ticked "بعت" (sent the first outreach). One pending lead is
+  // marked sent, the other not, so the demo shows the checkbox in both states.
   const fupData = [
-    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, visited: false, assignedAgo: 6,  summary: null },
-    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, visited: false, assignedAgo: 4,  summary: null },
-    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
-    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
+    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, visited: false, assignedAgo: 6,  summary: null },
+    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, visited: false, assignedAgo: 4,  summary: null },
+    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
+    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
   ];
   const insFup = db.prepare(`
     INSERT OR REPLACE INTO branch_customer_followups
-      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary)
-    VALUES (?,?,?,?,?,?,?,?,?)
+      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
   `);
   db.transaction(() => {
     for (const f of fupData) {
@@ -4148,7 +4179,9 @@ function seedDemoData(db) {
         SALES,
         iso(daysAgo(f.assignedAgo)),
         MANAGER,
-        f.summary
+        f.summary,
+        f.sent ? 1 : 0,
+        f.sent ? iso(daysAgo(f.assignedAgo)) : null
       );
       // if visited after followup, also update lead_profiles
       if (f.visited) {
