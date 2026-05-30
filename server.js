@@ -1730,7 +1730,8 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
       (SELECT COUNT(*)        FROM purchases p
          WHERE p.user_id = lp.user_id AND p.rep = ?)                      AS my_purchases,
       (SELECT COALESCE(SUM(p.price),0) FROM purchases p
-         WHERE p.user_id = lp.user_id AND p.rep = ?)                      AS my_sales_total
+         WHERE p.user_id = lp.user_id AND p.rep = ?)                      AS my_sales_total,
+      ${crossBranchCols('lp.user_id')}
     FROM lead_visits v
     JOIN lead_profiles lp ON lp.user_id = v.user_id
     WHERE v.sales_rep = ?
@@ -2438,7 +2439,8 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       f.call_summary,
       COALESCE(f.auto_assigned, 0) AS auto_assigned,
       CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited,
-      lv.sales_rep AS showroom_rep
+      lv.sales_rep AS showroom_rep,
+      ${crossBranchCols('req.user_id')}
     FROM (
       SELECT DISTINCT e.user_id
       FROM events e
@@ -2498,6 +2500,19 @@ function customerJourney(db, userId) {
       : null;
   return { visits, purchases, branches, multi_branch: branches.length > 1, owner };
 }
+
+// Compact cross-branch SELECT columns for customer LISTS, so a rep sees a
+// "قارن فروع" tag right on the card without opening the profile. `uid` is the
+// row's user_id column reference (e.g. 'f.user_id'). Returns:
+//   branches_count — distinct branches the customer visited/bought in.
+//   bought_branch  — the branch of their latest purchase (null if none).
+const crossBranchCols = (uid) => `
+  (SELECT COUNT(*) FROM (
+     SELECT branch FROM lead_visits WHERE user_id = ${uid} AND branch IS NOT NULL
+     UNION SELECT branch FROM purchases  WHERE user_id = ${uid} AND branch IS NOT NULL
+  ))                                                                  AS branches_count,
+  (SELECT branch FROM purchases WHERE user_id = ${uid}
+     ORDER BY created_at DESC, id DESC LIMIT 1)                       AS bought_branch`;
 
 // Records an admin/manager action in the undo ledger. `oldState` describes how
 // to restore the affected row: { table, where: {...}, row: {...}|null }.
@@ -2690,7 +2705,8 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       CASE WHEN EXISTS (
         SELECT 1 FROM lead_visits v
          WHERE v.user_id = f.user_id AND v.branch = f.branch
-      ) THEN 1 ELSE 0 END                                          AS visited
+      ) THEN 1 ELSE 0 END                                          AS visited,
+      ${crossBranchCols('f.user_id')}
     FROM branch_customer_followups f
     LEFT JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
@@ -3103,7 +3119,8 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
          ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_by,
       (SELECT rf.note FROM revisit_followups rf
          WHERE rf.user_id = lp.user_id
-         ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_note
+         ORDER BY rf.created_at DESC LIMIT 1) AS last_followup_note,
+      ${crossBranchCols('lp.user_id')}
     FROM lead_profiles lp
     WHERE lp.visit_confirmed = 1
       AND ${statusWhere}
