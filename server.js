@@ -1679,11 +1679,22 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
 // GET /api/sales/my — a salesperson's own customers + this-month KPIs.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
-  const me    = req.user.name;
-  const today = req.query.today === '1';
-  const db    = getDb();
+  const me       = req.user.name;
+  const myBranch = req.user.branch || null;
+  const today    = req.query.today === '1';
+  const db       = getDb();
 
   const todayFilter = today ? `AND date(v.visited_at) = date('now')` : '';
+
+  // Only customers whose "owner branch" (where they closed their latest
+  // interaction — purchase branch if bought, else most-recent visit) is THIS
+  // rep's branch. Without it, a customer who bought in another branch but had a
+  // stray visit logged here would leak into this rep's "عملائي" list too.
+  const ownerBranchFilter = myBranch ? `
+    AND COALESCE(
+      (SELECT pu.branch FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+      (SELECT vv.branch FROM lead_visits vv WHERE vv.user_id = lp.user_id ORDER BY vv.visited_at DESC LIMIT 1)
+    ) = ?` : '';
 
   const customers = db.prepare(`
     SELECT
@@ -1698,9 +1709,10 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
     FROM lead_visits v
     JOIN lead_profiles lp ON lp.user_id = v.user_id
     WHERE v.sales_rep = ?
+      ${ownerBranchFilter}
       ${todayFilter}
     ORDER BY (my_purchases > 0) ASC, v.visited_at DESC
-  `).all(me, me, me);
+  `).all(me, me, me, ...(myBranch ? [myBranch] : []));
 
   // This-month performance
   const servedMonth = db.prepare(`
