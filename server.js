@@ -2357,6 +2357,22 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
 
   const db = getDb();
 
+  // Page size. Generous default so big branches (e.g. Nasr City with 500+)
+  // aren't silently truncated at 200; clamped so one request can't pull tens of
+  // thousands. The frontend paginates client-side over what it gets.
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 1000, 1), 2000);
+
+  // Total cohort size (ignores the page limit) so the UI can tell the manager
+  // how many there really are.
+  const total = db.prepare(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT DISTINCT e.user_id FROM events e
+      WHERE e.event_type = 'branch_selected'
+        AND (e.event_value = ? OR e.branch = ?)
+        AND EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = e.user_id)
+    )
+  `).get(branch, branch).n;
+
   // Driven by events (same universe as the "عملاء طلبوا الفرع" KPI) so the
   // count matches it. lead_profiles is LEFT JOINed — a customer with a
   // branch_selected event but no profile row still shows up.
@@ -2403,10 +2419,10 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
     -- DESC, so leads without a profile row fall to the bottom. Score is only a
     -- tie-breaker now.
     ORDER BY lp.last_activity DESC, COALESCE(lp.total_score, 0) DESC
-    LIMIT 200
-  `).all(branch, branch, branch, branch);
+    LIMIT ?
+  `).all(branch, branch, branch, branch, limit);
 
-  return res.json({ branch, customers });
+  return res.json({ branch, customers, total, limit });
 });
 
 // Records a completed follow-up in the append-only log (history survives
