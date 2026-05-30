@@ -2514,6 +2514,17 @@ const crossBranchCols = (uid) => `
   (SELECT branch FROM purchases WHERE user_id = ${uid}
      ORDER BY created_at DESC, id DESC LIMIT 1)                       AS bought_branch`;
 
+// The "owner" branch/rep of a visited customer (purchase wins, else most-recent
+// visit). Used for BOTH who-sees-them (RBAC) and how-they're-shown/grouped, so a
+// customer who bought in Maadi shows under Maadi/their seller — not under the
+// Nasr City rep they merely passed by. Assumes the row aliases lead_profiles `lp`.
+const OWNER_BRANCH_SQL = `COALESCE(
+  (SELECT pu.branch FROM purchases pu  WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+  (SELECT v.branch  FROM lead_visits v WHERE v.user_id  = lp.user_id ORDER BY v.visited_at DESC LIMIT 1))`;
+const OWNER_REP_SQL = `COALESCE(
+  (SELECT pu.rep      FROM purchases pu  WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+  (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id  = lp.user_id ORDER BY v.visited_at DESC LIMIT 1))`;
+
 // Records an admin/manager action in the undo ledger. `oldState` describes how
 // to restore the affected row: { table, where: {...}, row: {...}|null }.
 function auditLog(db, operator, actionType, targetId, oldState) {
@@ -3103,10 +3114,8 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
       lp.campaign_source, lp.manychat_source, lp.preferred_branch,
       lp.revisit_status, lp.revisit_note, lp.revisit_updated_by, lp.revisit_updated_at,
       lp.purchased_at,
-      (SELECT v.branch    FROM lead_visits v WHERE v.user_id = lp.user_id
-         ORDER BY v.visited_at DESC LIMIT 1) AS branch,
-      (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id
-         ORDER BY v.visited_at DESC LIMIT 1) AS sales_rep,
+      ${OWNER_BRANCH_SQL} AS branch,
+      ${OWNER_REP_SQL}    AS sales_rep,
       (SELECT COALESCE(SUM(p.price), 0) FROM purchases p
          WHERE p.user_id = lp.user_id)       AS purchase_total,
       (SELECT COUNT(*) FROM revisit_followups rf
@@ -3260,10 +3269,8 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
   const rows = db.prepare(`
     SELECT
       lp.user_id, lp.lead_class, lp.purchased_at, lp.revisit_status,
-      (SELECT v.branch    FROM lead_visits v WHERE v.user_id = lp.user_id
-         ORDER BY v.visited_at DESC LIMIT 1) AS branch,
-      (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id
-         ORDER BY v.visited_at DESC LIMIT 1) AS sales_rep,
+      ${OWNER_BRANCH_SQL} AS branch,
+      ${OWNER_REP_SQL}    AS sales_rep,
       (SELECT COUNT(*) FROM revisit_followups rf WHERE rf.user_id = lp.user_id) AS followup_count
     FROM lead_profiles lp
     WHERE lp.visit_confirmed = 1 AND ${rbacWhere}
