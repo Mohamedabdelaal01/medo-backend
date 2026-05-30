@@ -1400,6 +1400,13 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     ORDER BY visited_at DESC LIMIT 1
   `).get(lead.user_id);
 
+  // Cross-branch heads-up: did this customer already visit / buy in a DIFFERENT
+  // branch? If so reception (and the sales rep) should know they're a comparer —
+  // it prevents "you stole my customer" fights and helps them tailor the offer.
+  const journey = customerJourney(db, lead.user_id);
+  const otherVisits   = journey.visits.filter(v => v.branch && v.branch !== visitBranch);
+  const otherPurchase = journey.purchases.find(p => p.branch && p.branch !== visitBranch) || null;
+
   return res.json({
     ok:                   true,
     user_id:              lead.user_id,
@@ -1410,7 +1417,25 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     pre_visit_rep:        preVisitRow?.assigned_sales || null,
     last_showroom_rep:    lastShowroomRow?.sales_rep || null,
     was_lost_and_returned: wasLostAndReturned,
+    prior_activity: {
+      multi_branch:   otherVisits.length > 0 || !!otherPurchase,
+      other_visits:   otherVisits,      // [{ branch, sales_rep, visited_at }]
+      other_purchase: otherPurchase,    // { branch, rep, price, ... } | null
+    },
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/customers/:userId/journey — the customer's full cross-branch journey
+// (every visit + purchase + who served them) so everyone understands what
+// happened when a customer compares branches. Visible to all staff roles.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/customers/:userId/journey', requireAuth,
+  authorizeRoles('admin', 'branch_manager', 'sales', 'rep', 'reception'), (req, res) => {
+  const db = getDb();
+  const lead = db.prepare(`SELECT first_name FROM lead_profiles WHERE user_id = ?`).get(req.params.userId);
+  if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  return res.json({ first_name: lead.first_name || null, ...customerJourney(db, req.params.userId) });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2444,6 +2469,34 @@ function logFollowup(db, branch, userId, sales, summary) {
     INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at)
     VALUES (?, ?, ?, ?, datetime('now'))
   `).run(branch, userId, sales || null, (summary && String(summary).trim()) || null);
+}
+
+// Full cross-branch journey of a customer: every visit (which branch, which rep)
+// and every purchase, plus the derived current "owner" (the rep/branch that gets
+// the customer per our rule — purchase wins, else most-recent visit). This is the
+// transparency layer so reception, sales and management all SEE what happened when
+// a customer compares branches — and nobody fights over who owns whom.
+function customerJourney(db, userId) {
+  const visits = db.prepare(`
+    SELECT branch, sales_rep, pre_visit_rep, visited_at
+    FROM lead_visits WHERE user_id = ? ORDER BY visited_at ASC, id ASC
+  `).all(userId);
+  const purchases = db.prepare(`
+    SELECT branch, rep, price, contract_number, created_at
+    FROM purchases WHERE user_id = ? ORDER BY created_at ASC, id ASC
+  `).all(userId);
+  const branches = [...new Set([
+    ...visits.map(v => v.branch),
+    ...purchases.map(p => p.branch),
+  ].filter(Boolean))];
+  const lastPurchase = purchases.length ? purchases[purchases.length - 1] : null;
+  const lastVisit    = visits.length    ? visits[visits.length - 1]       : null;
+  const owner = lastPurchase
+    ? { branch: lastPurchase.branch, rep: lastPurchase.rep, via: 'purchase' }
+    : lastVisit
+      ? { branch: lastVisit.branch, rep: lastVisit.sales_rep, via: 'visit' }
+      : null;
+  return { visits, purchases, branches, multi_branch: branches.length > 1, owner };
 }
 
 // Records an admin/manager action in the undo ledger. `oldState` describes how
@@ -4354,6 +4407,11 @@ function seedDemoData(db) {
       `).run(pDate, p.uid);
     });
   })();
+
+  // One buyer ALSO browsed a different branch (المعادي) before buying here — so
+  // the cross-branch customer journey + the reception heads-up show up in the
+  // demo too (ownership stays with the branch where they actually bought).
+  insVisit.run(`${PREFIX}16`, 'المعادي', iso(daysAgo(9)), 'سيلز المعادي', null);
 
   // ── 4. Pre-visit follow-up assignments (branch_customer_followups) ───────
   // 2 pending (not yet followed up) + 2 done (followed up + visited / not visited)
