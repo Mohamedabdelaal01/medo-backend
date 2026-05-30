@@ -2981,21 +2981,31 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
   if (role === 'branch_manager') {
     const b = req.user.branch || null;
     if (!b) return res.status(400).json({ error: 'branch_required' });
-    rbacWhere = `(lp.preferred_branch = ?
-      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
-    params.push(b, b);
+    // A visited customer belongs to the branch where they closed their LATEST
+    // interaction (purchase branch if bought, else most-recent visit branch), so
+    // a customer who bought in another branch never shows for this manager.
+    rbacWhere = `COALESCE(
+      (SELECT pu.branch FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+      (SELECT v.branch FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+    ) = ?`;
+    params.push(b);
   } else if (role === 'sales' || role === 'rep') {
     const me       = req.user.name;
     const myBranch = req.user.branch || null;
-    // Post-visit ownership belongs to the rep who ACTUALLY SERVED the customer at
-    // the showroom (lead_visits.sales_rep), scoped to that rep's own branch. We do
-    // NOT use lp.assigned_rep here — that's the pre-visit / call-rep owner, and it
-    // was leaking customers into the wrong rep's (and wrong branch's) post-visit
-    // list (e.g. a Nasr City rep seeing a customer another rep sold to in Maadi).
-    rbacWhere = `lp.user_id IN (
-      SELECT user_id FROM lead_visits
-      WHERE TRIM(sales_rep) = TRIM(?)${myBranch ? ' AND branch = ?' : ''}
-    )`;
+    // A visited customer's post-visit OWNER is whoever closed their LATEST
+    // showroom interaction: the purchase's rep if they bought, otherwise their
+    // most-recent visit's sales_rep — scoped to that owner's branch. This stops a
+    // customer who bought in one branch from appearing for a rep in another branch
+    // just because a stray visit got logged there, and supersedes the old
+    // assigned_rep / any-visit matching that leaked across reps and branches.
+    rbacWhere = `
+      TRIM(COALESCE(
+        (SELECT pu.rep FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+        (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+      )) = TRIM(?)${myBranch ? ` AND COALESCE(
+        (SELECT pu.branch FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+        (SELECT v.branch FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+      ) = ?` : ''}`;
     params.push(me);
     if (myBranch) params.push(myBranch);
   }
@@ -3135,21 +3145,31 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
   if (role === 'branch_manager') {
     const b = req.user.branch || null;
     if (!b) return res.status(400).json({ error: 'branch_required' });
-    rbacWhere = `(lp.preferred_branch = ?
-      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
-    params.push(b, b);
+    // A visited customer belongs to the branch where they closed their LATEST
+    // interaction (purchase branch if bought, else most-recent visit branch), so
+    // a customer who bought in another branch never shows for this manager.
+    rbacWhere = `COALESCE(
+      (SELECT pu.branch FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+      (SELECT v.branch FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+    ) = ?`;
+    params.push(b);
   } else if (role === 'sales' || role === 'rep') {
     const me       = req.user.name;
     const myBranch = req.user.branch || null;
-    // Post-visit ownership belongs to the rep who ACTUALLY SERVED the customer at
-    // the showroom (lead_visits.sales_rep), scoped to that rep's own branch. We do
-    // NOT use lp.assigned_rep here — that's the pre-visit / call-rep owner, and it
-    // was leaking customers into the wrong rep's (and wrong branch's) post-visit
-    // list (e.g. a Nasr City rep seeing a customer another rep sold to in Maadi).
-    rbacWhere = `lp.user_id IN (
-      SELECT user_id FROM lead_visits
-      WHERE TRIM(sales_rep) = TRIM(?)${myBranch ? ' AND branch = ?' : ''}
-    )`;
+    // A visited customer's post-visit OWNER is whoever closed their LATEST
+    // showroom interaction: the purchase's rep if they bought, otherwise their
+    // most-recent visit's sales_rep — scoped to that owner's branch. This stops a
+    // customer who bought in one branch from appearing for a rep in another branch
+    // just because a stray visit got logged there, and supersedes the old
+    // assigned_rep / any-visit matching that leaked across reps and branches.
+    rbacWhere = `
+      TRIM(COALESCE(
+        (SELECT pu.rep FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+        (SELECT v.sales_rep FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+      )) = TRIM(?)${myBranch ? ` AND COALESCE(
+        (SELECT pu.branch FROM purchases pu WHERE pu.user_id = lp.user_id ORDER BY pu.created_at DESC, pu.id DESC LIMIT 1),
+        (SELECT v.branch FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1)
+      ) = ?` : ''}`;
     params.push(me);
     if (myBranch) params.push(myBranch);
   }
