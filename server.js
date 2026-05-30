@@ -2852,6 +2852,12 @@ app.post('/api/purchases', requireAuth, (req, res) => {
     if (firstProduct) legacyProductLabel = firstProduct.name;
   }
 
+  // A sale must record WHAT was sold — otherwise best-selling analytics are
+  // blind. Require at least one product (catalog selection preferred).
+  if (!productIds.length && !legacyProductLabel) {
+    return res.status(400).json({ error: 'اختار المنتج اللي اشتراه العميل قبل ما تسجّل البيعة' });
+  }
+
   const result = db.prepare(`
     INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3536,12 +3542,64 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     ORDER BY leads DESC
   `).all(fromDate, toDate, ...branchParam, ...campaignParam);
 
+  // ── SALES analytics — best-selling products. Mirrors the "most viewed"
+  // analysis above but sourced from ACTUAL purchases (purchase_items → products
+  // → categories), not view events. "units" = number of line items sold, which
+  // is the clean, unambiguous "best-seller" metric. We deliberately do NOT split
+  // a contract's price across its products (one contract can bundle several
+  // products under a single total), so we rank by units, not by revenue.
+  const salesArgs = [fromDate, toDate, ...branchParam, ...campaignParam];
+  const salesFrom = `
+    FROM purchase_items pi
+    JOIN purchases pur     ON pur.id = pi.purchase_id
+    JOIN lead_profiles lp  ON lp.user_id = pur.user_id
+    JOIN products p        ON p.id = pi.product_id
+    LEFT JOIN product_categories pc ON pc.id = p.category_id
+    WHERE date(pur.created_at) BETWEEN ? AND ?
+      ${branchClause} ${campaignClause}
+  `;
+  // Best-selling overall (all categories)
+  const topSelling = db.prepare(`
+    SELECT p.name AS product, COALESCE(pc.name, 'بدون فئة') AS category,
+           COUNT(*) AS units, COUNT(DISTINCT pur.user_id) AS buyers
+    ${salesFrom}
+    GROUP BY pi.product_id
+    ORDER BY units DESC, buyers DESC
+    LIMIT 10
+  `).all(...salesArgs);
+  // Sales rolled up per category
+  const salesByCategory = db.prepare(`
+    SELECT COALESCE(pc.name, 'بدون فئة') AS category,
+           COUNT(*) AS units,
+           COUNT(DISTINCT pi.product_id) AS products_sold,
+           COUNT(DISTINCT pur.user_id)   AS buyers
+    ${salesFrom}
+    GROUP BY COALESCE(pc.name, 'بدون فئة')
+    ORDER BY units DESC
+  `).all(...salesArgs);
+  // Best-selling products inside each category (nested, like productsByCategory)
+  const sellingByCategoryRows = db.prepare(`
+    SELECT COALESCE(pc.name, 'بدون فئة') AS category, p.name AS product,
+           COUNT(*) AS units, COUNT(DISTINCT pur.user_id) AS buyers
+    ${salesFrom}
+    GROUP BY COALESCE(pc.name, 'بدون فئة'), pi.product_id
+    ORDER BY category, units DESC
+  `).all(...salesArgs);
+  const sellingByCategory = {};
+  for (const r of sellingByCategoryRows) {
+    if (!sellingByCategory[r.category]) sellingByCategory[r.category] = [];
+    sellingByCategory[r.category].push({ product: r.product, units: r.units, buyers: r.buyers });
+  }
+
   return res.json({
     eventsSeries,
     funnel:      funnel || { total_leads: 0, hot: 0, visited: 0, purchased: 0 },
     topProducts,
     categories,
     productsByCategory,
+    topSelling,
+    salesByCategory,
+    sellingByCategory,
     campaigns,
     adFunnel,
     branches,
@@ -4134,9 +4192,10 @@ function seedDemoData(db) {
 
   // ── 3. Purchases — 3 completed sales by demo_sales ──────────────────────
   const purchaseData = [
-    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش',        daysAgoN: 6 },
-    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور', daysAgoN: 8 },
-    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد — دفع كاش',            daysAgoN: 10 },
+    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش',        daysAgoN: 6,  products: ['غرفة نوم كلاسيك ملكي'] },
+    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور', daysAgoN: 8,  products: ['طقم سفرة 8 كراسي فاخر'] },
+    // Bedroom set repeats here → it becomes the best-seller overall + in غرف النوم.
+    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد + غرفة نوم — دفع كاش',  daysAgoN: 10, products: ['كنبة 4 مقاعد جلد', 'غرفة نوم كلاسيك ملكي'] },
   ];
   const insPurchase = db.prepare(`
     INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
@@ -4145,8 +4204,30 @@ function seedDemoData(db) {
   const insPurchaseItem = db.prepare(`
     INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)
   `);
-  // Pick a couple of real catalog products per demo contract so the new
-  // multi-select UI on the lead profile shows realistic items.
+  // The catalog is normally cloned from production (hundreds of real products).
+  // But on a fresh/empty live DB the clone is empty, which would leave demo
+  // purchases with no line items and the best-selling analytics blank. Seed a
+  // tiny catalog (only if none exists) so the demo always reflects the feature.
+  if (db.prepare(`SELECT COUNT(*) c FROM products WHERE active = 1`).get().c === 0) {
+    const catIns  = db.prepare(`INSERT INTO product_categories (name) VALUES (?)`);
+    const prodIns = db.prepare(`INSERT INTO products (category_id, name) VALUES (?, ?)`);
+    const demoCatalog = {
+      'غرف النوم':   ['غرفة نوم كلاسيك ملكي', 'غرفة نوم مودرن'],
+      'السفرة':      ['طقم سفرة 8 كراسي فاخر', 'طقم سفرة 6 كراسي'],
+      'الانتريهات':  ['كنبة 4 مقاعد جلد', 'انتريه كلاسيك'],
+    };
+    db.transaction(() => {
+      for (const [cat, prods] of Object.entries(demoCatalog)) {
+        const cid = catIns.run(cat).lastInsertRowid;
+        for (const name of prods) prodIns.run(cid, name);
+      }
+    })();
+  }
+
+  // Link each demo contract to the catalog product that matches its note (so the
+  // best-selling-by-category analysis is meaningful), falling back to random.
+  const productByName = (frag) =>
+    db.prepare(`SELECT id FROM products WHERE active = 1 AND name LIKE ? LIMIT 1`).get('%' + frag + '%')?.id;
   const pickRandomProducts = (n) => {
     const rows = db.prepare(`SELECT id FROM products WHERE active = 1`).all();
     if (!rows.length) return [];
@@ -4159,8 +4240,10 @@ function seedDemoData(db) {
       const result = insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
       const purchaseId = result.lastInsertRowid;
 
-      // 1–3 random catalog products per demo contract
-      const productIds = pickRandomProducts(1 + Math.floor(Math.random() * 3));
+      // Link the contract to its catalog products (by name), so the
+      // best-selling-by-category analysis has real, sensible data.
+      let productIds = (p.products || []).map(productByName).filter(Boolean);
+      if (!productIds.length) productIds = pickRandomProducts(1 + Math.floor(Math.random() * 2));
       for (const pid of productIds) insPurchaseItem.run(purchaseId, pid);
 
       // set purchased_at so the "اشتروا" tab in revisit works
