@@ -2696,6 +2696,53 @@ app.patch('/api/sales/followups/:userId/sent', requireAuth, authorizeRoles('sale
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Pre-visit follow-up LOG — the rep can record SEVERAL follow-ups over time for
+// a customer who hasn't visited yet (updates/timeline), not just one. Append-only
+// (followup_log), scoped to the rep the customer is assigned to.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/followups/:userId/log', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me = req.user.name;
+  const { userId } = req.params;
+  const db = getDb();
+  const own = db.prepare(`
+    SELECT 1 FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+  const log = db.prepare(`
+    SELECT id, sales, call_summary, followed_up_at
+    FROM followup_log WHERE user_id = ?
+    ORDER BY followed_up_at DESC, id DESC
+  `).all(userId);
+  return res.json({ log });
+});
+
+app.post('/api/sales/followups/:userId/log', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me   = req.user.name;
+  const { userId } = req.params;
+  const note = (req.body?.note && String(req.body.note).trim()) || null;
+  if (!note) return res.status(400).json({ error: 'اكتب نص المتابعة' });
+
+  const db  = getDb();
+  const own = db.prepare(`
+    SELECT branch FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+
+  // Keep the customer in the followed-up list and surface the latest note on the
+  // row, while appending this update to the permanent history.
+  db.prepare(`
+    UPDATE branch_customer_followups
+       SET followed_up = 1, followed_up_at = ?, followed_up_by = ?, call_summary = ?
+     WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).run(new Date().toISOString(), me, note, userId, me);
+  logFollowup(db, own.branch, userId, me, note);
+
+  return res.json({ ok: true });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Branch sales accounts — branch_manager manages the sales users of THEIR
 // branch only. admin may target any branch via ?branch / body.branch.
 // These rows live in the same `users` table, so they also show up in the
@@ -2955,7 +3002,12 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
 
   const customers = db.prepare(`
     SELECT
-      lp.user_id, lp.first_name, lp.phone, lp.total_score, lp.lead_class,
+      lp.user_id, lp.first_name,
+      -- The phone usually lives in lead_phones, not lp.phone — fall back to it
+      -- so the number actually shows (the branch manager couldn't see it before).
+      COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                          WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
+      lp.total_score, lp.lead_class,
       lp.last_product, lp.last_category, lp.last_activity, lp.visit_at,
       lp.campaign_source, lp.manychat_source, lp.preferred_branch,
       lp.revisit_status, lp.revisit_note, lp.revisit_updated_by, lp.revisit_updated_at,
