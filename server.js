@@ -2938,10 +2938,19 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
       OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
     params.push(b, b);
   } else if (role === 'sales' || role === 'rep') {
-    const me = req.user.name;
-    rbacWhere = `(lp.assigned_rep = ?
-      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE sales_rep = ?))`;
-    params.push(me, me);
+    const me       = req.user.name;
+    const myBranch = req.user.branch || null;
+    // Post-visit ownership belongs to the rep who ACTUALLY SERVED the customer at
+    // the showroom (lead_visits.sales_rep), scoped to that rep's own branch. We do
+    // NOT use lp.assigned_rep here — that's the pre-visit / call-rep owner, and it
+    // was leaking customers into the wrong rep's (and wrong branch's) post-visit
+    // list (e.g. a Nasr City rep seeing a customer another rep sold to in Maadi).
+    rbacWhere = `lp.user_id IN (
+      SELECT user_id FROM lead_visits
+      WHERE TRIM(sales_rep) = TRIM(?)${myBranch ? ' AND branch = ?' : ''}
+    )`;
+    params.push(me);
+    if (myBranch) params.push(myBranch);
   }
 
   const customers = db.prepare(`
@@ -3078,10 +3087,19 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
       OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE branch = ?))`;
     params.push(b, b);
   } else if (role === 'sales' || role === 'rep') {
-    const me = req.user.name;
-    rbacWhere = `(lp.assigned_rep = ?
-      OR lp.user_id IN (SELECT user_id FROM lead_visits WHERE sales_rep = ?))`;
-    params.push(me, me);
+    const me       = req.user.name;
+    const myBranch = req.user.branch || null;
+    // Post-visit ownership belongs to the rep who ACTUALLY SERVED the customer at
+    // the showroom (lead_visits.sales_rep), scoped to that rep's own branch. We do
+    // NOT use lp.assigned_rep here — that's the pre-visit / call-rep owner, and it
+    // was leaking customers into the wrong rep's (and wrong branch's) post-visit
+    // list (e.g. a Nasr City rep seeing a customer another rep sold to in Maadi).
+    rbacWhere = `lp.user_id IN (
+      SELECT user_id FROM lead_visits
+      WHERE TRIM(sales_rep) = TRIM(?)${myBranch ? ' AND branch = ?' : ''}
+    )`;
+    params.push(me);
+    if (myBranch) params.push(myBranch);
   }
 
   // One row per customer who visited the showroom.
