@@ -3343,6 +3343,119 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/sales-followup-monitor — admin oversight of every sales rep's
+// follow-up work. Returns, per rep, the PRE-visit and POST-visit follow-up
+// activity kept SEPARATE so the admin can tell at a glance who is actually
+// following up vs not, and read what they wrote:
+//   pre  → assigned / followed / pending (+ the customers still pending and the
+//          latest follow-up notes they logged in followup_log)
+//   post → revisit owned / followed / pending (+ the customers still pending and
+//          the latest revisit notes from revisit_followups)
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/sales-followup-monitor', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+
+  // Every showroom rep — include inactive ones too, their history still matters.
+  const reps = db.prepare(`
+    SELECT name, branch FROM users
+    WHERE role IN ('sales', 'rep')
+    ORDER BY branch, name
+  `).all();
+
+  // ── PRE-visit (branch_customer_followups, customer not yet visited) ─────────
+  const preAgg = db.prepare(`
+    SELECT
+      COUNT(*) AS assigned,
+      COALESCE(SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END), 0) AS followed
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE TRIM(f.assigned_sales) = TRIM(?)
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+  `);
+  const prePending = db.prepare(`
+    SELECT f.user_id, lp.first_name, f.assigned_at, f.sent,
+      (SELECT ph.phone FROM lead_phones ph WHERE ph.user_id = f.user_id ORDER BY ph.id LIMIT 1) AS phone
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE TRIM(f.assigned_sales) = TRIM(?)
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND f.followed_up = 0
+    ORDER BY f.assigned_at DESC
+    LIMIT 25
+  `);
+  const preRecent = db.prepare(`
+    SELECT fl.user_id, lp.first_name, fl.call_summary, fl.followed_up_at
+    FROM followup_log fl
+    LEFT JOIN lead_profiles lp ON lp.user_id = fl.user_id
+    WHERE TRIM(fl.sales) = TRIM(?) AND fl.call_summary IS NOT NULL
+    ORDER BY fl.followed_up_at DESC, fl.id DESC
+    LIMIT 15
+  `);
+
+  // ── POST-visit (revisit; owner-based; still pending = not bought/lost) ──────
+  const postAgg = db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN (SELECT COUNT(*) FROM revisit_followups rf WHERE rf.user_id = lp.user_id) > 0 THEN 1 ELSE 0 END), 0) AS followed
+    FROM lead_profiles lp
+    WHERE lp.visit_confirmed = 1
+      AND lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+      AND (lp.revisit_status IS NULL OR lp.revisit_status = 'pending')
+      AND TRIM(${OWNER_REP_SQL}) = TRIM(?)
+  `);
+  const postPending = db.prepare(`
+    SELECT lp.user_id, lp.first_name, lp.last_activity,
+      COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+    FROM lead_profiles lp
+    WHERE lp.visit_confirmed = 1
+      AND lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+      AND (lp.revisit_status IS NULL OR lp.revisit_status = 'pending')
+      AND TRIM(${OWNER_REP_SQL}) = TRIM(?)
+      AND (SELECT COUNT(*) FROM revisit_followups rf WHERE rf.user_id = lp.user_id) = 0
+    ORDER BY lp.last_activity DESC
+    LIMIT 25
+  `);
+  const postRecent = db.prepare(`
+    SELECT rf.user_id, lp.first_name, rf.note, rf.created_at
+    FROM revisit_followups rf
+    LEFT JOIN lead_profiles lp ON lp.user_id = rf.user_id
+    WHERE TRIM(rf.followed_up_by) = TRIM(?)
+    ORDER BY rf.created_at DESC, rf.id DESC
+    LIMIT 15
+  `);
+
+  const out = reps.map((r) => {
+    const pa  = preAgg.get(r.name)  || { assigned: 0, followed: 0 };
+    const poa = postAgg.get(r.name) || { total: 0, followed: 0 };
+    return {
+      sales_rep: r.name,
+      branch: r.branch || null,
+      pre: {
+        assigned: pa.assigned || 0,
+        followed: pa.followed || 0,
+        pending:  (pa.assigned || 0) - (pa.followed || 0),
+        pending_list: prePending.all(r.name),
+        recent:       preRecent.all(r.name),
+      },
+      post: {
+        total:    poa.total || 0,
+        followed: poa.followed || 0,
+        pending:  (poa.total || 0) - (poa.followed || 0),
+        pending_list: postPending.all(r.name),
+        recent:       postRecent.all(r.name),
+      },
+    };
+  });
+
+  // Hide reps with literally nothing (assignment or activity) to cut noise — but
+  // if that empties the list, fall back to showing everyone so the page isn't blank.
+  const active = out.filter(
+    (r) => r.pre.assigned || r.post.total || r.pre.recent.length || r.post.recent.length
+  );
+  return res.json({ reps: active.length ? active : out });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/leads/:user_id/purchases — Purchase history for a lead
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
@@ -4496,6 +4609,25 @@ function seedDemoData(db) {
         insVisit.run(f.uid, BRANCH, vDate, SALES, SALES);
       }
     }
+  })();
+
+  // followup_log — the append-only PRE-visit follow-up timeline. Seed an entry
+  // for each done follow-up (and a 2nd one for هبة, to show a multi-touch
+  // timeline) so the admin's "متابعات السيلز" monitor isn't empty in the demo.
+  const insFulog = db.prepare(`
+    INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at)
+    VALUES (?,?,?,?,?)
+  `);
+  db.transaction(() => {
+    for (const f of fupData) {
+      if (f.fu && f.summary) {
+        insFulog.run(BRANCH, f.uid, SALES, f.summary,
+          iso(daysAgo(f.visitedAgo ? f.visitedAgo + 2 : 3)));
+      }
+    }
+    // A second, earlier touch for هبة رضا — shows the rep followed up more than once.
+    insFulog.run(BRANCH, `${PREFIX}09`, SALES,
+      'كلمتها أول مرة، طلبت تفاصيل أكتر عن الخامات والأسعار — بعتتلها صور', iso(daysAgo(7)));
   })();
 
   // ── 5. Sales targets for this month ─────────────────────────────────────
