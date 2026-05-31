@@ -1788,7 +1788,8 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
       v.branch    AS branch,
       COUNT(DISTINCT v.user_id) AS served,
       COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
-      COALESCE(SUM(DISTINCT_PRICE.amount),0) AS total_sales
+      COALESCE(SUM(DISTINCT_PRICE.amount),0) AS total_sales,
+      (SELECT COUNT(*) FROM purchases pu WHERE pu.rep = v.sales_rep AND pu.branch = v.branch) AS contracts
     FROM lead_visits v
     LEFT JOIN purchases p
       ON p.user_id = v.user_id AND p.rep = v.sales_rep
@@ -2286,7 +2287,8 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
       v.sales_rep AS sales_rep,
       COUNT(DISTINCT v.user_id) AS served,
       COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
-      COALESCE(SUM(DP.amount),0) AS total_sales
+      COALESCE(SUM(DP.amount),0) AS total_sales,
+      (SELECT COUNT(*) FROM purchases pu WHERE pu.rep = v.sales_rep AND pu.branch = v.branch) AS contracts
     FROM lead_visits v
     LEFT JOIN purchases p ON p.user_id = v.user_id AND p.rep = v.sales_rep
     LEFT JOIN (
@@ -2352,18 +2354,23 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
   // Attach each rep's CURRENT-MONTH target + achievement (revenue this month),
   // and the follow-up rate (followed-up ÷ assigned).
   for (const r of bySales) {
-    r.target       = getTarget(db, 'sales_rep', r.sales_rep);
-    r.target_pct   = pctAchieved(monthRevenue(db, { rep: r.sales_rep }), r.target);
+    r.contracts    = r.contracts || 0;
+    r.target       = getTarget(db, 'sales_rep', r.sales_rep);   // a CONTRACTS target now
+    r.target_pct   = pctAchieved(monthContracts(db, { rep: r.sales_rep, branch }), r.target);
     r.followup_rate = r.assigned ? Math.round((r.followed_up / r.assigned) * 100) : 0;
   }
 
   const served      = bySales.reduce((s, r) => s + r.served, 0);
   const bought      = bySales.reduce((s, r) => s + r.bought, 0);
   const totalSales  = bySales.reduce((s, r) => s + r.total_sales, 0);
+  // Total contracts for the branch (count of purchase rows in this branch).
+  const contractsCount = db.prepare(
+    `SELECT COUNT(*) AS c FROM purchases WHERE branch = ?`
+  ).get(branch).c || 0;
 
-  // Branch target progress — current month's target vs this month's revenue.
+  // Branch target progress — current month's target vs this month's CONTRACTS.
   const branchTarget = getTarget(db, 'branch', branch);
-  const branchMonthRevenue = monthRevenue(db, { branch });
+  const branchMonthContracts = monthContracts(db, { branch });
 
   return res.json({
     branch,
@@ -2372,11 +2379,12 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
       requested,
       visited,
       bought,
-      total_sales: totalSales,
+      total_sales: totalSales,        // kept for backward-compat
+      contracts_count: contractsCount, // headline metric now
       close_rate: served ? Math.round((bought / served) * 100) : 0,
-      target:        branchTarget,
-      month_revenue: branchMonthRevenue,
-      target_pct:    pctAchieved(branchMonthRevenue, branchTarget),
+      target:          branchTarget,
+      month_contracts: branchMonthContracts,
+      target_pct:      pctAchieved(branchMonthContracts, branchTarget),
     },
     bySales,
   });
@@ -2575,6 +2583,19 @@ function monthRevenue(db, { branch, rep, month } = {}) {
   return db.prepare(
     `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${where}`
   ).get(...params).r || 0;
+}
+
+// Count of CONTRACTS (purchases) recorded WITHIN a calendar month, optionally
+// scoped to a branch or rep. This replaces revenue as the headline metric — the
+// business tracks number of contracts, not money. `month` defaults to current.
+function monthContracts(db, { branch, rep, month } = {}) {
+  let where = `strftime('%Y-%m', created_at) = ?`;
+  const params = [month || currentMonth()];
+  if (branch) { where += ` AND branch = ?`; params.push(branch); }
+  if (rep)    { where += ` AND rep = ?`;    params.push(rep); }
+  return db.prepare(
+    `SELECT COUNT(*) AS c FROM purchases WHERE ${where}`
+  ).get(...params).c || 0;
 }
 
 function pctAchieved(actual, target) {
@@ -4483,9 +4504,10 @@ function seedDemoData(db) {
     VALUES (?,?,?,?)
   `);
   db.transaction(() => {
-    insTarget.run('branch',     BRANCH, month, 400000);   // branch target
-    insTarget.run('sales_rep',  SALES,  month,  80000);   // personal target for demo_sales
-    insTarget.run('branch_manager', MANAGER, month, 400000);
+    // Targets are now CONTRACT COUNTS (not money).
+    insTarget.run('branch',     BRANCH, month, 20);   // 20 contracts for the branch
+    insTarget.run('sales_rep',  SALES,  month,  8);   // 8 contracts for demo_sales
+    insTarget.run('branch_manager', MANAGER, month, 20);
   })();
 
   // ── 6. Pending tasks for demo_sales ─────────────────────────────────────
@@ -4688,7 +4710,8 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   if (branch) { purWhere += ' AND branch = ?'; purParams.push(branch); }
   if (rep)    { purWhere += ' AND rep = ?';    purParams.push(rep); }
   const purRow = db.prepare(`
-    SELECT COALESCE(SUM(price), 0) AS revenue, COUNT(DISTINCT user_id) AS buyers
+    SELECT COALESCE(SUM(price), 0) AS revenue, COUNT(DISTINCT user_id) AS buyers,
+           COUNT(*) AS contracts
     FROM purchases WHERE ${purWhere}
   `).get(...purParams);
 
@@ -4714,7 +4737,8 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
       FROM sales_targets WHERE scope_type = 'branch' AND target_month = ?
     `).get(curMonth).t || 0;
   }
-  const monthRev = monthRevenue(db, { branch, rep, month: curMonth });
+  const monthRev  = monthRevenue(db, { branch, rep, month: curMonth });
+  const monthCnts = monthContracts(db, { branch, rep, month: curMonth });
 
   const revenue = purRow.revenue || 0;
 
@@ -4767,13 +4791,15 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   `).all(...ldParams);
 
   return res.json({
-    total_revenue:    revenue,
+    total_revenue:    revenue,                 // kept for backward-compat
+    contracts_count:  purRow.contracts || 0,   // headline metric now
     total_visits:     visits,
     closing_rate:     visits ? Math.round((purRow.buyers / visits) * 100) : 0,
-    target,
+    target,                                     // a CONTRACTS target now
     target_month:     curMonth,
     month_revenue:    monthRev,
-    percent_achieved: pctAchieved(monthRev, target),
+    month_contracts:  monthCnts,
+    percent_achieved: pctAchieved(monthCnts, target),
     funnel_stages,
     lead_distribution,
     branch_demand,
@@ -4788,12 +4814,14 @@ app.get('/api/sales/my-target', requireAuth, authorizeRoles('sales', 'rep'), (re
   const db = getDb();
   const me = req.user.name;
   // Current calendar month: this month's target vs this month's revenue.
-  const target  = getTarget(db, 'sales_rep', me);
-  const revenue = monthRevenue(db, { rep: me });
+  const target    = getTarget(db, 'sales_rep', me);
+  const revenue   = monthRevenue(db, { rep: me });
+  const contracts = monthContracts(db, { rep: me });
   return res.json({
-    target,
-    revenue,
-    percent:      pctAchieved(revenue, target),
+    target,                                  // a CONTRACTS target now
+    revenue,                                 // kept for backward-compat
+    contracts,
+    percent:      pctAchieved(contracts, target),
     target_month: currentMonth(),
   });
 });
