@@ -1114,6 +1114,11 @@ app.delete('/api/leads/:user_id', requireAuth, requireRole('admin'), (req, res) 
     db.prepare(`DELETE FROM purchases       WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM messages_sent   WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM follow_up_state WHERE user_id = ?`).run(user_id);
+    // These are keyed by user_id too — leaving them behind orphans the lead's
+    // assignment (it would resurface as a nameless ghost in a rep's list).
+    db.prepare(`DELETE FROM branch_customer_followups WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM followup_log     WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM revisit_followups WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM lead_profiles   WHERE user_id = ?`).run(user_id);
   });
   wipe();
@@ -2740,7 +2745,10 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       ) THEN 1 ELSE 0 END                                          AS visited,
       ${crossBranchCols('f.user_id')}
     FROM branch_customer_followups f
-    LEFT JOIN lead_profiles lp ON lp.user_id = f.user_id
+    -- INNER JOIN (not LEFT): an assignment row whose customer profile no longer
+    -- exists (e.g. the lead was deleted) is an orphan — never surface it, or it
+    -- shows up as a nameless ghost (the raw walkin_ id) in the rep's list.
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
       AND COALESCE(lp.visit_confirmed, 0) = 0
     ORDER BY f.followed_up ASC, f.assigned_at DESC
