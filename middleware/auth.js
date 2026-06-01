@@ -53,7 +53,24 @@ function requireAuth(req, res, next) {
   // Route the rest of this request to the sandbox DB for demo_ training
   // accounts; everything else stays on production.
   const isDemo = typeof req.user?.name === 'string' && req.user.name.startsWith('demo_');
-  return runWithDbContext(isDemo, () => next());
+  return runWithDbContext(isDemo, () => {
+    // Honor account suspension IMMEDIATELY — even with a still-valid 7-day JWT.
+    // The token is signed at login, so an admin who freezes an account can't wait
+    // for it to expire; we re-check the live `active` flag on every request and
+    // reject (401, so the client logs the user straight out) the moment it's 0.
+    try {
+      const db  = getDb();
+      const row = req.user?.id != null
+        ? db.prepare('SELECT active FROM users WHERE id = ?').get(req.user.id)
+        : db.prepare('SELECT active FROM users WHERE name = ?').get(req.user?.name);
+      if (row && row.active === 0) {
+        return res.status(401).json({ error: 'الحساب موقوف — تواصل مع مدير النظام', suspended: true });
+      }
+    } catch (_) {
+      // A lookup failure must never lock everyone out — fail open on errors only.
+    }
+    return next();
+  });
 }
 
 /**

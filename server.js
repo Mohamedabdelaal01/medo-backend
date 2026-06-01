@@ -4114,7 +4114,7 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
-  let { name, email, role, password, branch } = req.body || {};
+  let { name, email, role, password, branch, active } = req.body || {};
   if (name != null) name = String(name).trim();
   const db      = getDb();
   const updates = [];
@@ -4124,6 +4124,23 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (email)    { updates.push('email = ?');         params.push(email); }
   if (role)     { updates.push('role = ?');          params.push(role); }
   if (password) { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
+  // active: 1 = can log in, 0 = frozen (reversible suspension). Reject freezing
+  // the last remaining admin so the system can never lock itself out.
+  if (active !== undefined) {
+    const next = active ? 1 : 0;
+    if (next === 0) {
+      const target = db.prepare(`SELECT role FROM users WHERE id = ?`).get(req.params.id);
+      if (target?.role === 'admin') {
+        const otherAdmins = db.prepare(
+          `SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1 AND id != ?`
+        ).get(req.params.id).n;
+        if (otherAdmins === 0) {
+          return res.status(400).json({ error: 'مينفعش توقف آخر مدير نظام نشط' });
+        }
+      }
+    }
+    updates.push('active = ?'); params.push(next);
+  }
   // Set branch for reception accounts; clear it for any other role
   if (role)     { updates.push('branch = ?');        params.push(['reception','sales','branch_manager'].includes(role) ? (branch || null) : null); }
   else if (branch !== undefined) { updates.push('branch = ?'); params.push(branch || null); }
@@ -4365,6 +4382,238 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
 
   console.log(`↩️  AUDIT REVERT: log#${log.id} (${log.action_type}) by ${req.user?.name}`);
   return res.json({ ok: true, reverted: log.action_type, target_id: log.target_id });
+});
+
+// Resolve a branch id (e.g. 'nasr_city') to its Arabic label from the
+// active_branches setting; falls back to the raw value. Used by CSV export.
+function branchLabelMap(db) {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key='active_branches'`).get();
+    const arr = JSON.parse(row?.value || '[]');
+    const m = {};
+    for (const b of arr) if (b && b.id) m[b.id] = b.name || b.id;
+    return m;
+  } catch (_) { return {}; }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/analytics/advanced — admin-only deep analytics. Four executive KPIs
+// computed from existing tables (no new schema):
+//   1. True rep conversion  = contracts closed ÷ leads assigned (efficiency, not
+//      volume) per rep.
+//   2. Sales velocity        = avg days from lead creation → purchase.
+//   3. Lost-lead analysis    = where COLD leads cluster (last touchpoint / branch).
+//   4. Pipeline value        = HOT/WARM leads × a mock ticket = money left on the table.
+// ════════════════════════════════════════════════════════════════════════════
+const HOT_TICKET  = 50000;  // mock avg ticket per HOT lead (EGP)
+const WARM_TICKET = 25000;  // mock avg ticket per WARM lead (EGP)
+
+app.get('/api/analytics/advanced', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+
+  // ── 1. True rep conversion rate (contracts ÷ assigned) ────────────────────
+  const reps = db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep')`).all();
+  const assignedStmt  = db.prepare(`SELECT COUNT(*) AS n FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(?)`);
+  const contractsStmt = db.prepare(`SELECT COUNT(*) AS n FROM purchases WHERE TRIM(rep) = TRIM(?)`);
+  const repConversion = reps.map((r) => {
+    const assigned  = assignedStmt.get(r.name).n  || 0;
+    const contracts = contractsStmt.get(r.name).n || 0;
+    return {
+      rep: r.name,
+      branch: r.branch || null,
+      assigned,
+      contracts,
+      rate: assigned ? Math.round((contracts / assigned) * 1000) / 10 : 0, // 1-dp %
+    };
+  }).filter((r) => r.assigned > 0 || r.contracts > 0)
+    .sort((a, b) => b.rate - a.rate || b.contracts - a.contracts);
+
+  // ── 2. Sales velocity (lead created → purchase) ───────────────────────────
+  // Guard out rows where the purchase predates lead creation (data drift) so the
+  // average can't go negative.
+  const vel = db.prepare(`
+    SELECT
+      COUNT(*) AS n,
+      AVG(julianday(p.created_at) - julianday(lp.created_at)) AS avg_days,
+      MIN(julianday(p.created_at) - julianday(lp.created_at)) AS min_days,
+      MAX(julianday(p.created_at) - julianday(lp.created_at)) AS max_days
+    FROM purchases p
+    JOIN lead_profiles lp ON lp.user_id = p.user_id
+    WHERE lp.created_at IS NOT NULL AND p.created_at IS NOT NULL
+      AND julianday(p.created_at) >= julianday(lp.created_at)
+  `).get();
+  const bucket = (lo, hi) => db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM purchases p JOIN lead_profiles lp ON lp.user_id = p.user_id
+    WHERE lp.created_at IS NOT NULL AND p.created_at IS NOT NULL
+      AND julianday(p.created_at) >= julianday(lp.created_at)
+      AND (julianday(p.created_at) - julianday(lp.created_at)) >= ?
+      ${hi != null ? 'AND (julianday(p.created_at) - julianday(lp.created_at)) < ?' : ''}
+  `).get(...(hi != null ? [lo, hi] : [lo])).n;
+  const velocity = {
+    avg_days:     vel.n ? Math.round((vel.avg_days || 0) * 10) / 10 : null,
+    sample_size:  vel.n || 0,
+    fastest_days: vel.n ? Math.max(0, Math.round((vel.min_days || 0) * 10) / 10) : null,
+    slowest_days: vel.n ? Math.round((vel.max_days || 0) * 10) / 10 : null,
+    buckets: vel.n ? {
+      same_day:     bucket(0, 1),
+      within_week:  bucket(1, 7),
+      within_month: bucket(7, 30),
+      over_month:   bucket(30, null),
+    } : null,
+  };
+
+  // ── 3. Lost-lead analysis — where COLD leads drop off ─────────────────────
+  const total_cold = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'cold'`).get().n;
+  const groupCold = (col) => db.prepare(`
+    SELECT COALESCE(NULLIF(TRIM(${col}), ''), 'غير محدّد') AS label, COUNT(*) AS count
+    FROM lead_profiles WHERE lead_class = 'cold'
+    GROUP BY label ORDER BY count DESC LIMIT 12
+  `).all();
+  const lostLeads = {
+    total_cold,
+    byCategory: groupCold('last_category'),
+    byBranch:   groupCold('preferred_branch'),
+    byPlatform: groupCold('platform'),
+  };
+
+  // ── 4. Pipeline estimated value — money left on the table ─────────────────
+  const hot  = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'hot'`).get().n;
+  const warm = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'warm'`).get().n;
+  const pipeline = {
+    hot, warm,
+    hot_ticket: HOT_TICKET, warm_ticket: WARM_TICKET,
+    hot_value:  hot * HOT_TICKET,
+    warm_value: warm * WARM_TICKET,
+    total_value: hot * HOT_TICKET + warm * WARM_TICKET,
+  };
+
+  return res.json({ repConversion, velocity, lostLeads, pipeline });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/search?q= — fast global lead lookup for the Ctrl+K command
+// palette. Matches by customer name OR any phone number. Admin-only.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/search', requireAuth, requireRole('admin'), (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ results: [] });
+  const db   = getDb();
+  const like = `%${q}%`;
+  const results = db.prepare(`
+    SELECT lp.user_id, lp.first_name, lp.lead_class,
+      COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                          WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+    FROM lead_profiles lp
+    WHERE lp.first_name LIKE ?
+       OR lp.phone LIKE ?
+       OR lp.user_id IN (SELECT user_id FROM lead_phones WHERE phone LIKE ?)
+    ORDER BY lp.last_activity DESC
+    LIMIT 8
+  `).all(like, like, like);
+  return res.json({ results });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// CSV export — Leads & Contracts as UTF-8 (with BOM, so Arabic opens correctly
+// in Excel). Admin-only. Streams an attachment.
+// ════════════════════════════════════════════════════════════════════════════
+const CSV_BOM = '﻿';
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csvRow = (arr) => arr.map(csvCell).join(',');
+function sendCsv(res, filename, headerRow, rows) {
+  const body = CSV_BOM + [csvRow(headerRow), ...rows.map(csvRow)].join('\r\n') + '\r\n';
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  return res.send(body);
+}
+
+app.get('/api/admin/export/leads.csv', requireAuth, requireRole('admin'), (req, res) => {
+  const db   = getDb();
+  const blm  = branchLabelMap(db);
+  const rows = db.prepare(`
+    SELECT lp.user_id, lp.first_name, lp.lead_class, lp.total_score,
+      lp.preferred_branch, lp.last_category, lp.campaign_source, lp.platform,
+      lp.created_at, lp.last_activity,
+      COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                          WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+    FROM lead_profiles lp
+    ORDER BY lp.created_at DESC
+    LIMIT 50000
+  `).all();
+  const CLASS_AR = { cold: 'بارد', warm: 'دافئ', hot: 'ساخن', visited: 'زار', purchased: 'اشترى' };
+  const out = rows.map((r) => [
+    r.user_id, r.first_name || '', r.phone || '', CLASS_AR[r.lead_class] || r.lead_class || '',
+    r.total_score ?? 0, blm[r.preferred_branch] || r.preferred_branch || '', r.last_category || '',
+    r.campaign_source || '', r.platform || '', r.created_at || '', r.last_activity || '',
+  ]);
+  return sendCsv(res, 'leads-export.csv',
+    ['معرّف العميل', 'الاسم', 'التليفون', 'التصنيف', 'النقاط', 'الفرع', 'آخر فئة',
+     'مصدر الحملة', 'المنصة', 'تاريخ التسجيل', 'آخر نشاط'], out);
+});
+
+app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (req, res) => {
+  const db   = getDb();
+  const blm  = branchLabelMap(db);
+  const rows = db.prepare(`
+    SELECT p.contract_number, p.created_at, p.branch, p.rep,
+      lp.first_name,
+      COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                          WHERE ph.user_id = p.user_id ORDER BY ph.id LIMIT 1)) AS phone
+    FROM purchases p
+    LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
+    ORDER BY p.created_at DESC
+    LIMIT 50000
+  `).all();
+  const out = rows.map((r) => [
+    r.contract_number || '', r.first_name || '', r.phone || '',
+    blm[r.branch] || r.branch || '', r.rep || '', r.created_at || '',
+  ]);
+  return sendCsv(res, 'contracts-export.csv',
+    ['رقم التعاقد', 'العميل', 'التليفون', 'الفرع', 'السيلز', 'تاريخ التعاقد'], out);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/system-health — infrastructure vitals so the admin can spot a
+// growing DB / runaway table before it bites. DB file size, per-table row
+// counts, server uptime & memory. Admin-only.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/system-health', requireAuth, requireRole('admin'), (req, res) => {
+  const fs = require('fs');
+  const db = getDb();
+
+  let db_bytes = null;
+  try { db_bytes = fs.statSync(db.name).size; } catch (_) { /* path may be unavailable */ }
+
+  const TABLES = [
+    'lead_profiles', 'lead_phones', 'lead_visits', 'events', 'purchases',
+    'purchase_items', 'branch_customer_followups', 'followup_log',
+    'revisit_followups', 'users', 'products', 'tasks',
+  ];
+  const tables = {};
+  let total_rows = 0;
+  for (const t of TABLES) {
+    try {
+      const n = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+      tables[t] = n;
+      total_rows += n;
+    } catch (_) { tables[t] = null; }
+  }
+
+  const mem = process.memoryUsage();
+  return res.json({
+    db_bytes,
+    db_mb: db_bytes != null ? Math.round((db_bytes / 1048576) * 100) / 100 : null,
+    total_rows,
+    tables,
+    uptime_seconds: Math.round(process.uptime()),
+    memory_rss_mb: Math.round((mem.rss / 1048576) * 10) / 10,
+    node_version: process.version,
+    now: new Date().toISOString(),
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
