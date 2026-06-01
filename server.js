@@ -4617,6 +4617,68 @@ app.get('/api/admin/system-health', requireAuth, requireRole('admin'), (req, res
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/admin/swap-reps — swap two sales reps: exchange their BRANCH and
+// their PRE-VISIT customer assignments (branch_customer_followups). Each rep
+// ends up in the other's branch holding the other's customer list.
+// Post-visit / revisit ownership is intentionally LEFT UNTOUCHED — it's
+// owner-based (whoever actually served the customer keeps them, per the
+// commission design). Body: { repA, repB } = user ids.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/swap-reps', requireAuth, requireRole('admin'), (req, res) => {
+  const db  = getDb();
+  const aId = req.body?.repA, bId = req.body?.repB;
+  if (!aId || !bId || String(aId) === String(bId)) {
+    return res.status(400).json({ error: 'اختار سيلزين مختلفين' });
+  }
+  const a = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(aId);
+  const b = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(bId);
+  if (!a || !b) return res.status(404).json({ error: 'سيلز مش موجود' });
+  if (!['sales', 'rep'].includes(a.role) || !['sales', 'rep'].includes(b.role)) {
+    return res.status(400).json({ error: 'التبديل للسيلز بس' });
+  }
+  if (a.name.trim() === b.name.trim()) {
+    return res.status(400).json({ error: 'الاتنين بنفس الاسم — مينفعش التبديل' });
+  }
+
+  const countFor = (nm) => db.prepare(`
+    SELECT COUNT(*) AS total,
+      SUM(CASE WHEN COALESCE((SELECT visit_confirmed FROM lead_profiles lp
+            WHERE lp.user_id = branch_customer_followups.user_id), 0) = 0 THEN 1 ELSE 0 END) AS previsit
+    FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(?)`).get(nm);
+  const beforeA = countFor(a.name), beforeB = countFor(b.name);
+
+  const rows_swapped = db.transaction(() => {
+    // CASE swap → atomic, no temp value needed. Only assigned_sales changes, so
+    // each customer keeps their follow-up status, notes and original assign date.
+    const moved = db.prepare(`
+      UPDATE branch_customer_followups
+      SET assigned_sales = CASE WHEN TRIM(assigned_sales) = TRIM(@a) THEN @b ELSE @a END
+      WHERE TRIM(assigned_sales) IN (TRIM(@a), TRIM(@b))
+    `).run({ a: a.name, b: b.name }).changes;
+    // Swap their branch (values captured before the tx).
+    db.prepare(`UPDATE users SET branch = ? WHERE id = ?`).run(b.branch, a.id);
+    db.prepare(`UPDATE users SET branch = ? WHERE id = ?`).run(a.branch, b.id);
+    return moved;
+  })();
+
+  auditLog(db, req.user?.name, 'swap_reps', `${a.id}-${b.id}`, {
+    type: 'swap_reps',
+    a: { id: a.id, name: a.name, branch: a.branch },
+    b: { id: b.id, name: b.name, branch: b.branch },
+  });
+  createNotification(db, 'admin', 'swap_reps',
+    `تم تبديل ${a.name} (${a.branch || '—'}) و ${b.name} (${b.branch || '—'}) وعملائهم قبل الزيارة`);
+
+  const afterA = countFor(a.name), afterB = countFor(b.name);
+  return res.json({
+    ok: true,
+    rows_swapped,
+    a: { name: a.name, old_branch: a.branch, new_branch: b.branch, before: beforeA.total, after: afterA.total, previsit_after: afterA.previsit },
+    b: { name: b.name, old_branch: b.branch, new_branch: a.branch, before: beforeB.total, after: afterB.total, previsit_after: afterB.previsit },
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
 // seedDemoData — fills the عين شمس demo branch with realistic fake data.
 // Called every time demo accounts are (re)generated — fully idempotent.
