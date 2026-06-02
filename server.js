@@ -3374,15 +3374,18 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
 //   post → revisit owned / followed / pending (+ the customers still pending and
 //          the latest revisit notes from revisit_followups)
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/admin/sales-followup-monitor', requireAuth, requireRole('admin'), (req, res) => {
+app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
   const db = getDb();
 
-  // Every showroom rep — include inactive ones too, their history still matters.
-  const reps = db.prepare(`
-    SELECT name, branch FROM users
-    WHERE role IN ('sales', 'rep')
-    ORDER BY branch, name
-  `).all();
+  // Admin sees every showroom rep; a branch manager sees ONLY their own branch's
+  // reps (include inactive ones too — their history still matters).
+  const myBranch = req.user?.role === 'branch_manager' ? (req.user.branch || null) : null;
+  if (req.user?.role === 'branch_manager' && !myBranch) {
+    return res.status(400).json({ error: 'branch_required' });
+  }
+  const reps = myBranch
+    ? db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') AND branch = ? ORDER BY name`).all(myBranch)
+    : db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') ORDER BY branch, name`).all();
 
   // ── PRE-visit (branch_customer_followups, customer not yet visited) ─────────
   const preAgg = db.prepare(`
