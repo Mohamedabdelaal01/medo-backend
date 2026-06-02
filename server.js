@@ -3040,10 +3040,24 @@ app.post('/api/purchases', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'اختار المنتج اللي اشتراه العميل قبل ما تسجّل البيعة' });
   }
 
+  // Branch fallback — never store a branch-less contract (it would be invisible
+  // to every branch manager). If the client didn't send one, use the rep's
+  // current branch, else the customer's most-recent visit branch, else their
+  // preferred branch.
+  let branchVal = (branch && String(branch).trim()) || null;
+  if (!branchVal && rep) {
+    branchVal = db.prepare(`SELECT branch FROM users WHERE TRIM(name) = TRIM(?) LIMIT 1`).get(rep)?.branch || null;
+  }
+  if (!branchVal) {
+    branchVal = db.prepare(`SELECT branch FROM lead_visits WHERE user_id = ? ORDER BY visited_at DESC LIMIT 1`).get(user_id)?.branch
+      || db.prepare(`SELECT preferred_branch FROM lead_profiles WHERE user_id = ?`).get(user_id)?.preferred_branch
+      || null;
+  }
+
   const result = db.prepare(`
     INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(user_id, legacyProductLabel, price || null, branch || null, notes || null, rep,
+  `).run(user_id, legacyProductLabel, price || null, branchVal, notes || null, rep,
          (contract_number && String(contract_number).trim()) || null);
 
   // Link the catalog products to this purchase (many-to-many).
@@ -3072,7 +3086,7 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   createNotification(db, 'admin', 'new_purchase',
     `🎉 تم إغلاق تعاقد جديد (عقد: ${contract_number || '—'}) بقيمة ` +
     `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
-    `${rep || '؟'} في فرع ${branch || '—'}`);
+    `${rep || '؟'} في فرع ${branchVal || '—'}`);
 
   // Event-Triggered Flow: Purchase Made
   const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();

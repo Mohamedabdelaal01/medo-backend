@@ -498,6 +498,32 @@ function initializeDatabase(dbPath = DB_PATH) {
     console.warn('[backfill auto_assigned] skipped:', e.message);
   }
 
+  // ── Backfill: heal branch-less contracts ────────────────────────────────
+  // A purchase recorded without a branch is invisible to every branch manager.
+  // Derive it from the rep's current branch, else the customer's latest visit
+  // branch, else their preferred branch. Idempotent (only touches NULL/empty).
+  try {
+    const healed = db.prepare(`
+      UPDATE purchases
+      SET branch = COALESCE(
+        (SELECT u.branch FROM users u WHERE TRIM(u.name) = TRIM(purchases.rep) AND u.branch IS NOT NULL LIMIT 1),
+        (SELECT v.branch FROM lead_visits v WHERE v.user_id = purchases.user_id AND v.branch IS NOT NULL ORDER BY v.visited_at DESC LIMIT 1),
+        (SELECT lp.preferred_branch FROM lead_profiles lp WHERE lp.user_id = purchases.user_id)
+      )
+      WHERE (branch IS NULL OR TRIM(branch) = '')
+        AND COALESCE(
+          (SELECT u.branch FROM users u WHERE TRIM(u.name) = TRIM(purchases.rep) AND u.branch IS NOT NULL LIMIT 1),
+          (SELECT v.branch FROM lead_visits v WHERE v.user_id = purchases.user_id AND v.branch IS NOT NULL ORDER BY v.visited_at DESC LIMIT 1),
+          (SELECT lp.preferred_branch FROM lead_profiles lp WHERE lp.user_id = purchases.user_id)
+        ) IS NOT NULL
+    `).run();
+    if (healed.changes > 0) {
+      console.log(`✅ Backfill: ${healed.changes} branch-less contract(s) assigned a branch`);
+    }
+  } catch (e) {
+    console.warn('[backfill purchase branch] skipped:', e.message);
+  }
+
   // followup_log: append-only history. One row per COMPLETED follow-up so
   // reassigning a customer to another sales rep never erases what was done
   // before — the old call summaries stay visible in the customer profile.
