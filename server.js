@@ -3556,6 +3556,25 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     LIMIT 500
   `).all(...params);
 
+  // Attach the products on each contract (what the customer actually took), so
+  // the contracts table can show it and the manager can edit it.
+  const ids = contracts.map(c => c.id);
+  if (ids.length) {
+    const ph    = ids.map(() => '?').join(',');
+    const items = db.prepare(`
+      SELECT pi.purchase_id, pr.id, pr.name, pr.category_id
+      FROM purchase_items pi
+      JOIN products pr ON pr.id = pi.product_id
+      WHERE pi.purchase_id IN (${ph})
+      ORDER BY pr.name
+    `).all(...ids);
+    const byPurchase = {};
+    for (const it of items) (byPurchase[it.purchase_id] ||= []).push({ id: it.id, name: it.name });
+    for (const c of contracts) c.products = byPurchase[c.id] || [];
+  } else {
+    for (const c of contracts) c.products = [];
+  }
+
   return res.json({ contracts });
 });
 
@@ -3567,13 +3586,35 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const { price, contract_number } = req.body || {};
+  const { price, contract_number, product_ids } = req.body || {};
   const newNumber = (contract_number && String(contract_number).trim()) || null;
-  db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
-    price != null && price !== '' ? Number(price) : null,
-    newNumber,
-    row.id
-  );
+
+  // Validate the products edit (when provided) BEFORE writing anything. A
+  // contract must keep at least one product (product selection is mandatory).
+  let validIds = null;
+  if (Array.isArray(product_ids)) {
+    const wanted = product_ids.map(v => parseInt(v, 10)).filter(n => Number.isFinite(n) && n > 0);
+    validIds = wanted.filter(id => db.prepare(`SELECT 1 FROM products WHERE id = ?`).get(id));
+    if (!validIds.length) {
+      return res.status(400).json({ error: 'لازم تختار منتج واحد على الأقل' });
+    }
+  }
+
+  db.transaction(() => {
+    db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
+      price != null && price !== '' ? Number(price) : null,
+      newNumber,
+      row.id
+    );
+    if (validIds) {
+      // Replace the product lines wholesale with the new selection.
+      db.prepare(`DELETE FROM purchase_items WHERE purchase_id = ?`).run(row.id);
+      const ins = db.prepare(`INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)`);
+      for (const id of validIds) ins.run(row.id, id);
+      // Keep the legacy single product_id in sync (first item) for older views.
+      db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(validIds[0], row.id);
+    }
+  })();
 
   // Macro alert for the admin war-room.
   createNotification(db, 'admin', 'contract_modified',
