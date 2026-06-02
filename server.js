@@ -2634,6 +2634,20 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
   if (!sales) return res.status(400).json({ error: 'sales_required' });
 
   const db  = getDb();
+
+  // Guard: the chosen rep must actually be an active sales rep IN this branch.
+  // Stops a STALE dropdown (e.g. right after a rep swap, when an open page still
+  // lists a rep who has since moved to another branch) from writing a wrong
+  // assignment — the customer would otherwise land in the wrong rep's list.
+  const repInBranch = db.prepare(
+    `SELECT 1 FROM users WHERE TRIM(name) = TRIM(?) AND role IN ('sales','rep') AND branch = ? AND active = 1`
+  ).get(sales, branch);
+  if (!repInBranch) {
+    return res.status(400).json({
+      error: 'السيلز ده مش في الفرع ده — حدّث الصفحة واختار من القائمة الجديدة',
+    });
+  }
+
   // Full old row — kept for the audit/undo ledger.
   const cur = db.prepare(
     `SELECT * FROM branch_customer_followups WHERE branch = ? AND user_id = ?`
