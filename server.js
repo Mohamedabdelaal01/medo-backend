@@ -1289,13 +1289,31 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
 // Fallback: { visit_code }  (legacy — still works)
 // Returns: { ok, user_id, first_name, campaign_source, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
+// Reception capability is available to receptionists & admins, and — by request
+// — the FAISAL branch manager (who doubles as reception). For a branch manager
+// it's locked to their own branch; any non-Faisal manager is rejected here so
+// the capability can't leak to other branches.
+const RECEPTION_MANAGER_BRANCH = 'faisal';
+function denyNonReceptionManager(req, res) {
+  if (req.user?.role === 'branch_manager' && req.user.branch !== RECEPTION_MANAGER_BRANCH) {
+    res.status(403).json({ error: 'forbidden' });
+    return true;
+  }
+  return false;
+}
+// True for any role that acts as reception locked to its own branch.
+const actsAsReception = (req) =>
+  req.user?.role === 'reception' ||
+  (req.user?.role === 'branch_manager' && req.user.branch === RECEPTION_MANAGER_BRANCH);
+
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
   const { phone, visit_code, branch, user_id } = req.body || {};
   const db = getDb();
   // The receptionist explicitly picks the branch they're at — that is the
   // source of truth for WHICH branch was visited (no guessing from intent).
   // A reception account is LOCKED to its own branch (can't confirm for others).
-  const pickedBranch = req.user?.role === 'reception'
+  const pickedBranch = actsAsReception(req)
     ? (req.user.branch || null)
     : ((typeof branch === 'string' && branch.trim()) ? branch.trim() : null);
 
@@ -1449,9 +1467,9 @@ app.get('/api/customers/:userId/journey', requireAuth,
 // Shows everyone who picked the branch (branch_selected event) even if they
 // haven't visited yet; visited_here flags who already came.
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
-  const role = req.user?.role;
-  const branch = role === 'reception'
+app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const branch = actsAsReception(req)
     ? (req.user.branch || null)
     : (req.query.branch || null);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
@@ -1502,9 +1520,9 @@ app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'
 // GET /api/sales/reps — list showroom salespeople (role='sales').
 //   reception → locked to its own branch. admin → all or ?branch=
 // ════════════════════════════════════════════════════════════════════════════
-app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sales'), (req, res) => {
-  const role = req.user?.role;
-  const branch = role === 'reception' ? (req.user.branch || null) : (req.query.branch || null);
+app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sales', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const branch = actsAsReception(req) ? (req.user.branch || null) : (req.query.branch || null);
   const db = getDb();
   const rows = branch
     ? db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND active=1 AND branch=? ORDER BY name`).all(branch)
@@ -1516,13 +1534,13 @@ app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sa
 // POST /api/visits/set-sales — reception attaches the salesperson who served.
 // Body: { user_id, sales_rep }   (reception → own branch; admin → ?branch)
 // ════════════════════════════════════════════════════════════════════════════
-app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
-  const role = req.user?.role;
+app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
   const { user_id, sales_rep, branch: bodyBranch } = req.body || {};
   if (!user_id || !sales_rep) {
     return res.status(400).json({ error: 'user_id and sales_rep required' });
   }
-  const branch = role === 'reception' ? (req.user.branch || null) : (bodyBranch || null);
+  const branch = actsAsReception(req) ? (req.user.branch || null) : (bodyBranch || null);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const db = getDb();
@@ -1620,11 +1638,11 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
 // purchase logging, follow-up) treats them exactly like an online lead.
 //   reception → locked to own branch. admin → body.branch
 // ════════════════════════════════════════════════════════════════════════════
-app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admin'), (req, res) => {
-  const role = req.user?.role;
+app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
   const { first_name, phone, interest, source, branch: bodyBranch } = req.body || {};
 
-  const branch = role === 'reception' ? (req.user.branch || null) : (bodyBranch || null);
+  const branch = actsAsReception(req) ? (req.user.branch || null) : (bodyBranch || null);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const name = (first_name && String(first_name).trim()) || '';
