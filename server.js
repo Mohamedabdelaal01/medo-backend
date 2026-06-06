@@ -2736,6 +2736,64 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, authorizeRoles(
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/branch/customers/:userId/contact — branch manager / admin fixes a
+// reception customer's NAME and/or PHONE (e.g. a typo taken at the desk). A
+// manager can only edit customers that belong to their own branch.
+// Body: { first_name?, phone? }
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/branch/customers/:userId/contact', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
+  const role = req.user?.role;
+  const { userId } = req.params;
+  const db = getDb();
+
+  const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return res.status(404).json({ error: 'العميل مش موجود' });
+
+  // A manager may only touch customers in their own branch (same universe as the
+  // branch-customers list: a branch_selected event, an assignment, or a visit).
+  if (role === 'branch_manager') {
+    const b = req.user.branch || null;
+    if (!b) return res.status(400).json({ error: 'branch_required' });
+    const inBranch = db.prepare(`
+      SELECT 1 AS ok WHERE
+        EXISTS (SELECT 1 FROM events e WHERE e.user_id = ? AND e.event_type = 'branch_selected' AND (e.event_value = ? OR e.branch = ?))
+        OR EXISTS (SELECT 1 FROM branch_customer_followups f WHERE f.user_id = ? AND f.branch = ?)
+        OR EXISTS (SELECT 1 FROM lead_visits v WHERE v.user_id = ? AND v.branch = ?)
+    `).get(userId, b, b, userId, b, userId, b);
+    if (!inBranch) return res.status(403).json({ error: 'العميل ده مش في فرعك' });
+  }
+
+  const rawName = req.body?.first_name;
+  const rawPhone = req.body?.phone;
+  const name = rawName != null ? String(rawName).trim() : null;
+
+  const updates = [];
+  const params  = [];
+  if (name) { updates.push('first_name = ?'); params.push(name); }
+
+  let np = null;
+  if (rawPhone != null && String(rawPhone).trim() !== '') {
+    np = normalizePhone(rawPhone);
+    // Must be a valid Egyptian mobile (11 digits starting with 01) — this is a
+    // correction tool, so reject obvious garbage like "123".
+    if (!np || !/^01\d{9}$/.test(np)) {
+      return res.status(400).json({ error: 'رقم تليفون غير صحيح — لازم 11 رقم يبدأ بـ 01' });
+    }
+    updates.push('phone = ?'); params.push(np);
+  }
+  if (!updates.length) return res.status(400).json({ error: 'مفيش حاجة تتعدّل' });
+
+  db.transaction(() => {
+    params.push(userId);
+    db.prepare(`UPDATE lead_profiles SET ${updates.join(', ')} WHERE user_id = ?`).run(...params);
+    // Keep the new number in lead_phones too so confirm-by-phone still matches.
+    if (np) db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+  })();
+
+  return res.json({ ok: true, first_name: name || null, phone: np || null });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Sales follow-ups — the sales rep sees customers the branch manager assigned
 // to them, splits pending vs done, and writes a call summary on completion.
 // ════════════════════════════════════════════════════════════════════════════
