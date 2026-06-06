@@ -2827,9 +2827,10 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       f.assigned_at,
       f.sent,
       f.sent_at,
+      lp.visit_at AS visited_at,
       (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
          WHERE ph.user_id = f.user_id)                              AS phones,
-      CASE WHEN EXISTS (
+      CASE WHEN COALESCE(lp.visit_confirmed, 0) = 1 OR EXISTS (
         SELECT 1 FROM lead_visits v
          WHERE v.user_id = f.user_id AND v.branch = f.branch
       ) THEN 1 ELSE 0 END                                          AS visited,
@@ -2840,7 +2841,15 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
     -- shows up as a nameless ghost (the raw walkin_ id) in the rep's list.
     JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
-      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND (
+        -- still pre-visit (the normal case), OR
+        COALESCE(lp.visit_confirmed, 0) = 0
+        -- a customer I followed up who has now VISITED but not bought yet — keep
+        -- showing them in the "تابعتهم وزاروا" tab as a handoff cue (go follow up
+        -- post-visit) instead of silently vanishing.
+        OR (f.followed_up = 1 AND lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+            AND COALESCE(lp.revisit_status, '') != 'lost')
+      )
     ORDER BY f.followed_up ASC, f.assigned_at DESC
   `).all(me);
 
