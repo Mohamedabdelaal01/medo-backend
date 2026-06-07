@@ -2844,10 +2844,11 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       AND (
         -- still pre-visit (the normal case), OR
         COALESCE(lp.visit_confirmed, 0) = 0
-        -- a customer I followed up who has now VISITED but not bought yet — keep
-        -- showing them in the "تابعتهم وزاروا" tab as a handoff cue (go follow up
-        -- post-visit) instead of silently vanishing.
-        OR (f.followed_up = 1 AND lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+        -- the customer has VISITED but not bought/closed yet — surface them in the
+        -- "زاروا المعرض" tab as a handoff cue (go follow up post-visit) instead of
+        -- silently vanishing. Covers BOTH cases: followed-up-then-visited, AND
+        -- visited-before-any-follow-up (walked in cold).
+        OR (lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
             AND COALESCE(lp.revisit_status, '') != 'lost')
       )
     ORDER BY f.followed_up ASC, f.assigned_at DESC
@@ -5056,6 +5057,8 @@ function seedDemoData(db) {
     { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, visited: false, assignedAgo: 4,  summary: null },
     { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
     { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
+    // Walked in & visited BEFORE any pre-visit follow-up → "زار قبل المتابعة".
+    { uid: `${PREFIX}10`, name: 'أيمن خالد',      fu: 0, sent: 0, visited: true,  assignedAgo: 3,  summary: null, visitedAgo: 1 },
   ];
   const insFup = db.prepare(`
     INSERT OR REPLACE INTO branch_customer_followups
