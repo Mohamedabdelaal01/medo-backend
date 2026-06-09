@@ -4845,6 +4845,59 @@ app.post('/api/admin/swap-reps', requireAuth, requireRole('admin'), (req, res) =
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/admin/transfer-rep — move a sales rep to another branch WITHOUT
+// dragging their customers along. Their old-branch PRE-visit customers are
+// released to the unassigned pool (so that branch's manager redistributes them);
+// history (visits, purchases, followup_log) is untouched; post-visit/revisit
+// customers naturally fall under the old branch (owner-based by where they were
+// served). Body: { repId, newBranch }.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/transfer-rep', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const repId = req.body?.repId;
+  const newBranch = (req.body?.newBranch && String(req.body.newBranch).trim()) || null;
+  if (!repId || !newBranch) return res.status(400).json({ error: 'اختار السيلز والفرع الجديد' });
+
+  const rep = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(repId);
+  if (!rep) return res.status(404).json({ error: 'السيلز مش موجود' });
+  if (!['sales', 'rep'].includes(rep.role)) return res.status(400).json({ error: 'النقل للسيلز بس' });
+  if ((rep.branch || null) === newBranch) return res.status(400).json({ error: 'هو أصلاً في الفرع ده' });
+
+  const oldBranch = rep.branch || null;
+
+  const released = db.transaction(() => {
+    // Release the rep's PRE-visit customers in the OLD branch back to the pool
+    // (clear assignment + reset the cycle; prior calls stay in followup_log).
+    const rows = db.prepare(`
+      SELECT f.id FROM branch_customer_followups f
+      JOIN lead_profiles lp ON lp.user_id = f.user_id
+      WHERE TRIM(f.assigned_sales) = TRIM(?)
+        AND f.branch IS ${oldBranch === null ? 'NULL' : '?'}
+        AND COALESCE(lp.visit_confirmed, 0) = 0
+    `).all(...(oldBranch === null ? [rep.name] : [rep.name, oldBranch])).map(r => r.id);
+    if (rows.length) {
+      const ph = rows.map(() => '?').join(',');
+      db.prepare(`
+        UPDATE branch_customer_followups
+        SET assigned_sales = NULL, assigned_by = NULL, auto_assigned = 0,
+            followed_up = 0, followed_up_at = NULL, followed_up_by = NULL, call_summary = NULL
+        WHERE id IN (${ph})
+      `).run(...rows);
+    }
+    db.prepare(`UPDATE users SET branch = ? WHERE id = ?`).run(newBranch, rep.id);
+    return rows.length;
+  })();
+
+  auditLog(db, req.user?.name, 'transfer_rep', String(rep.id), {
+    type: 'transfer_rep', rep: { id: rep.id, name: rep.name }, from: oldBranch, to: newBranch, released,
+  });
+  createNotification(db, 'admin', 'transfer_rep',
+    `تم نقل ${rep.name} من ${oldBranch || '—'} لـ ${newBranch} — ${released} عميل قبل الزيارة رجعوا "مش متوزّع" في الفرع القديم`);
+
+  return res.json({ ok: true, rep: rep.name, from: oldBranch, to: newBranch, released });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
 // seedDemoData — fills the عين شمس demo branch with realistic fake data.
 // Called every time demo accounts are (re)generated — fully idempotent.
