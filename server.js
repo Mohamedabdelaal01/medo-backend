@@ -1290,12 +1290,12 @@ app.get('/api/leads/:user_id', requireAuth, (req, res) => {
 // Returns: { ok, user_id, first_name, campaign_source, lead_class }
 // ════════════════════════════════════════════════════════════════════════════
 // Reception capability is available to receptionists & admins, and — by request
-// — the FAISAL branch manager (who doubles as reception). For a branch manager
-// it's locked to their own branch; any non-Faisal manager is rejected here so
-// the capability can't leak to other branches.
-const RECEPTION_MANAGER_BRANCH = 'faisal';
+// — the branch managers of specific branches (who double as reception). For a
+// branch manager it's locked to their own branch; a manager of any OTHER branch
+// is rejected here so the capability can't leak.
+const RECEPTION_MANAGER_BRANCHES = ['faisal', 'nasr_city'];
 function denyNonReceptionManager(req, res) {
-  if (req.user?.role === 'branch_manager' && req.user.branch !== RECEPTION_MANAGER_BRANCH) {
+  if (req.user?.role === 'branch_manager' && !RECEPTION_MANAGER_BRANCHES.includes(req.user.branch)) {
     res.status(403).json({ error: 'forbidden' });
     return true;
   }
@@ -1304,7 +1304,7 @@ function denyNonReceptionManager(req, res) {
 // True for any role that acts as reception locked to its own branch.
 const actsAsReception = (req) =>
   req.user?.role === 'reception' ||
-  (req.user?.role === 'branch_manager' && req.user.branch === RECEPTION_MANAGER_BRANCH);
+  (req.user?.role === 'branch_manager' && RECEPTION_MANAGER_BRANCHES.includes(req.user.branch));
 
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
