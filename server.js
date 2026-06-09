@@ -2844,15 +2844,24 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       AND (
         -- still pre-visit (the normal case), OR
         COALESCE(lp.visit_confirmed, 0) = 0
-        -- the customer has VISITED but not bought/closed yet — surface them in the
-        -- "زاروا المعرض" tab as a handoff cue (go follow up post-visit) instead of
-        -- silently vanishing. Covers BOTH cases: followed-up-then-visited, AND
-        -- visited-before-any-follow-up (walked in cold).
-        OR (lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
-            AND COALESCE(lp.revisit_status, '') != 'lost')
+        -- the customer VISITED but didn't buy/close yet AND the rep actually
+        -- engaged with them — they FOLLOWED them up, or they SERVED them in the
+        -- showroom. Surfaces them in the "زاروا المعرض" handoff tab. Without the
+        -- engagement check a rep who was merely BULK-assigned hundreds of leads by
+        -- the manager would see every one of those that happened to walk in, even
+        -- ones he never touched (the "42 visited but only served 2" bug).
+        OR (
+          lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+          AND COALESCE(lp.revisit_status, '') != 'lost'
+          AND (
+            f.followed_up = 1
+            OR EXISTS (SELECT 1 FROM lead_visits v
+                       WHERE v.user_id = f.user_id AND TRIM(v.sales_rep) = TRIM(?))
+          )
+        )
       )
     ORDER BY f.followed_up ASC, f.assigned_at DESC
-  `).all(me);
+  `).all(me, me);
 
   return res.json({ branch, customers });
 });
