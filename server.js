@@ -14,7 +14,7 @@ const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./serv
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
-const { sendMetaEvent }    = require('./services/metaCapi');
+const { sendMetaEvent, bulkSyncHistoricalLeads } = require('./services/metaCapi');
 const { getManyChatClient }= require('./manychat/client');
 const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
@@ -4782,6 +4782,47 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
 // growing DB / runaway table before it bites. DB file size, per-table row
 // counts, server uptime & memory. Admin-only.
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/admin/meta/sync-historical — "Pixel warm-up": bulk-send every lead
+// with a valid phone to the Meta CRM dataset as Lead events (batched ×500,
+// sequential). Explicit admin action — awaited so the UI can show real results.
+// Refused for demo sandbox sessions (training data must never reach the ad
+// account). Never crashes: all failures land in the JSON summary.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/meta/sync-historical', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    if (String(req.user?.name || '').startsWith('demo_')) {
+      return res.status(400).json({ error: 'المزامنة مش متاحة من حساب الديمو — دي بيانات تدريب' });
+    }
+    if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) {
+      return res.status(400).json({ error: 'Meta CAPI مش متظبط — حط META_PIXEL_ID و META_ACCESS_TOKEN في إعدادات السيرفر' });
+    }
+
+    const db = getDb();
+    // Every lead that has ANY phone (profile.phone or any lead_phones row).
+    const leads = db.prepare(`
+      SELECT lp.user_id, lp.first_name,
+        COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                            WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+      FROM lead_profiles lp
+      WHERE COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                                WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) IS NOT NULL
+    `).all();
+
+    console.log(`[meta-capi] warm-up started by ${req.user?.name}: ${leads.length} leads with phones`);
+    const result = await bulkSyncHistoricalLeads(leads);
+
+    createNotification(db, 'admin', 'meta_warmup',
+      `Pixel Warm-up: اتبعت ${result.sent} من ${result.eligible} عميل لفيسبوك` +
+      (result.failed_batches ? ` (${result.failed_batches} دفعة فشلت)` : ''));
+
+    return res.json({ ok: result.failed_batches === 0, ...result });
+  } catch (err) {
+    console.error('[meta-capi] warm-up endpoint error:', err.message);
+    return res.status(500).json({ error: 'فشلت المزامنة — راجع لوج السيرفر' });
+  }
+});
+
 app.get('/api/admin/system-health', requireAuth, requireRole('admin'), (req, res) => {
   const fs = require('fs');
   const db = getDb();

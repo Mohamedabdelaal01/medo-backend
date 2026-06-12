@@ -135,4 +135,95 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
   }
 }
 
-module.exports = { sendMetaEvent, hashPhone, API_VERSION };
+/**
+ * Pixel warm-up: bulk-sync historical CRM leads to the Meta dataset.
+ *
+ * Sends every lead as a "Lead" event in batches of 500 (Meta caps `data` at
+ * 1000), SEQUENTIALLY to stay friendly with rate limits. event_time is NOW for
+ * every lead — Meta rejects events older than 7 days, and for audience building
+ * (the whole point of the warm-up) the match matters, not the date.
+ *
+ * event_id reuses the live trigger's format (lead_{user_id}_{phone}) so leads
+ * that already fired a real-time Lead event are DEDUPLICATED by Meta, not
+ * double-counted.
+ *
+ * Unlike sendMetaEvent this IS awaitable (it's an explicit admin action with a
+ * progress UI) — but it still never throws: every failure is captured in the
+ * returned summary.
+ *
+ * @param {Array<{user_id:string, phone:string, first_name?:string}>} leads
+ * @returns {Promise<{configured:boolean,total:number,eligible:number,sent:number,batches:number,failed_batches:number,errors:string[]}>}
+ */
+async function bulkSyncHistoricalLeads(leads = []) {
+  const summary = {
+    configured: !!(process.env.META_PIXEL_ID && process.env.META_ACCESS_TOKEN),
+    total: leads.length, eligible: 0, sent: 0, batches: 0, failed_batches: 0, errors: [],
+  };
+  try {
+    if (!summary.configured) return summary;
+
+    // Build events, dropping leads whose phone can't be hashed to a valid number.
+    const events = [];
+    for (const lead of leads) {
+      const ph = hashPhone(lead.phone);
+      if (!ph) continue;
+      const user_data = { ph: [ph] };
+      const fn = hashText(lead.first_name);
+      if (fn) user_data.fn = [fn];
+      if (lead.user_id) user_data.external_id = [sha256(String(lead.user_id))];
+      events.push({
+        action_source: 'system_generated',
+        custom_data: { event_source: 'crm', lead_event_source: LEAD_EVENT_SOURCE },
+        event_name: 'Lead',
+        event_time: Math.floor(Date.now() / 1000),
+        event_id: `lead_${lead.user_id}_${lead.phone}`,
+        user_data,
+      });
+    }
+    summary.eligible = events.length;
+    if (!events.length) return summary;
+
+    // Chunk into batches of 500 and send sequentially.
+    const BATCH = 500;
+    const url = `https://graph.facebook.com/v25.0/${process.env.META_PIXEL_ID}/events?access_token=${process.env.META_ACCESS_TOKEN}`;
+    const chunks = [];
+    for (let i = 0; i < events.length; i += BATCH) chunks.push(events.slice(i, i + BATCH));
+
+    for (const chunk of chunks) {
+      summary.batches++;
+      try {
+        const body = {
+          data: chunk,
+          ...(process.env.META_TEST_EVENT_CODE
+            ? { test_event_code: process.env.META_TEST_EVENT_CODE } : {}),
+        };
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(30000),
+        });
+        if (res.ok) {
+          const json = await res.json().catch(() => ({}));
+          summary.sent += json.events_received ?? chunk.length;
+          console.log(`[meta-capi] warm-up batch ${summary.batches}/${chunks.length}: ${json.events_received ?? chunk.length} received ✓`);
+        } else {
+          const text = await res.text().catch(() => '');
+          summary.failed_batches++;
+          summary.errors.push(`batch ${summary.batches}: HTTP ${res.status} ${text.slice(0, 200)}`);
+          console.error(`[meta-capi] warm-up batch ${summary.batches} rejected (HTTP ${res.status}): ${text.slice(0, 200)}`);
+        }
+      } catch (err) {
+        summary.failed_batches++;
+        summary.errors.push(`batch ${summary.batches}: ${err.message}`);
+        console.error(`[meta-capi] warm-up batch ${summary.batches} failed: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    summary.errors.push(err.message);
+    console.error(`[meta-capi] warm-up error: ${err.message}`);
+  }
+  return summary;
+}
+
+module.exports = { sendMetaEvent, bulkSyncHistoricalLeads, hashPhone, API_VERSION };
