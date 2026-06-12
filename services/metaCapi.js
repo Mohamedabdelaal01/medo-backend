@@ -174,7 +174,11 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
           const text = await res.text().catch(() => '');
           console.error(`[meta-capi] ${eventName} rejected (HTTP ${res.status}): ${text.slice(0, 300)}`);
         } else {
+          const json = await res.json().catch(() => ({}));
           console.log(`[meta-capi] ${eventName} sent ✓${eventId ? ` (event_id=${eventId})` : ''}`);
+          if (Array.isArray(json.messages) && json.messages.length > 0) {
+            console.warn(`[meta-capi] ⚠️ Meta warnings: ${JSON.stringify(json.messages)}`);
+          }
         }
       })
       .catch((err) => {
