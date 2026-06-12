@@ -1,9 +1,16 @@
 /**
- * Meta (Facebook) Conversions API service.
+ * Meta (Facebook) Conversions API service — CRM (Conversion Leads) integration.
  *
- * Sends offline CRM signals (Lead / Purchase) back to Meta so the ad account
- * can build high-quality Custom & Lookalike Audiences from customers who left
- * phone numbers via ManyChat — closing the offline attribution loop.
+ * Sends offline CRM signals (Lead / Purchase / stage changes) back to Meta so
+ * the ad account can build high-quality Custom & Lookalike Audiences from
+ * customers who left phone numbers via ManyChat — closing the offline loop.
+ *
+ * Follows Meta's official CRM integration spec (v25.0):
+ *   - action_source MUST be "system_generated"
+ *   - custom_data MUST carry { event_source: "crm", lead_event_source: <CRM name> }
+ *   - event_time in UNIX SECONDS
+ *   - user_data.ph MUST be an array of SHA-256 hashes (digits-only, with country
+ *     code, no leading zeros); more identifiers (fn, external_id) improve matching.
  *
  * SAFETY CONTRACT (the most important thing in this file):
  *   sendMetaEvent is STRICTLY fire-and-forget. It never throws, never rejects,
@@ -11,14 +18,15 @@
  *   logs one line and the CRM flow continues untouched. Callers must NOT await
  *   it on the request path.
  *
- * Config (read at call time so a restart isn't needed between edits):
- *   META_PIXEL_ID      — the Pixel / Dataset id
- *   META_ACCESS_TOKEN  — a system-user token with ads_management
+ * Config (read at call time):
+ *   META_PIXEL_ID        — the Dataset (formerly Pixel) id
+ *   META_ACCESS_TOKEN    — a system-user token for the dataset
  *   META_TEST_EVENT_CODE (optional) — routes events to Test Events while wiring
  */
 const crypto = require('crypto');
 
-const GRAPH_VERSION = 'v19.0';
+const API_VERSION = 'v25.0';
+const LEAD_EVENT_SOURCE = 'Grand Furniture CRM';
 const EGYPT_CC = '20';
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -53,49 +61,61 @@ function hashText(raw) {
 }
 
 /**
- * Fire one event to Meta CAPI. Fire-and-forget — see the safety contract.
+ * Fire one CRM event to Meta CAPI. Fire-and-forget — see the safety contract.
  *
- * @param {string} eventName        e.g. 'Lead' | 'Purchase'
- * @param {object} userData         { phone?, firstName?, externalId? } — RAW values; hashed here
- * @param {string} [eventId]        stable id for Meta-side deduplication
- * @param {object} [custom]         optional custom_data (e.g. { currency, value })
+ * @param {string} eventName   critical CRM stage, e.g. 'Lead' | 'Purchase'
+ * @param {object} userData    { phone?, firstName?, externalId?, leadId? } — RAW values; hashed here
+ * @param {string} [eventId]   stable id for Meta-side deduplication
+ * @param {object} [custom]    extra custom_data merged over the required CRM
+ *                             fields (e.g. { currency: 'EGP', value: 0 })
  */
 function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = undefined) {
   try {
-    const pixelId = process.env.META_PIXEL_ID;
-    const token   = process.env.META_ACCESS_TOKEN;
-    if (!pixelId || !token) return; // not configured — silently skip
+    if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) return; // not configured — skip
 
+    // ── user_data: as many matchable identifiers as we have ──────────────────
     const user_data = {};
     const ph = hashPhone(userData.phone);
-    if (ph) user_data.ph = [ph];
+    if (ph) user_data.ph = [ph];                       // MUST be an array of SHA-256
     const fn = hashText(userData.firstName);
     if (fn) user_data.fn = [fn];
     if (userData.externalId) user_data.external_id = [sha256(String(userData.externalId))];
+    // Meta-generated lead id (15-17 digits) when the lead came from a Lead Ad —
+    // highest-priority matcher, sent UNHASHED per spec.
+    if (userData.leadId && /^\d{15,17}$/.test(String(userData.leadId))) {
+      user_data.lead_id = Number(userData.leadId);
+    }
 
-    // Meta requires at least one identifier — without one the event is useless.
-    if (!user_data.ph && !user_data.external_id) return;
+    // At least one identifier or the event can't be matched to anyone.
+    if (!user_data.ph && !user_data.external_id && !user_data.lead_id) return;
 
-    const body = {
-      data: [{
-        event_name: eventName,
-        event_time: Math.floor(Date.now() / 1000),
-        action_source: 'chat', // leads arrive via ManyChat conversations
-        ...(eventId ? { event_id: String(eventId) } : {}),
-        user_data,
-        ...(custom ? { custom_data: custom } : {}),
-      }],
+    // ── exact Meta CRM payload schema ─────────────────────────────────────────
+    const payload = {
+      data: [
+        {
+          action_source: 'system_generated',           // REQUIRED for CRM events
+          custom_data: {
+            event_source: 'crm',                       // REQUIRED, always "crm"
+            lead_event_source: LEAD_EVENT_SOURCE,      // REQUIRED: this CRM's name
+            ...(custom || {}),
+          },
+          event_name: eventName,
+          event_time: Math.floor(Date.now() / 1000),   // UNIX seconds
+          ...(eventId ? { event_id: String(eventId) } : {}),
+          user_data,
+        },
+      ],
       ...(process.env.META_TEST_EVENT_CODE
         ? { test_event_code: process.env.META_TEST_EVENT_CODE } : {}),
     };
 
-    const url = `https://graph.facebook.com/${GRAPH_VERSION}/${pixelId}/events?access_token=${encodeURIComponent(token)}`;
+    const url = `https://graph.facebook.com/v25.0/${process.env.META_PIXEL_ID}/events?access_token=${process.env.META_ACCESS_TOKEN}`;
 
     // Background send — deliberately NOT returned/awaited by callers.
     fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(8000), // never hang a socket forever
     })
       .then(async (res) => {
@@ -115,4 +135,4 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
   }
 }
 
-module.exports = { sendMetaEvent, hashPhone };
+module.exports = { sendMetaEvent, hashPhone, API_VERSION };
