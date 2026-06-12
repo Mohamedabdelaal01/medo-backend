@@ -646,7 +646,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     // Fire-and-forget — never blocks or fails the webhook response.
     if (phoneIns.changes > 0) {
       sendMetaEvent('Lead',
-        { phone: normPhone, firstName: first_name, externalId: user_id },
+        { phone: normPhone, firstName: first_name, lastName: last_name, branch: detectedBranch, gender, externalId: user_id },
         `lead_${user_id}_${normPhone}`);
     }
   }
@@ -4801,7 +4801,7 @@ app.post('/api/admin/meta/sync-historical', requireAuth, requireRole('admin'), a
     const db = getDb();
     // Every lead that has ANY phone (profile.phone or any lead_phones row).
     const leads = db.prepare(`
-      SELECT lp.user_id, lp.first_name,
+      SELECT lp.user_id, lp.first_name, lp.last_name, lp.gender, lp.preferred_branch,
         COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                             WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
       FROM lead_profiles lp
@@ -5597,7 +5597,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-05-20-manychat-enrichment-v1';
+const BUILD_VERSION = '2026-06-13-meta-capi-emq-v2';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',

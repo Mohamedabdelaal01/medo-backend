@@ -31,6 +31,15 @@ const EGYPT_CC = '20';
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
+// Branch canonical key → Meta city string (lowercase, no spaces, per Meta spec)
+const BRANCH_CITY = {
+  nasr_city: 'nasrcity',
+  maadi:     'maadi',
+  helwan:    'helwan',
+  faisal:    'giza',
+  ain_shams: 'ainshams',
+};
+
 /**
  * Normalize + hash a phone for Meta `ph`. Meta requires: digits only, WITH
  * country code, no leading zeros, no symbols — then SHA-256.
@@ -60,6 +69,31 @@ function hashText(raw) {
   return v ? sha256(v) : null;
 }
 
+/** City: lowercase, strip all non-alphanumeric (Meta spec), then SHA-256. */
+function hashCity(raw) {
+  if (raw == null) return null;
+  const v = String(raw).trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  return v ? sha256(v) : null;
+}
+
+/** Split a full name into { first, last } — first word and last word if different. */
+function splitName(full) {
+  const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
+  return {
+    first: parts[0] || null,
+    last:  parts.length > 1 ? parts[parts.length - 1] : null,
+  };
+}
+
+/** Normalize gender to 'm'/'f' that Meta expects, or null. */
+function normalizeGender(raw) {
+  if (!raw) return null;
+  const g = String(raw).toLowerCase().trim();
+  if (g === 'm' || g === 'male')   return 'm';
+  if (g === 'f' || g === 'female') return 'f';
+  return null;
+}
+
 /**
  * Fire one CRM event to Meta CAPI. Fire-and-forget — see the safety contract.
  *
@@ -77,8 +111,25 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
     const user_data = {};
     const ph = hashPhone(userData.phone);
     if (ph) user_data.ph = [ph];                       // MUST be an array of SHA-256
-    const fn = hashText(userData.firstName);
+
+    // Name: split into first/last for higher EMQ
+    const { first: fnRaw, last: flnRaw } = splitName(userData.firstName);
+    const fn = hashText(fnRaw);
     if (fn) user_data.fn = [fn];
+    const lnCandidate = userData.lastName || (flnRaw && flnRaw !== fnRaw ? flnRaw : null);
+    const ln = hashText(lnCandidate);
+    if (ln) user_data.ln = [ln];
+
+    // City from branch + country (always Egypt)
+    const city = BRANCH_CITY[userData.branch] ?? null;
+    const ct = hashCity(city);
+    if (ct) user_data.ct = [ct];
+    user_data.country = [sha256('eg')];
+
+    // Gender when available
+    const ge = normalizeGender(userData.gender);
+    if (ge) user_data.ge = [sha256(ge)];
+
     if (userData.externalId) user_data.external_id = [sha256(String(userData.externalId))];
     // Meta-generated lead id (15-17 digits) when the lead came from a Lead Ad —
     // highest-priority matcher, sent UNHASHED per spec.
@@ -168,8 +219,25 @@ async function bulkSyncHistoricalLeads(leads = []) {
       const ph = hashPhone(lead.phone);
       if (!ph) continue;
       const user_data = { ph: [ph] };
-      const fn = hashText(lead.first_name);
+
+      // Name — split into first/last words for higher EMQ
+      const { first: fnRaw, last: flnRaw } = splitName(lead.first_name);
+      const fn = hashText(fnRaw);
       if (fn) user_data.fn = [fn];
+      const lnCandidate = lead.last_name || (flnRaw && flnRaw !== fnRaw ? flnRaw : null);
+      const ln = hashText(lnCandidate);
+      if (ln) user_data.ln = [ln];
+
+      // City from preferred_branch + country
+      const city = BRANCH_CITY[lead.preferred_branch] ?? null;
+      const ct = hashCity(city);
+      if (ct) user_data.ct = [ct];
+      user_data.country = [sha256('eg')];
+
+      // Gender when available
+      const ge = normalizeGender(lead.gender);
+      if (ge) user_data.ge = [sha256(ge)];
+
       if (lead.user_id) user_data.external_id = [sha256(String(lead.user_id))];
       events.push({
         action_source: 'system_generated',
