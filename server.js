@@ -14,6 +14,7 @@ const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./serv
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
+const { sendMetaEvent }    = require('./services/metaCapi');
 const { getManyChatClient }= require('./manychat/client');
 const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
@@ -637,9 +638,17 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // profile.phone above stays as the latest (quick display); lead_phones is
   // the full set the receptionist can match against.
   if (normPhone) {
-    db.prepare(`
+    const phoneIns = db.prepare(`
       INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)
     `).run(user_id, normPhone);
+    // Meta CAPI "Lead": the moment a ManyChat lead leaves a NEW phone number
+    // (changes=1 → first time we see this phone for them; repeats don't refire).
+    // Fire-and-forget — never blocks or fails the webhook response.
+    if (phoneIns.changes > 0) {
+      sendMetaEvent('Lead',
+        { phone: normPhone, firstName: first_name, externalId: user_id },
+        `lead_${user_id}_${normPhone}`);
+    }
   }
 
   // ── 9. Insert raw event record (with event_id) ────────────────────────
@@ -3176,6 +3185,23 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   `).run(user_id);
 
   console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}`);
+
+  // Meta CAPI "Purchase" — offline conversion back to the ad account so Meta
+  // can optimize toward real buyers. Skipped entirely for demo/training sandbox
+  // sessions (a demo_ user works on the demo DB — never pollute the ad data).
+  // Fire-and-forget — never blocks the response.
+  if (!String(req.user?.name || '').startsWith('demo_')) {
+    const capiPhone = db.prepare(`
+      SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                                 WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
+             lp.first_name
+      FROM lead_profiles lp WHERE lp.user_id = ?
+    `).get(user_id);
+    sendMetaEvent('Purchase',
+      { phone: capiPhone?.phone, firstName: capiPhone?.first_name, externalId: user_id },
+      `purchase_${result.lastInsertRowid}`,
+      { currency: 'EGP', value: Number(price) || 0 });
+  }
 
   // Every purchase → macro alert for the admin war-room.
   createNotification(db, 'admin', 'new_purchase',
