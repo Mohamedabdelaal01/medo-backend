@@ -1696,6 +1696,7 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   const existed = !!lead;
   const userId  = existed ? lead.user_id : `walkin_${crypto.randomUUID()}`;
 
+  let phoneIsNew = false;
   const tx = db.transaction(() => {
     if (existed) {
       // Known customer walking in again — refresh + mark this visit.
@@ -1721,7 +1722,8 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
       `).run(userId, name, np, branch, interestVal, sourceVal);
     }
 
-    db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+    const phoneIns = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+    phoneIsNew = phoneIns.changes > 0;
 
     // A branch_selected event makes the walk-in show up everywhere online
     // leads do (reception list, branch-manager customers, funnels).
@@ -1737,6 +1739,16 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
       .run(userId, branch);
   });
   tx();
+
+  // Meta CAPI "Lead" — walk-ins are real top-of-funnel signals too. Fire only
+  // when this phone is NEW (mirrors the ManyChat path so a known customer
+  // re-visiting never double-counts). reception always picks a branch → we also
+  // get `ct` for free. Fire-and-forget — never blocks or fails the response.
+  if (phoneIsNew) {
+    sendMetaEvent('Lead',
+      { phone: np, firstName: name, branch, externalId: userId },
+      `lead_${userId}_${np}`);
+  }
 
   console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${sourceVal})`);
 
@@ -5617,7 +5629,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-06-13-placeholder-sanitize-v3';
+const BUILD_VERSION = '2026-06-13-walkin-capi-lead-v4';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
