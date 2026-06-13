@@ -5629,7 +5629,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-06-13-walkin-capi-lead-v4';
+const BUILD_VERSION = '2026-06-13-manychat-log-detail-v5';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',

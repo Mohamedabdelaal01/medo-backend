@@ -39,7 +39,11 @@ async function apiCall(endpoint, payload) {
     }
 
     if (!response.ok) {
-      console.error(`[ManyChat] ❌ ${endpoint} → HTTP ${response.status}:`, data);
+      // JSON.stringify so nested validation detail (e.g. details.messages) is
+      // printed in full on one line — Node's console truncates objects to [Object].
+      let detail;
+      try { detail = JSON.stringify(data); } catch { detail = String(data); }
+      console.error(`[ManyChat] ❌ ${endpoint} → HTTP ${response.status}: ${detail}`);
       return { ok: false, data, error: `http_${response.status}` };
     }
     return { ok: true, data, error: null };
