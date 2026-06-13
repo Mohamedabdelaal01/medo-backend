@@ -48,6 +48,17 @@ function normalizePhone(raw) {
   return d;
 }
 
+// ── ManyChat placeholder guard ────────────────────────────────────────────────
+// An unresolved ManyChat field reference arrives as a literal "{{...}}" template
+// token (e.g. "{{gender}}", "{{cuf_14597615}}") — it means the External Request
+// block points at a field that didn't resolve. It's never a real value, so we
+// store NULL instead of polluting the column. Matches a "{{ }}" token ANYWHERE
+// in the string (not just a whole-string match), so partially-broken values
+// like "John {{last_name}}" are caught too.
+function isBrokenPlaceholder(v) {
+  return typeof v === 'string' && /\{\{.*?\}\}/.test(v);
+}
+
 // ── Branch normalization ──────────────────────────────────────────────────────
 // ManyChat sends the same branch under inconsistent ids across different
 // External Request blocks (Arabic free text, English slug, alt spellings like
@@ -360,6 +371,23 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res) => {
   const db = getDb();
 
+  // ── 0. Sanitize unresolved ManyChat placeholders ──────────────────────
+  // Single entry point: null any "{{...}}" token BEFORE the payload is read,
+  // so garbage never reaches a DB column, extra_fields, the event_id dedup key,
+  // or the Meta CAPI payload. user_id and event_type are structural (already
+  // guaranteed non-empty by validatePayload) and left untouched.
+  const PLACEHOLDER_SKIP = new Set(['user_id', 'event_type']);
+  const brokenFields = [];
+  for (const k of Object.keys(req.body || {})) {
+    if (!PLACEHOLDER_SKIP.has(k) && isBrokenPlaceholder(req.body[k])) {
+      brokenFields.push(`${k}=${req.body[k]}`);
+      req.body[k] = null;
+    }
+  }
+  if (brokenFields.length) {
+    console.warn(`[events] nulled broken ManyChat placeholders — user_id=${req.body.user_id}, event=${req.body.event_type}: ${brokenFields.join(', ')}`);
+  }
+
   // ── 1. Extract payload ────────────────────────────────────────────────
   // Validation (required fields, types) is handled upstream by validatePayload.
   const {
@@ -397,16 +425,8 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     return (v === 'instagram' || v === 'facebook') ? v : null;
   })();
 
-  // Detect unresolved ManyChat user_field placeholders (e.g. "{{cuf_14597615}}")
-  // — these mean the External Request reference is wrong on the ManyChat side
-  // and we should treat the value as missing rather than store garbage.
-  const isBrokenPlaceholder = (v) => typeof v === 'string' && /^\{\{[^}]+\}\}$/.test(v.trim());
-  const cleanCampaignSource = isBrokenPlaceholder(campaign_source) ? null : campaign_source;
-  const cleanAdId           = isBrokenPlaceholder(ad_id)           ? null : ad_id;
-  const cleanVisitCode      = isBrokenPlaceholder(visit_code)      ? null : visit_code;
-  if (isBrokenPlaceholder(campaign_source) || isBrokenPlaceholder(ad_id)) {
-    console.warn(`[events] broken placeholder from ManyChat — user_id=${user_id}, event=${event_type}, campaign_source=${campaign_source}, ad_id=${ad_id}`);
-  }
+  // (campaign_source, ad_id, visit_code and every other field were already
+  // stripped of unresolved "{{...}}" placeholders in step 0 above.)
 
   // Canonical phone (used as the reception lookup key — replaces visit code)
   const normPhone = normalizePhone(phone);
@@ -485,7 +505,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     db.prepare(`
       INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone, platform)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(user_id, first_name || 'Unknown', cleanCampaignSource || null, cleanAdId || null, cleanVisitCode || null, normPhone || null, normalizedPlatform);
+    `).run(user_id, first_name || 'Unknown', campaign_source || null, ad_id || null, visit_code || null, normPhone || null, normalizedPlatform);
 
     profile = db.prepare(`
       SELECT * FROM lead_profiles WHERE user_id = ?
@@ -616,9 +636,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     isVisitConfirmed ? 1 : 0,
     isLocationEvent ? 1 : 0,
     isVisitConfirmed ? 1 : 0,  // visit_at — same flag, separate param
-    cleanCampaignSource || null,
-    cleanAdId || null,
-    cleanVisitCode || null,
+    campaign_source || null,
+    ad_id || null,
+    visit_code || null,
     normPhone || null,
     // ManyChat enrichment fields
     last_name || null,
@@ -5597,7 +5617,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-06-13-meta-capi-emq-v2';
+const BUILD_VERSION = '2026-06-13-placeholder-sanitize-v3';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
