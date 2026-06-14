@@ -197,6 +197,12 @@ function initializeDatabase(dbPath = DB_PATH) {
     // platform: which ManyChat channel the lead first contacted us on
     // ('instagram' | 'facebook'). Set once on first event and preserved.
     { col: 'platform',                type: 'TEXT'     },
+    // is_duplicate: the branch manager flags a junk / duplicate lead from the
+    // "عملاء الفرع" view. A flagged lead is EXCLUDED from every sales-rep queue
+    // and KPI (pre-visit list, post-visit/revisit list, served-visits, follow-up
+    // counts) so it never inflates a rep's numbers — but the row itself is kept,
+    // so the flag is fully reversible. 0 = normal, 1 = duplicate.
+    { col: 'is_duplicate',            type: 'INTEGER DEFAULT 0' },
   ];
   for (const { col, type } of o2oColumns) {
     try {
@@ -206,6 +212,13 @@ function initializeDatabase(dbPath = DB_PATH) {
       if (!e.message.includes('duplicate column name')) throw e;
     }
   }
+
+  // Partial index: the duplicate-exclusion subquery only ever looks for the
+  // flagged rows, so index just those (keeps it tiny — duplicates are rare).
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_lead_profiles_is_duplicate
+    ON lead_profiles(user_id) WHERE is_duplicate = 1
+  `);
 
   // ── One-time backfill: existing leads predate the Instagram flow, so all
   // historic ManyChat leads came from Facebook. Idempotent — only fills NULLs.
