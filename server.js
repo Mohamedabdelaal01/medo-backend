@@ -416,6 +416,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     source: manychat_source,
     // platform: 'instagram' or 'facebook' — set per-flow in ManyChat
     platform: rawPlatform,
+    // psid: Messenger Page-Scoped ID — sent for Meta CAPI Advanced Matching so
+    // leads from direct m.me links (no fbclid) still match. Optional.
+    psid,
   } = req.body;
 
   // Normalize platform: lowercase, only accept known values
@@ -665,8 +668,14 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     // (changes=1 → first time we see this phone for them; repeats don't refire).
     // Fire-and-forget — never blocks or fails the webhook response.
     if (phoneIns.changes > 0) {
+      // Advanced Matching: send the Messenger PSID as external_id so leads from
+      // direct m.me links (which carry no fbclid) still match a Meta profile.
+      // Prefer the explicit psid; fall back to user_id (itself the PSID for
+      // Messenger subscribers). If neither resolves, sendMetaEvent just omits
+      // external_id and matches on the phone alone — no error either way.
       sendMetaEvent('Lead',
-        { phone: normPhone, firstName: first_name, lastName: last_name, branch: detectedBranch, gender, externalId: user_id },
+        { phone: normPhone, firstName: first_name, lastName: last_name, branch: detectedBranch, gender,
+          externalId: psid || user_id },
         `lead_${user_id}_${normPhone}`);
     }
   }
