@@ -197,6 +197,9 @@ function initializeDatabase(dbPath = DB_PATH) {
     // platform: which ManyChat channel the lead first contacted us on
     // ('instagram' | 'facebook'). Set once on first event and preserved.
     { col: 'platform',                type: 'TEXT'     },
+    // ig_username: the Instagram handle (@user) for IG leads — shown to the
+    // sales team so they recognize the customer on Instagram.
+    { col: 'ig_username',             type: 'TEXT'     },
     // is_duplicate: the branch manager flags a junk / duplicate lead from the
     // "عملاء الفرع" view. A flagged lead is EXCLUDED from every sales-rep queue
     // and KPI (pre-visit list, post-visit/revisit list, served-visits, follow-up

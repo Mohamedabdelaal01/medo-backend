@@ -419,7 +419,20 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     // psid: Messenger Page-Scoped ID — sent for Meta CAPI Advanced Matching so
     // leads from direct m.me links (no fbclid) still match. Optional.
     psid,
+    // Instagram flow fields (optional): full_name is split into first/last when
+    // first_name/last_name aren't sent; ig_username is the @handle for sales.
+    full_name,
+    ig_username,
   } = req.body;
+
+  // Derive first/last name. Prefer explicit first_name/last_name; otherwise split
+  // full_name → first word = first, the rest = last (matches metaCapi splitName).
+  const nameParts = String(full_name || '').trim().split(/\s+/).filter(Boolean);
+  const effFirstName = (first_name && String(first_name).trim())
+    || (nameParts.length ? nameParts[0] : null);
+  const effLastName  = (last_name && String(last_name).trim())
+    || (nameParts.length > 1 ? nameParts.slice(1).join(' ') : null);
+  const igHandle = (ig_username && String(ig_username).trim()) || null;
 
   // Normalize platform: lowercase, only accept known values
   const normalizedPlatform = (() => {
@@ -442,6 +455,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     'campaign_source','ad_id','visit_code','phone','product','category',
     'last_name','gender','locale','timezone','last_input_text','subscribed_at',
     'growth_tool_id','source','branch','event_id','platform',
+    'full_name','ig_username','psid',
   ]);
   const extraFields = {};
   for (const k of Object.keys(req.body || {})) {
@@ -506,9 +520,9 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   if (!profile) {
     db.prepare(`
-      INSERT INTO lead_profiles (user_id, first_name, campaign_source, ad_id, visit_code, phone, platform)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(user_id, first_name || 'Unknown', campaign_source || null, ad_id || null, visit_code || null, normPhone || null, normalizedPlatform);
+      INSERT INTO lead_profiles (user_id, first_name, last_name, campaign_source, ad_id, visit_code, phone, platform, ig_username)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(user_id, effFirstName || 'Unknown', effLastName || null, campaign_source || null, ad_id || null, visit_code || null, normPhone || null, normalizedPlatform, igHandle);
 
     profile = db.prepare(`
       SELECT * FROM lead_profiles WHERE user_id = ?
@@ -624,11 +638,12 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       growth_tool_id      = COALESCE(growth_tool_id, ?),
       manychat_source     = COALESCE(?, manychat_source),
       platform            = COALESCE(platform, ?),
+      ig_username         = COALESCE(?, ig_username),
       extra_fields        = COALESCE(?, extra_fields),
       last_activity       = datetime('now')
     WHERE user_id = ?
   `).run(
-    first_name || null,
+    effFirstName || null,
     newTotalScore,
     newLeadClass,
     detectedBranch || null,
@@ -644,7 +659,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     visit_code || null,
     normPhone || null,
     // ManyChat enrichment fields
-    last_name || null,
+    effLastName || null,
     gender || null,
     locale || null,
     timezone || null,
@@ -653,6 +668,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     growth_tool_id || null,
     manychat_source || null,
     normalizedPlatform,
+    igHandle,
     extraFieldsJson,
     user_id
   );
@@ -674,7 +690,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       // Messenger subscribers). If neither resolves, sendMetaEvent just omits
       // external_id and matches on the phone alone — no error either way.
       sendMetaEvent('Lead',
-        { phone: normPhone, firstName: first_name, lastName: last_name, branch: detectedBranch, gender,
+        { phone: normPhone, firstName: effFirstName, lastName: effLastName, branch: detectedBranch, gender,
           externalId: psid || user_id },
         `lead_${user_id}_${normPhone}`);
     }
@@ -5290,6 +5306,12 @@ function seedDemoData(db) {
         iso(daysAgo(createdAgo))
       );
       if (l.phone) insPhone.run(l.id, l.phone, iso(daysAgo(10)));
+
+      // Instagram leads carry an @handle for the sales team (demo only).
+      if (srcToPlatform(l.src) === 'instagram') {
+        db.prepare(`UPDATE lead_profiles SET ig_username = ? WHERE user_id = ?`)
+          .run(`cust_${String(l.id).slice(-2)}`, l.id);
+      }
 
       // branch_selected event — makes the lead appear in the reception queue
       insEvent.run(

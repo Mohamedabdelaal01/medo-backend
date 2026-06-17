@@ -76,12 +76,14 @@ function hashCity(raw) {
   return v ? sha256(v) : null;
 }
 
-/** Split a full name into { first, last } — first word and last word if different. */
+/** Split a full name into { first, last }: first word = first, the REST = last
+ *  (e.g. "أحمد محمد علي" → first "أحمد", last "محمد علي"). Matches how IG
+ *  full_name is split before hashing into fn / ln. */
 function splitName(full) {
   const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
   return {
     first: parts[0] || null,
-    last:  parts.length > 1 ? parts[parts.length - 1] : null,
+    last:  parts.length > 1 ? parts.slice(1).join(' ') : null,
   };
 }
 
