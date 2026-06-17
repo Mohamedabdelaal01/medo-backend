@@ -140,20 +140,28 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
     // At least one identifier or the event can't be matched to anyone.
     if (!user_data.ph && !user_data.external_id && !user_data.lead_id) return;
 
-    // ── exact Meta CRM payload schema ─────────────────────────────────────────
+    // ── Meta event payload ────────────────────────────────────────────────────
+    // action_source aligns the server events with the Meta campaign's Conversion
+    // Location ("Website") so leads attribute under Website Leads in Ads Manager,
+    // and event_source_url supplies the matching site. Both are env-overridable so
+    // they can be flipped back to "system_generated" (the CRM Conversion-Leads
+    // value) instantly without a redeploy if attribution doesn't behave.
+    const actionSource    = process.env.META_ACTION_SOURCE || 'website';
+    const eventSourceUrl  = process.env.META_EVENT_SOURCE_URL || 'https://portal.grandfurnitureeg.com';
     const payload = {
       data: [
         {
-          action_source: 'system_generated',           // REQUIRED for CRM events
+          action_source: actionSource,                 // event level (outside user_data)
+          event_source_url: eventSourceUrl,            // event level (outside user_data)
           custom_data: {
-            event_source: 'crm',                       // REQUIRED, always "crm"
-            lead_event_source: LEAD_EVENT_SOURCE,      // REQUIRED: this CRM's name
+            event_source: 'crm',
+            lead_event_source: LEAD_EVENT_SOURCE,
             ...(custom || {}),
           },
           event_name: eventName,
           event_time: Math.floor(Date.now() / 1000),   // UNIX seconds
           ...(eventId ? { event_id: String(eventId) } : {}),
-          user_data,
+          user_data,                                   // Advanced Matching — unchanged (incl. hashed external_id)
         },
       ],
       ...(process.env.META_TEST_EVENT_CODE
