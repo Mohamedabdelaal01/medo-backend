@@ -104,8 +104,12 @@ function normalizeGender(raw) {
  * @param {string} [eventId]   stable id for Meta-side deduplication
  * @param {object} [custom]    extra custom_data merged over the required CRM
  *                             fields (e.g. { currency: 'EGP', value: 0 })
+ * @param {object} [opts]      event-level overrides. opts.actionSource forces the
+ *                             action_source for THIS event (e.g. 'physical_store'
+ *                             for an in-store visit) — defaults to the env value
+ *                             then 'website'.
  */
-function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = undefined) {
+function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = undefined, opts = {}) {
   try {
     if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) return; // not configured — skip
 
@@ -143,18 +147,18 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
     if (!user_data.ph && !user_data.external_id && !user_data.lead_id) return;
 
     // ── Meta event payload ────────────────────────────────────────────────────
-    // action_source aligns the server events with the Meta campaign's Conversion
-    // Location ("Website") so leads attribute under Website Leads in Ads Manager,
-    // and event_source_url supplies the matching site. Both are env-overridable so
-    // they can be flipped back to "system_generated" (the CRM Conversion-Leads
-    // value) instantly without a redeploy if attribution doesn't behave.
-    const actionSource    = process.env.META_ACTION_SOURCE || 'website';
-    const eventSourceUrl  = process.env.META_EVENT_SOURCE_URL || 'https://portal.grandfurnitureeg.com';
+    // action_source: a per-event override (opts.actionSource) wins — e.g.
+    // 'physical_store' for an in-store visit — otherwise the env value, otherwise
+    // 'website' (aligns leads/purchases with the Website Conversion Location).
+    // event_source_url is a WEBSITE-only field, so it's only attached when the
+    // source is actually 'website'; for physical_store it's correctly omitted.
+    const actionSource   = opts.actionSource || process.env.META_ACTION_SOURCE || 'website';
+    const eventSourceUrl = process.env.META_EVENT_SOURCE_URL || 'https://portal.grandfurnitureeg.com';
     const payload = {
       data: [
         {
           action_source: actionSource,                 // event level (outside user_data)
-          event_source_url: eventSourceUrl,            // event level (outside user_data)
+          ...(actionSource === 'website' ? { event_source_url: eventSourceUrl } : {}),
           custom_data: {
             event_source: 'crm',
             lead_event_source: LEAD_EVENT_SOURCE,

@@ -1453,6 +1453,23 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
 
   console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${visitBranch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
+  // Meta CAPI "StoreVisit" — map this confirmed offline showroom visit back to
+  // the customer's online ad click (external_id + phone). Fire-and-forget; never
+  // blocks the reception response. Skipped for demo sessions so training visits
+  // never reach the ad dataset.
+  if (!String(req.user?.name || '').startsWith('demo_')) {
+    const visitPhone = db.prepare(`
+      SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                                 WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+      FROM lead_profiles lp WHERE lp.user_id = ?
+    `).get(lead.user_id)?.phone;
+    sendMetaEvent('StoreVisit',
+      { phone: visitPhone, firstName: lead.first_name, branch: visitBranch, externalId: lead.user_id },
+      `visit_confirm_${lead.user_id}_${Date.now()}`,
+      undefined,
+      { actionSource: 'physical_store' });
+  }
+
   // Event-Triggered Flow: Visit Confirmed
   const visitFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_visit_flow'`).get();
   if (visitFlowSetting && visitFlowSetting.value && visitFlowSetting.value.trim() !== '') {
@@ -1773,6 +1790,17 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
     sendMetaEvent('Lead',
       { phone: np, firstName: name, branch, externalId: userId },
       `lead_${userId}_${np}`);
+  }
+
+  // Meta CAPI "StoreVisit" — a walk-in IS a physical visit, so this fires for
+  // EVERY walk-in (not just new phones; the time-based eventId keeps each visit
+  // distinct). Skipped for demo sessions so training data never hits the dataset.
+  if (!String(req.user?.name || '').startsWith('demo_')) {
+    sendMetaEvent('StoreVisit',
+      { phone: np, firstName: name, branch, externalId: userId },
+      `visit_walkin_${userId}_${Date.now()}`,
+      undefined,
+      { actionSource: 'physical_store' });
   }
 
   console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${sourceVal})`);
