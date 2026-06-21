@@ -3462,8 +3462,7 @@ app.post('/api/purchases', requireAuth, (req, res) => {
     sendMetaEvent('Purchase',
       { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
         gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: user_id },
-      `purchase_${result.lastInsertRowid}`,
-      { currency: 'EGP', value: Number(price) || 0 });
+      `purchase_${result.lastInsertRowid}`);
   }
 
   // Every purchase → macro alert for the admin war-room.
