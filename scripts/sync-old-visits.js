@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * sync-old-visits.js — ONE-TIME backfill of historical in-store visitors to Meta
- * CAPI as `StoreVisit` events (action_source: physical_store), to instantly seed
+ * CAPI as `FindLocation` events (action_source: physical_store), to instantly seed
  * the "Store Visitors" Custom Audience.
  *
  * Run on the Railway server (where META_* env vars are injected):
@@ -53,7 +53,7 @@ async function main() {
   let dispatched = 0;
   for (const v of visitors) {
     sendMetaEvent(
-      'StoreVisit',
+      'FindLocation',
       { phone: v.phone, firstName: v.first_name, branch: v.branch, externalId: v.user_id },
       `visit_hist_${v.user_id}`,            // stable → idempotent re-runs
       undefined,
@@ -70,8 +70,8 @@ async function main() {
   // before the process exits. Per-event delivery is logged by metaCapi above.
   console.log('All dispatched — waiting a few seconds for in-flight requests to drain…');
   await sleep(5000);
-  console.log(`Sync complete! Dispatched ${dispatched} StoreVisit events. ` +
-              `Verify in Events Manager → Dataset (StoreVisit, Action Source = Physical store).`);
+  console.log(`Sync complete! Dispatched ${dispatched} FindLocation events. ` +
+              `Verify in Events Manager → Dataset (FindLocation, Action Source = Physical store).`);
 }
 
 main()
