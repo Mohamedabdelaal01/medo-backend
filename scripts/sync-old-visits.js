@@ -36,6 +36,8 @@ async function main() {
   const visitors = db.prepare(`
     SELECT lp.user_id,
            lp.first_name,
+           lp.last_name,
+           lp.gender,
            COALESCE(lp.phone, ${phoneSub}) AS phone,
            COALESCE(
              (SELECT v.branch FROM lead_visits v WHERE v.user_id = lp.user_id ORDER BY v.visited_at DESC LIMIT 1),
@@ -54,7 +56,8 @@ async function main() {
   for (const v of visitors) {
     sendMetaEvent(
       'FindLocation',
-      { phone: v.phone, firstName: v.first_name, branch: v.branch, externalId: v.user_id },
+      { phone: v.phone, firstName: v.first_name, lastName: v.last_name,
+        gender: v.gender, branch: v.branch, externalId: v.user_id },
       `visit_hist_${v.user_id}`,            // stable → idempotent re-runs
       undefined,
       { actionSource: 'physical_store' },   // omits event_source_url automatically

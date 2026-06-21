@@ -1374,7 +1374,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   let lead = null;
   if (user_id != null && String(user_id).trim() !== '') {
     lead = db.prepare(`
-      SELECT user_id, first_name, campaign_source, lead_class,
+      SELECT user_id, first_name, last_name, gender, campaign_source, lead_class,
              visit_confirmed, preferred_branch
       FROM lead_profiles WHERE user_id = ?
     `).get(String(user_id).trim());
@@ -1395,7 +1395,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     // Fallback: legacy rows whose phone is only on the profile
     if (!lead) {
       lead = db.prepare(`
-        SELECT user_id, first_name, campaign_source, lead_class,
+        SELECT user_id, first_name, last_name, gender, campaign_source, lead_class,
                visit_confirmed, preferred_branch
         FROM lead_profiles WHERE phone = ?
         ORDER BY last_activity DESC LIMIT 1
@@ -1404,7 +1404,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     if (!lead) return res.status(404).json({ error: 'phone_not_found' });
   } else if (visit_code != null && String(visit_code).trim() !== '') {
     lead = db.prepare(`
-      SELECT user_id, first_name, campaign_source, lead_class,
+      SELECT user_id, first_name, last_name, gender, campaign_source, lead_class,
              visit_confirmed, preferred_branch
       FROM lead_profiles WHERE visit_code = ?
     `).get(String(visit_code).trim());
@@ -1464,7 +1464,8 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       FROM lead_profiles lp WHERE lp.user_id = ?
     `).get(lead.user_id)?.phone;
     sendMetaEvent('FindLocation',
-      { phone: visitPhone, firstName: lead.first_name, branch: visitBranch, externalId: lead.user_id },
+      { phone: visitPhone, firstName: lead.first_name, lastName: lead.last_name,
+        gender: lead.gender, branch: visitBranch, externalId: lead.user_id },
       `visit_confirm_${lead.user_id}_${Date.now()}`,
       undefined,
       { actionSource: 'physical_store' });
@@ -3452,14 +3453,15 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   // sessions (a demo_ user works on the demo DB — never pollute the ad data).
   // Fire-and-forget — never blocks the response.
   if (!String(req.user?.name || '').startsWith('demo_')) {
-    const capiPhone = db.prepare(`
+    const capiLead = db.prepare(`
       SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                                  WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
-             lp.first_name
+             lp.first_name, lp.last_name, lp.gender, lp.preferred_branch
       FROM lead_profiles lp WHERE lp.user_id = ?
     `).get(user_id);
     sendMetaEvent('Purchase',
-      { phone: capiPhone?.phone, firstName: capiPhone?.first_name, externalId: user_id },
+      { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
+        gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: user_id },
       `purchase_${result.lastInsertRowid}`,
       { currency: 'EGP', value: Number(price) || 0 });
   }
