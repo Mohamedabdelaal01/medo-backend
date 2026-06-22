@@ -1453,8 +1453,12 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
 
   console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${visitBranch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
-  // Meta CAPI FindLocation — standard event for confirmed showroom visit.
-  // Maps the offline visit back to the customer's online ad click via external_id + phone.
+  // Meta CAPI FindLocation — standard event for a confirmed showroom visit.
+  // Sent with the DEFAULT action_source ('website') — same channel as Lead/
+  // Purchase — so it lands in this Web/CRM dataset's surfaced channel (gets EMQ,
+  // freshness, stats, audience usability). action_source: 'physical_store' was
+  // dropped: it filed the event in the dataset's "offline" bucket, which this
+  // web dataset doesn't surface, so the event kept vanishing from the views.
   // Fire-and-forget; never blocks the reception response.
   // Skipped for demo sessions so training visits never reach the ad dataset.
   if (!String(req.user?.name || '').startsWith('demo_')) {
@@ -1466,9 +1470,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     sendMetaEvent('FindLocation',
       { phone: visitPhone, firstName: lead.first_name, lastName: lead.last_name,
         gender: lead.gender, branch: visitBranch, externalId: lead.user_id },
-      `visit_confirm_${lead.user_id}_${Date.now()}`,
-      undefined,
-      { actionSource: 'physical_store' });
+      `visit_confirm_${lead.user_id}_${Date.now()}`);
   }
 
   // Event-Triggered Flow: Visit Confirmed
@@ -1793,15 +1795,15 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
       `lead_${userId}_${np}`);
   }
 
-  // Meta CAPI FindLocation — standard event for physical showroom walk-in.
-  // Fires for EVERY walk-in; time-based eventId keeps each visit distinct.
-  // Skipped for demo sessions so training data never hits the dataset.
+  // Meta CAPI FindLocation — standard event for a showroom walk-in. Sent with
+  // the DEFAULT action_source ('website') like Lead/Purchase so it stays in this
+  // Web/CRM dataset's surfaced channel (physical_store filed it in the offline
+  // bucket, which kept vanishing). Fires for EVERY walk-in; time-based eventId
+  // keeps each visit distinct. Skipped for demo sessions.
   if (!String(req.user?.name || '').startsWith('demo_')) {
     sendMetaEvent('FindLocation',
       { phone: np, firstName: name, branch, externalId: userId },
-      `visit_walkin_${userId}_${Date.now()}`,
-      undefined,
-      { actionSource: 'physical_store' });
+      `visit_walkin_${userId}_${Date.now()}`);
   }
 
   console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${sourceVal})`);

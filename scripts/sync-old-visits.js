@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * sync-old-visits.js — ONE-TIME backfill of historical in-store visitors to Meta
- * CAPI as `FindLocation` events (action_source: physical_store), to instantly seed
- * the "Store Visitors" Custom Audience.
+ * sync-old-visits.js — backfill of historical in-store visitors to Meta CAPI as
+ * `FindLocation` events, to instantly seed the "Store Visitors" Custom Audience.
  *
  * Run on the Railway server (where META_* env vars are injected):
  *     railway ssh "node /app/scripts/sync-old-visits.js"
  *
  * - Source of truth = physical visits: a `lead_visits` row OR visit_confirmed=1.
- * - Idempotent: a STABLE per-customer event_id (`visit_hist_<user_id>`) means
- *   re-running the script does NOT double-count — Meta deduplicates by event_id.
+ * - Sent with the DEFAULT action_source ('website'), like Lead/Purchase, so the
+ *   events land in this Web/CRM dataset's surfaced channel (EMQ/stats/audience).
+ *   The old `physical_store` override filed them in the dataset's offline bucket,
+ *   which it doesn't surface — so they kept disappearing from the views.
+ * - event_id namespace is `visit_web_<user_id>` (NOT the old `visit_hist_`) so
+ *   this fresh web-channel re-send is NOT deduplicated against the earlier
+ *   physical_store events. Stable within the namespace → idempotent re-runs.
  * - Rate-limit safe: fires one event, then waits DELAY_MS before the next.
- * - Never touches the CRM flow; read-only on the DB. Reuses the live triggers'
- *   exact payload + the `{ actionSource: 'physical_store' }` override (which makes
- *   metaCapi omit event_source_url, since that's a website-only field).
+ * - Never touches the CRM flow; read-only on the DB.
  */
 const { getLiveDb }     = require('../db');
 const { sendMetaEvent } = require('../services/metaCapi');
@@ -58,9 +60,7 @@ async function main() {
       'FindLocation',
       { phone: v.phone, firstName: v.first_name, lastName: v.last_name,
         gender: v.gender, branch: v.branch, externalId: v.user_id },
-      `visit_hist_${v.user_id}`,            // stable → idempotent re-runs
-      undefined,
-      { actionSource: 'physical_store' },   // omits event_source_url automatically
+      `visit_web_${v.user_id}`,             // fresh web-channel namespace; stable → idempotent
     );
     dispatched++;
     if (dispatched % 100 === 0 || dispatched === visitors.length) {
@@ -74,7 +74,7 @@ async function main() {
   console.log('All dispatched — waiting a few seconds for in-flight requests to drain…');
   await sleep(5000);
   console.log(`Sync complete! Dispatched ${dispatched} FindLocation events. ` +
-              `Verify in Events Manager → Dataset (FindLocation, Action Source = Physical store).`);
+              `Verify in Events Manager → Dataset (FindLocation, Web/CRM channel).`);
 }
 
 main()
