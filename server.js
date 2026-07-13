@@ -3832,9 +3832,13 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
     SELECT
       COUNT(*) AS assigned,
       COALESCE(SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END), 0) AS followed,
-      -- attempted: still pending, but the rep DID try to call (customer didn't
-      -- answer). Splits "لسه" into "حاول ولم يرد" vs "لم يحاول خالص".
-      COALESCE(SUM(CASE WHEN f.followed_up = 0 AND COALESCE(f.attempt_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS attempted
+      -- attempted: still pending, but the rep DID try to reach the customer —
+      -- either called with no answer (attempt_count) OR sent the WhatsApp
+      -- outreach (sent=1) and is waiting for a reply. Both are real effort, so
+      -- "لسه" splits into "حاول التواصل" vs "لم يحاول خالص".
+      COALESCE(SUM(CASE WHEN f.followed_up = 0
+        AND (COALESCE(f.attempt_count, 0) > 0 OR COALESCE(f.sent, 0) = 1)
+        THEN 1 ELSE 0 END), 0) AS attempted
     FROM branch_customer_followups f
     JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
@@ -3849,8 +3853,8 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
     WHERE TRIM(f.assigned_sales) = TRIM(?)
       AND COALESCE(lp.visit_confirmed, 0) = 0
       AND f.followed_up = 0
-    -- Attempted-but-unanswered first (they're being worked), then newest.
-    ORDER BY (COALESCE(f.attempt_count, 0) > 0) DESC, f.assigned_at DESC
+    -- Being-worked first (unanswered calls OR sent WhatsApp), then newest.
+    ORDER BY (COALESCE(f.attempt_count, 0) > 0 OR COALESCE(f.sent, 0) = 1) DESC, f.assigned_at DESC
     LIMIT 25
   `);
   const preRecent = db.prepare(`
