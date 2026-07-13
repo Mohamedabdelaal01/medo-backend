@@ -478,6 +478,12 @@ function initializeDatabase(dbPath = DB_PATH) {
     // the rep can see who they've already messaged vs not. Distinct from followed_up.
     { col: 'sent',           type: 'INTEGER NOT NULL DEFAULT 0' },
     { col: 'sent_at',        type: 'DATETIME'                   },
+    // attempt_count / last_attempt_at: "اتصلت — العميل لم يرد". The rep TRIED to
+    // call but the customer didn't answer, so no follow-up could be logged. Kept
+    // separate from followed_up so managers can tell "never called" apart from
+    // "called but customer didn't pick up" (the rep isn't blamed for the latter).
+    { col: 'attempt_count',   type: 'INTEGER NOT NULL DEFAULT 0' },
+    { col: 'last_attempt_at', type: 'DATETIME'                   },
   ]) {
     try {
       db.exec(`ALTER TABLE branch_customer_followups ADD COLUMN ${col} ${type}`);

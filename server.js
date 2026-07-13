@@ -2572,6 +2572,8 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       f.assigned_sales,
       f.assigned_by,
       f.call_summary,
+      COALESCE(f.attempt_count, 0)   AS attempt_count,
+      f.last_attempt_at,
       COALESCE(f.auto_assigned, 0) AS auto_assigned,
       CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited,
       lv.sales_rep AS showroom_rep,
@@ -3098,6 +3100,8 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       f.assigned_at,
       f.sent,
       f.sent_at,
+      COALESCE(f.attempt_count, 0) AS attempt_count,
+      f.last_attempt_at,
       lp.visit_at AS visited_at,
       (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
          WHERE ph.user_id = f.user_id)                              AS phones,
@@ -3196,6 +3200,41 @@ app.patch('/api/sales/followups/:userId/sent', requireAuth, authorizeRoles('sale
   `).run(sent, sent ? new Date().toISOString() : null, userId, me);
 
   return res.json({ ok: true, sent });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/sales/followups/:userId/attempt — the rep records "اتصلت — العميل
+// لم يرد": a real contact ATTEMPT that couldn't become a follow-up because the
+// customer didn't answer. Increments a counter (a customer may be tried several
+// times) + stamps the last attempt, so managers/admin can tell "never called"
+// apart from "called but no answer" instead of blaming the rep for both.
+// Matched by assignee (TRIM) like the other rep endpoints.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/sales/followups/:userId/attempt', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me         = req.user.name;
+  const { userId } = req.params;
+
+  const db  = getDb();
+  const own = db.prepare(`
+    SELECT 1 FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE branch_customer_followups
+       SET attempt_count = COALESCE(attempt_count, 0) + 1, last_attempt_at = ?
+     WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).run(now, userId, me);
+
+  const row = db.prepare(`
+    SELECT COALESCE(attempt_count, 0) AS attempt_count, last_attempt_at
+    FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+
+  return res.json({ ok: true, ...row });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3792,7 +3831,10 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
   const preAgg = db.prepare(`
     SELECT
       COUNT(*) AS assigned,
-      COALESCE(SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END), 0) AS followed
+      COALESCE(SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END), 0) AS followed,
+      -- attempted: still pending, but the rep DID try to call (customer didn't
+      -- answer). Splits "لسه" into "حاول ولم يرد" vs "لم يحاول خالص".
+      COALESCE(SUM(CASE WHEN f.followed_up = 0 AND COALESCE(f.attempt_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS attempted
     FROM branch_customer_followups f
     JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
@@ -3800,13 +3842,15 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
   `);
   const prePending = db.prepare(`
     SELECT f.user_id, lp.first_name, f.assigned_at, f.sent,
+      COALESCE(f.attempt_count, 0) AS attempt_count, f.last_attempt_at,
       (SELECT ph.phone FROM lead_phones ph WHERE ph.user_id = f.user_id ORDER BY ph.id LIMIT 1) AS phone
     FROM branch_customer_followups f
     JOIN lead_profiles lp ON lp.user_id = f.user_id
     WHERE TRIM(f.assigned_sales) = TRIM(?)
       AND COALESCE(lp.visit_confirmed, 0) = 0
       AND f.followed_up = 0
-    ORDER BY f.assigned_at DESC
+    -- Attempted-but-unanswered first (they're being worked), then newest.
+    ORDER BY (COALESCE(f.attempt_count, 0) > 0) DESC, f.assigned_at DESC
     LIMIT 25
   `);
   const preRecent = db.prepare(`
@@ -3851,15 +3895,19 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
   `);
 
   const out = reps.map((r) => {
-    const pa  = preAgg.get(r.name)  || { assigned: 0, followed: 0 };
+    const pa  = preAgg.get(r.name)  || { assigned: 0, followed: 0, attempted: 0 };
     const poa = postAgg.get(r.name) || { total: 0, followed: 0 };
     return {
       sales_rep: r.name,
       branch: r.branch || null,
       pre: {
-        assigned: pa.assigned || 0,
-        followed: pa.followed || 0,
-        pending:  (pa.assigned || 0) - (pa.followed || 0),
+        assigned:  pa.assigned || 0,
+        followed:  pa.followed || 0,
+        // Tried to call but the customer didn't answer (still pending).
+        attempted: pa.attempted || 0,
+        pending:   (pa.assigned || 0) - (pa.followed || 0),
+        // Pending customers the rep never even TRIED to reach.
+        untouched: (pa.assigned || 0) - (pa.followed || 0) - (pa.attempted || 0),
         pending_list: prePending.all(r.name),
         recent:       preRecent.all(r.name),
       },
@@ -5453,18 +5501,20 @@ function seedDemoData(db) {
   // 2 pending (not yet followed up) + 2 done (followed up + visited / not visited)
   // `sent` = the rep ticked "بعت" (sent the first outreach). One pending lead is
   // marked sent, the other not, so the demo shows the checkbox in both states.
+  // `attempts` = "اتصلت — لم يرد": نور الدين has 2 unanswered attempts (worked but
+  // unreachable) while تامر has none (never tried) — shows both pending states.
   const fupData = [
-    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, visited: false, assignedAgo: 6,  summary: null },
-    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, visited: false, assignedAgo: 4,  summary: null },
-    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
-    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
+    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, attempts: 2, visited: false, assignedAgo: 6,  summary: null },
+    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, attempts: 0, visited: false, assignedAgo: 4,  summary: null },
+    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, attempts: 0, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
+    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, attempts: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
     // Walked in & visited BEFORE any pre-visit follow-up → "زار قبل المتابعة".
-    { uid: `${PREFIX}10`, name: 'أيمن خالد',      fu: 0, sent: 0, visited: true,  assignedAgo: 3,  summary: null, visitedAgo: 1 },
+    { uid: `${PREFIX}10`, name: 'أيمن خالد',      fu: 0, sent: 0, attempts: 0, visited: true,  assignedAgo: 3,  summary: null, visitedAgo: 1 },
   ];
   const insFup = db.prepare(`
     INSERT OR REPLACE INTO branch_customer_followups
-      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at, attempt_count, last_attempt_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   db.transaction(() => {
     for (const f of fupData) {
@@ -5478,7 +5528,9 @@ function seedDemoData(db) {
         MANAGER,
         f.summary,
         f.sent ? 1 : 0,
-        f.sent ? iso(daysAgo(f.assignedAgo)) : null
+        f.sent ? iso(daysAgo(f.assignedAgo)) : null,
+        f.attempts || 0,
+        f.attempts ? iso(daysAgo(Math.max(1, f.assignedAgo - 2))) : null
       );
       // if visited after followup, also update lead_profiles
       if (f.visited) {
