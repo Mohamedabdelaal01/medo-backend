@@ -5,7 +5,7 @@
 //   - Hard timeout so a slow provider can never hang a request.
 //   - All config lives in `settings` (admin-editable, no redeploy needed):
 //       zai_api_key   — required; empty = AI features respond "مش متظبط"
-//       zai_model     — default 'glm-4.6' (change to any z.ai model id)
+//       zai_model     — default 'glm-4.7-flash' (free tier; change to any z.ai model id)
 //       zai_base_url  — default z.ai OpenAI-compatible chat endpoint
 //
 // GLM's API is OpenAI-compatible (messages / choices), so swapping providers
@@ -14,7 +14,7 @@
 const { getDb } = require('../db');
 
 const DEFAULT_BASE_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
-const DEFAULT_MODEL    = 'glm-4.6';
+const DEFAULT_MODEL    = 'glm-4.7-flash'; // free tier on z.ai
 const TIMEOUT_MS       = 25000;
 
 function getAiConfig() {
