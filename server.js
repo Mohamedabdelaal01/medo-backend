@@ -15,6 +15,7 @@ const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
 const { sendMetaEvent, bulkSyncHistoricalLeads } = require('./services/metaCapi');
+const { callAi, getAiConfig, extractJson } = require('./services/ai');
 const { getManyChatClient }= require('./manychat/client');
 const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
@@ -2803,7 +2804,8 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
       followed_up    = 0,
       followed_up_at = NULL,
       followed_up_by = NULL,
-      call_summary   = NULL` : ''}
+      call_summary   = NULL,
+      snoozed_until  = NULL` : ''}
   `).run(branch, userId, sales, req.user?.name || null);
 
   auditLog(db, req.user?.name, 'assign_customer', userId, {
@@ -2813,6 +2815,184 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
   });
 
   return res.json({ ok: true, assigned_sales: sales, reset: !!resetCycle });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/branch/customers/bulk-assign — "وزّع تلقائياً": distributes every
+// UNASSIGNED pre-visit customer in the branch across its active sales reps in
+// one shot, balancing against each rep's CURRENT pending load (the rep with
+// the lightest load receives first). Customers are dealt hottest-first so no
+// single rep hoards all the hot leads.
+//
+// Body: { dry_run?: true, branch? (admin) }
+//   dry_run → returns the exact plan (counts per rep) WITHOUT writing.
+// Never steals: only rows with no assigned_sales are touched.
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/branch/customers/bulk-assign', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
+  const branch = branchScopeOf(req);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+  const dryRun = !!req.body?.dry_run;
+  const db = getDb();
+
+  // Active sales reps of this branch + their current pending (pre-visit) load.
+  const reps = db.prepare(`
+    SELECT u.name,
+      (SELECT COUNT(*) FROM branch_customer_followups f
+        JOIN lead_profiles lp ON lp.user_id = f.user_id
+        WHERE TRIM(f.assigned_sales) = TRIM(u.name) AND f.branch = ?
+          AND COALESCE(f.followed_up, 0) = 0
+          AND COALESCE(lp.visit_confirmed, 0) = 0) AS load
+    FROM users u
+    WHERE u.role = 'sales' AND u.active = 1 AND u.branch = ?
+    ORDER BY load ASC, u.name ASC
+  `).all(branch, branch);
+  if (!reps.length) return res.status(400).json({ error: 'مفيش سيلز نشطين في الفرع ده' });
+
+  // Unassigned universe — same driver as /api/branch/customers (requested the
+  // branch + left a phone), still pre-visit, not duplicate, and NO owner yet
+  // (no bcf row for this branch, or a row whose assigned_sales is empty).
+  const customers = db.prepare(`
+    SELECT req.user_id, COALESCE(lp.total_score, 0) AS total_score
+    FROM (
+      SELECT DISTINCT e.user_id
+      FROM events e
+      WHERE e.event_type = 'branch_selected'
+        AND (e.event_value = ? OR e.branch = ?)
+        AND EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = e.user_id)
+    ) req
+    JOIN lead_profiles lp ON lp.user_id = req.user_id
+    LEFT JOIN branch_customer_followups f
+      ON f.user_id = req.user_id AND f.branch = ?
+    WHERE COALESCE(lp.is_duplicate, 0) = 0
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND (f.id IS NULL OR f.assigned_sales IS NULL OR TRIM(f.assigned_sales) = '')
+    ORDER BY total_score DESC
+  `).all(branch, branch, branch);
+
+  // Greedy deal, hottest-first, always to the rep with the smallest running
+  // total — evens out pre-existing imbalance instead of freezing it.
+  const running = reps.map(r => ({ name: r.name, load: r.load, receive: 0 }));
+  const plan = new Map(running.map(r => [r.name, r]));
+  const assignments = [];
+  for (const c of customers) {
+    running.sort((a, b) => (a.load + a.receive) - (b.load + b.receive));
+    const target = running[0];
+    target.receive++;
+    assignments.push({ user_id: c.user_id, rep: target.name });
+  }
+
+  const planOut = [...plan.values()].map(r => ({
+    rep: r.name, current_load: r.load, will_receive: r.receive,
+  }));
+
+  if (dryRun) {
+    return res.json({ ok: true, dry_run: true, branch,
+      unassigned: customers.length, plan: planOut });
+  }
+
+  const upsert = db.prepare(`
+    INSERT INTO branch_customer_followups
+      (branch, user_id, assigned_sales, assigned_at, assigned_by, followed_up, auto_assigned)
+    VALUES (?, ?, ?, datetime('now'), ?, 0, 1)
+    ON CONFLICT(branch, user_id) DO UPDATE SET
+      assigned_sales = excluded.assigned_sales,
+      assigned_at    = excluded.assigned_at,
+      assigned_by    = excluded.assigned_by,
+      auto_assigned  = 1
+    WHERE assigned_sales IS NULL OR TRIM(assigned_sales) = ''
+  `);
+  const by = req.user?.name || 'bulk';
+  let written = 0;
+  db.transaction(() => {
+    for (const a of assignments) {
+      const r = upsert.run(branch, a.user_id, a.rep, by);
+      written += r.changes;
+    }
+  })();
+
+  auditLog(db, req.user?.name, 'bulk_assign', branch, {
+    type: 'bulk_assign', branch, assigned: written, plan: planOut,
+  });
+  createNotification(db, 'admin', 'bulk_assign',
+    `توزيع تلقائي في فرع ${branch}: ${written} عميل اتوزعوا على ${reps.length} سيلز بواسطة ${by}`);
+
+  console.log(`📦 BULK ASSIGN: ${written} customers → ${reps.length} reps @ ${branch} by ${by}`);
+  return res.json({ ok: true, branch, assigned: written, plan: planOut });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/branch/sla-alerts — "الإدارة بالاستثناء": computed on demand (no
+// cron, no schema) so the manager sees ONLY what needs intervention:
+//   hot_untouched — hot/high-score customers assigned >48h with ZERO effort
+//                   (no follow-up, no attempt, no WhatsApp sent)
+//   idle_reps     — reps holding pending customers with no recorded activity
+//                   in the last 24h
+//   visits_today  — reception-confirmed arrivals today (0 on a workday usually
+//                   means reception forgot to confirm, not that nobody came)
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/branch/sla-alerts', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
+  const branch = branchScopeOf(req);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+  const db = getDb();
+
+  const hotUntouched = db.prepare(`
+    SELECT f.user_id, lp.first_name, TRIM(f.assigned_sales) AS rep,
+      COALESCE(lp.total_score, 0) AS total_score,
+      COALESCE(lp.lead_class, 'cold') AS lead_class,
+      f.assigned_at,
+      CAST((julianday('now') - julianday(f.assigned_at)) * 24 AS INTEGER) AS hours_waiting
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE f.branch = ?
+      AND f.assigned_sales IS NOT NULL AND TRIM(f.assigned_sales) != ''
+      AND COALESCE(f.followed_up, 0) = 0
+      AND COALESCE(f.attempt_count, 0) = 0
+      AND COALESCE(f.sent, 0) = 0
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND COALESCE(lp.is_duplicate, 0) = 0
+      AND (lp.lead_class = 'hot' OR COALESCE(lp.total_score, 0) >= 40)
+      AND f.assigned_at <= datetime('now', '-48 hours')
+    ORDER BY lp.total_score DESC
+    LIMIT 25
+  `).all(branch);
+
+  // Idle reps — pending work but no recorded action in 24h. Timestamps are a
+  // mix of ISO-T and SQLite formats, so compare in JS (robust to both).
+  const repRows = db.prepare(`
+    SELECT u.name,
+      (SELECT COUNT(*) FROM branch_customer_followups f
+        JOIN lead_profiles lp ON lp.user_id = f.user_id
+        WHERE TRIM(f.assigned_sales) = TRIM(u.name) AND f.branch = ?
+          AND COALESCE(f.followed_up, 0) = 0
+          AND COALESCE(lp.visit_confirmed, 0) = 0)          AS pending,
+      (SELECT MAX(followed_up_at)  FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(u.name)) AS t1,
+      (SELECT MAX(last_attempt_at) FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(u.name)) AS t2,
+      (SELECT MAX(sent_at)         FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(u.name)) AS t3,
+      (SELECT MAX(created_at)      FROM revisit_followups        WHERE TRIM(followed_up_by) = TRIM(u.name)) AS t4
+    FROM users u
+    WHERE u.role = 'sales' AND u.active = 1 AND u.branch = ?
+  `).all(branch, branch);
+
+  const parseTs = (s) => {
+    if (!s) return 0;
+    const iso = String(s).includes('T') ? s : s.replace(' ', 'T') + 'Z';
+    const t = new Date(iso).getTime();
+    return Number.isFinite(t) ? t : 0;
+  };
+  const dayAgo = Date.now() - 24 * 3600000;
+  const idleReps = repRows
+    .filter(r => r.pending > 0)
+    .map(r => ({ rep: r.name, pending: r.pending,
+      last_action: [r.t1, r.t2, r.t3, r.t4].map(parseTs).reduce((a, b) => Math.max(a, b), 0) }))
+    .filter(r => r.last_action < dayAgo)
+    .map(r => ({ ...r, last_action: r.last_action ? new Date(r.last_action).toISOString() : null }));
+
+  const visitsToday = db.prepare(`
+    SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits
+    WHERE branch = ? AND date(visited_at) = date('now')
+  `).get(branch).n;
+
+  return res.json({ branch, hot_untouched: hotUntouched, idle_reps: idleReps, visits_today: visitsToday });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3102,6 +3282,7 @@ app.get('/api/sales/followups', requireAuth, authorizeRoles('sales'), (req, res)
       f.sent_at,
       COALESCE(f.attempt_count, 0) AS attempt_count,
       f.last_attempt_at,
+      f.snoozed_until,
       lp.visit_at AS visited_at,
       (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
          WHERE ph.user_id = f.user_id)                              AS phones,
@@ -3235,6 +3416,298 @@ app.post('/api/sales/followups/:userId/attempt', requireAuth, authorizeRoles('sa
   `).get(userId, me);
 
   return res.json({ ok: true, ...row });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/sales/followups/:userId/snooze — "اتصل بعدين". The rep defers the
+// customer for N days: hidden from the daily queue until snoozed_until passes,
+// then RESURFACES with a boost (see /api/sales/queue) so nobody is forgotten.
+// Body: { days } — 1..30. days=0 clears the snooze (bring back now).
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/sales/followups/:userId/snooze', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me         = req.user.name;
+  const { userId } = req.params;
+  const days       = parseInt(req.body?.days, 10);
+  if (!Number.isFinite(days) || days < 0 || days > 30) {
+    return res.status(400).json({ error: 'المدة لازم تكون من 0 لـ 30 يوم' });
+  }
+
+  const db  = getDb();
+  const own = db.prepare(`
+    SELECT 1 FROM branch_customer_followups
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).get(userId, me);
+  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+
+  // SQLite datetime format ('YYYY-MM-DD HH:MM:SS', UTC) — NOT ISO-with-T — so
+  // lexical comparison against datetime('now') is always correct. An ISO 'T'
+  // sorts AFTER a space, which silently broke same-day comparisons.
+  const until = days === 0 ? null
+    : new Date(Date.now() + days * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+  db.prepare(`
+    UPDATE branch_customer_followups SET snoozed_until = ?
+    WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+  `).run(until, userId, me);
+
+  return res.json({ ok: true, snoozed_until: until });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/queue — "طابور النهاردة": the rep's TOP pending customers,
+// ranked server-side so the rep executes a short list instead of scanning
+// hundreds. Deterministic + explainable — every entry carries `reasons`.
+//
+//   priority = total_score
+//            + recency bonus     (active <1h +30 / <6h +20 / <24h +10)
+//            + resurface bonus   (+35 snooze just expired, +25 unanswered
+//                                 attempt >48h ago — time to retry)
+//            + task-due bonus    (+40 a pending task for this customer is due
+//                                 today or overdue — merges tasks into the queue)
+//            - staleness penalty (-15 assigned >30 days ago AND still cold)
+//
+// Excludes: visited customers (post-visit flow owns them), duplicates, and
+// customers snoozed into the future. followed_up=1 rows are excluded too —
+// the queue is "who needs a FIRST successful touch today".
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => {
+  const me    = req.user.name;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 5), 50);
+  const db    = getDb();
+
+  const rows = db.prepare(`
+    SELECT
+      f.user_id,
+      lp.first_name,
+      COALESCE(lp.total_score, 0)     AS total_score,
+      COALESCE(lp.lead_class, 'cold') AS lead_class,
+      lp.last_activity,
+      lp.last_category,
+      lp.last_product,
+      lp.last_input_text,
+      f.assigned_at,
+      f.sent, f.sent_at,
+      COALESCE(f.attempt_count, 0) AS attempt_count,
+      f.last_attempt_at,
+      f.snoozed_until,
+      (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph
+         WHERE ph.user_id = f.user_id)                              AS phones,
+      (SELECT MIN(t.due_at) FROM tasks t
+         WHERE t.lead_id = f.user_id AND t.rep_name = ? AND t.status = 'pending'
+           AND t.due_at <= date('now'))                             AS task_due
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE TRIM(f.assigned_sales) = TRIM(?)
+      AND COALESCE(lp.is_duplicate, 0) = 0
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND COALESCE(f.followed_up, 0) = 0
+      -- Normalize legacy ISO-T values before comparing (T sorts after space).
+      AND (f.snoozed_until IS NULL
+           OR datetime(replace(replace(f.snoozed_until,'T',' '),'Z','')) <= datetime('now'))
+  `).all(me, me);
+
+  const now = Date.now();
+  const scored = rows.map((r) => {
+    const reasons = [];
+    let priority  = r.total_score;
+
+    // Recency — reuse the same tiers as the dashboard priority engine.
+    const rec = computeRecencyBonus(r.last_activity);
+    if (rec > 0) { priority += rec; reasons.push(rec >= 20 ? 'نشط دلوقتي 🔥' : 'نشط النهاردة'); }
+
+    // Resurfaced snooze — its date passed, it's DUE now.
+    if (r.snoozed_until) { priority += 35; reasons.push('معاد المتابعة اللي أجّلته'); }
+
+    // Unanswered attempts older than 48h — time to retry.
+    if (r.attempt_count > 0 && r.last_attempt_at) {
+      const hrs = (now - new Date(r.last_attempt_at).getTime()) / 3600000;
+      if (hrs >= 48) { priority += 25; reasons.push(`لم يرد ×${r.attempt_count} — جرّب تاني`); }
+    }
+
+    // A due/overdue task for this customer merges into the queue.
+    if (r.task_due) { priority += 40; reasons.push('عندك مهمة مستحقة معاه 📌'); }
+
+    // Stale cold lead — don't let it crowd out fresh ones.
+    if (r.assigned_at) {
+      const days = (now - new Date(r.assigned_at).getTime()) / 86400000;
+      if (days > 30 && r.total_score < 40) priority -= 15;
+    }
+
+    if (!reasons.length) {
+      reasons.push(r.lead_class === 'hot' ? 'عميل ساخن' :
+                   r.lead_class === 'warm' ? 'عميل دافئ' : 'لسه ما اتلمسش');
+    }
+    return { ...r, priority, reasons };
+  })
+  .sort((a, b) => b.priority - a.priority)
+  .slice(0, limit);
+
+  // How many pending are hidden by an active snooze (for the "مؤجّلين" chip).
+  const snoozedCount = db.prepare(`
+    SELECT COUNT(*) AS n FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE TRIM(f.assigned_sales) = TRIM(?)
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND COALESCE(f.followed_up, 0) = 0
+      AND datetime(replace(replace(f.snoozed_until,'T',' '),'Z','')) > datetime('now')
+  `).get(me).n;
+
+  return res.json({ queue: scored, total_pending: rows.length, snoozed: snoozedCount });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/message-templates — WhatsApp openers the rep can one-tap send via
+// wa.me deep links. Defaults below; the admin can override the whole list by
+// saving a JSON array to settings key 'whatsapp_templates'
+// ([{id,label,text}] — {name} is replaced with the customer's first name).
+// Open to any authenticated user (sales need it constantly).
+// ════════════════════════════════════════════════════════════════════════════
+const DEFAULT_WA_TEMPLATES = [
+  { id: 'intro',   label: 'أول تواصل',
+    text: 'أهلاً {name} 🌟 معاك من جراند للأثاث — شفنا اهتمامك بمعروضاتنا وحابين نساعدك تختار الأنسب. أقدر أعرف إيه اللي كان شادّك أكتر؟' },
+  { id: 'noreply', label: 'بعد ما لم يرد',
+    text: 'أهلاً {name} 👋 حاولنا نتواصل معاك من جراند للأثاث بس يمكن الوقت ما كانش مناسب. لو تحب تعرف تفاصيل أو أسعار، ابعتلنا هنا وهنرد عليك فوراً.' },
+  { id: 'invite',  label: 'دعوة زيارة',
+    text: 'أهلاً {name} 🛋️ تشكيلتنا الجديدة وصلت المعرض — تحب تحجز معاد زيارة تشوفها على الطبيعة؟ هنستناك ومعاك عروض خاصة لزوار المعرض.' },
+  { id: 'revisit', label: 'بعد الزيارة',
+    text: 'أهلاً {name} 🙏 اتشرفنا بزيارتك لجراند للأثاث! لو لسه بتفكر في اللي شفته، قولنا وهنظبطلك أحسن عرض. رأيك يهمنا في كل الأحوال.' },
+];
+
+app.get('/api/message-templates', requireAuth, (req, res) => {
+  let templates = DEFAULT_WA_TEMPLATES;
+  try {
+    const raw = getSetting('whatsapp_templates');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length && parsed.every(t => t && t.text)) {
+        templates = parsed.map((t, i) => ({
+          id: t.id || `custom_${i}`, label: t.label || `قالب ${i + 1}`, text: String(t.text),
+        }));
+      }
+    }
+  } catch (_) { /* bad JSON in settings — serve defaults */ }
+  return res.json({ templates });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/sales/customers/:userId/ai-brief — "ملخص ما قبل المكالمة".
+// Turns the customer's raw history (events, categories, typed text, previous
+// call summaries, unanswered attempts) into a 3-line Arabic brief + a ready
+// WhatsApp draft the rep REVIEWS AND SENDS HIMSELF (never auto-sent).
+//
+// Cached in ai_briefs keyed by a data fingerprint — one paid generation serves
+// everyone until the customer does something new. ?refresh=1 forces regen.
+// RBAC: sales → must own the customer (assigned pre-visit or served the visit);
+//       branch_manager → own-branch customers; admin → anyone.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
+  authorizeRoles('sales', 'branch_manager', 'admin'), async (req, res) => {
+  const { userId } = req.params;
+  const db   = getDb();
+  const role = req.user?.role;
+  const me   = req.user?.name;
+
+  const lead = db.prepare(`SELECT * FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return res.status(404).json({ error: 'العميل مش موجود' });
+
+  // ── RBAC ──────────────────────────────────────────────────────────────────
+  if (role === 'sales') {
+    const owns = db.prepare(`
+      SELECT 1 FROM branch_customer_followups WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
+      UNION SELECT 1 FROM lead_visits WHERE user_id = ? AND TRIM(sales_rep) = TRIM(?)
+    `).get(userId, me, userId, me);
+    if (!owns) return res.status(403).json({ error: 'العميل ده مش مسنود ليك' });
+  } else if (role === 'branch_manager') {
+    if (!req.user.branch || !leadInBranch(db, userId, req.user.branch)) {
+      return res.status(403).json({ error: 'العميل ده مش في فرعك' });
+    }
+  }
+
+  // ── Fingerprint: regenerate only when the underlying data changed ─────────
+  const fp = db.prepare(`
+    SELECT
+      (SELECT MAX(id)    FROM events WHERE user_id = ?)            AS last_event,
+      (SELECT COUNT(*)   FROM events WHERE user_id = ?)            AS ev_n,
+      (SELECT COUNT(*)   FROM followup_log WHERE user_id = ?)      AS fu_n,
+      (SELECT COUNT(*)   FROM revisit_followups WHERE user_id = ?) AS rv_n,
+      (SELECT COALESCE(MAX(attempt_count),0) FROM branch_customer_followups WHERE user_id = ?) AS att_n
+  `).get(userId, userId, userId, userId, userId);
+  const eventsHash = `${fp.last_event || 0}:${fp.ev_n}:${fp.fu_n}:${fp.rv_n}:${fp.att_n}`;
+
+  const cached = db.prepare(`SELECT * FROM ai_briefs WHERE user_id = ?`).get(userId);
+  if (cached && cached.events_hash === eventsHash && req.query.refresh !== '1') {
+    return res.json({ ok: true, cached: true, brief: cached.brief,
+      draft_message: cached.draft_message, updated_at: cached.updated_at });
+  }
+
+  // Fail fast (before gathering) when the key isn't configured.
+  if (!getAiConfig().configured) {
+    return res.status(400).json({ error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API', unconfigured: true });
+  }
+
+  // ── Gather ONLY real data (the prompt forbids inventing anything) ─────────
+  const events = db.prepare(`
+    SELECT event_type, event_value, category, created_at
+    FROM events WHERE user_id = ? ORDER BY created_at DESC LIMIT 15
+  `).all(userId);
+  const fuLog = db.prepare(`
+    SELECT sales, call_summary, followed_up_at
+    FROM followup_log WHERE user_id = ? AND call_summary IS NOT NULL
+    ORDER BY followed_up_at DESC LIMIT 5
+  `).all(userId);
+  const rvLog = db.prepare(`
+    SELECT followed_up_by, note, created_at
+    FROM revisit_followups WHERE user_id = ? AND note IS NOT NULL
+    ORDER BY created_at DESC LIMIT 5
+  `).all(userId);
+  const bcf = db.prepare(`
+    SELECT attempt_count, last_attempt_at, sent FROM branch_customer_followups
+    WHERE user_id = ? ORDER BY id DESC LIMIT 1
+  `).get(userId);
+
+  const CLASS_AR = { cold: 'بارد', warm: 'دافئ', hot: 'ساخن 🔥', visited: 'زار المعرض', purchased: 'اشترى' };
+  const lines = [
+    `الاسم: ${lead.first_name || 'غير معروف'}`,
+    `التصنيف: ${CLASS_AR[lead.lead_class] || lead.lead_class} (نقاط: ${lead.total_score || 0})`,
+    lead.last_category   ? `الفئة اللي بيهتم بيها: ${lead.last_category}` : null,
+    lead.last_product    ? `آخر منتج شافه: ${lead.last_product}` : null,
+    lead.preferred_branch ? `الفرع المفضّل: ${lead.preferred_branch}` : null,
+    lead.platform        ? `جه من: ${lead.platform}` : null,
+    lead.last_input_text ? `آخر حاجة كتبها بنفسه: "${lead.last_input_text}"` : null,
+    bcf?.attempt_count   ? `محاولات اتصال بدون رد: ${bcf.attempt_count} (آخرها ${bcf.last_attempt_at || '؟'})` : null,
+    bcf?.sent            ? `اتبعتله رسالة واتساب قبل كده` : null,
+    events.length ? `آخر تحركاته:\n${events.map(e =>
+      `- ${e.created_at}: ${e.event_type}${e.event_value ? ` (${e.event_value})` : ''}${e.category ? ` [${e.category}]` : ''}`).join('\n')}` : null,
+    fuLog.length ? `ملخصات مكالمات سابقة:\n${fuLog.map(f => `- ${f.sales || '؟'}: ${f.call_summary}`).join('\n')}` : null,
+    rvLog.length ? `متابعات بعد الزيارة:\n${rvLog.map(f => `- ${f.followed_up_by || '؟'}: ${f.note}`).join('\n')}` : null,
+  ].filter(Boolean).join('\n');
+
+  const result = await callAi([
+    { role: 'system', content:
+      'انت مساعد مبيعات لمعرض أثاث في مصر. بتجهّز السيلز قبل ما يكلم العميل. ' +
+      'اعتمد فقط وحصرياً على المعلومات المكتوبة — ممنوع تخترع أي معلومة مش موجودة. ' +
+      'رد بـ JSON فقط بالشكل ده: {"brief": "...", "draft": "..."} — ' +
+      'brief = ملخص 2-3 سطور بالعامية المصرية: مين العميل، مهتم بإيه، وإيه أحسن مدخل للكلام معاه. ' +
+      'draft = رسالة واتساب قصيرة وودودة بالعامية (سطرين بالكتير) مناسبة لحالته، من غير مبالغة ومن غير وعود بأسعار.' },
+    { role: 'user', content: lines },
+  ], { maxTokens: 450 });
+
+  if (!result.ok) {
+    return res.status(result.unconfigured ? 400 : 502).json({ error: result.error, unconfigured: !!result.unconfigured });
+  }
+
+  const parsed = extractJson(result.text);
+  const brief  = (parsed?.brief && String(parsed.brief).trim()) || result.text.slice(0, 600);
+  const draft  = (parsed?.draft && String(parsed.draft).trim()) || null;
+
+  db.prepare(`
+    INSERT INTO ai_briefs (user_id, brief, draft_message, events_hash, model, updated_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(user_id) DO UPDATE SET
+      brief = excluded.brief, draft_message = excluded.draft_message,
+      events_hash = excluded.events_hash, model = excluded.model, updated_at = excluded.updated_at
+  `).run(userId, brief, draft, eventsHash, result.model);
+
+  return res.json({ ok: true, cached: false, brief, draft_message: draft });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5507,8 +5980,10 @@ function seedDemoData(db) {
   // marked sent, the other not, so the demo shows the checkbox in both states.
   // `attempts` = "اتصلت — لم يرد": نور الدين has 2 unanswered attempts (worked but
   // unreachable) while تامر has none (never tried) — shows both pending states.
+  // `snoozeAgo` = snoozed_until N days AGO → already expired, so the demo queue
+  // shows the "معاد المتابعة اللي أجّلته" resurfacing badge on نور الدين.
   const fupData = [
-    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, attempts: 2, visited: false, assignedAgo: 6,  summary: null },
+    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, attempts: 2, snoozeAgo: 1, visited: false, assignedAgo: 6,  summary: null },
     { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, attempts: 0, visited: false, assignedAgo: 4,  summary: null },
     { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, attempts: 0, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
     { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, attempts: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
@@ -5517,8 +5992,8 @@ function seedDemoData(db) {
   ];
   const insFup = db.prepare(`
     INSERT OR REPLACE INTO branch_customer_followups
-      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at, attempt_count, last_attempt_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at, attempt_count, last_attempt_at, snoozed_until)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   db.transaction(() => {
     for (const f of fupData) {
@@ -5534,7 +6009,8 @@ function seedDemoData(db) {
         f.sent ? 1 : 0,
         f.sent ? iso(daysAgo(f.assignedAgo)) : null,
         f.attempts || 0,
-        f.attempts ? iso(daysAgo(Math.max(1, f.assignedAgo - 2))) : null
+        f.attempts ? iso(daysAgo(Math.max(1, f.assignedAgo - 2))) : null,
+        f.snoozeAgo ? iso(daysAgo(f.snoozeAgo)) : null
       );
       // if visited after followup, also update lead_profiles
       if (f.visited) {

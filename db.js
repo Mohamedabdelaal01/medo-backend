@@ -484,6 +484,10 @@ function initializeDatabase(dbPath = DB_PATH) {
     // "called but customer didn't pick up" (the rep isn't blamed for the latter).
     { col: 'attempt_count',   type: 'INTEGER NOT NULL DEFAULT 0' },
     { col: 'last_attempt_at', type: 'DATETIME'                   },
+    // snoozed_until: "اتصل بعدين" — the rep defers this customer to a later date.
+    // While in the future the customer is hidden from the daily queue; once the
+    // date passes they RESURFACE with a boost (never silently forgotten).
+    { col: 'snoozed_until',   type: 'DATETIME'                   },
   ]) {
     try {
       db.exec(`ALTER TABLE branch_customer_followups ADD COLUMN ${col} ${type}`);
@@ -661,6 +665,22 @@ function initializeDatabase(dbPath = DB_PATH) {
       sends_this_week  INTEGER NOT NULL DEFAULT 0,
       week_anchor      TEXT,
       last_sent_at     DATETIME
+    );
+  `);
+
+  // ai_briefs: cached AI-generated pre-call briefs per customer. events_hash
+  // fingerprints the data the brief was built from (latest event id + counts) —
+  // when it changes the brief is stale and regenerated on next request. Keeping
+  // it in the DB means one generation serves every rep/manager who opens the
+  // customer, and a Railway redeploy doesn't wipe paid AI output.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ai_briefs (
+      user_id       TEXT PRIMARY KEY,
+      brief         TEXT,
+      draft_message TEXT,
+      events_hash   TEXT,
+      model         TEXT,
+      updated_at    DATETIME NOT NULL DEFAULT (datetime('now'))
     );
   `);
 
