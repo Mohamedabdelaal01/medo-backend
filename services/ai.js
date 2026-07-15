@@ -42,54 +42,68 @@ function getAiConfig() {
  *   the reply may come back as toolCalls instead of / alongside text.
  * @returns {Promise<{ok:true,text:string,toolCalls:Array|null,model:string}|{ok:false,error:string,unconfigured?:true}>}
  */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function callAi(messages, opts = {}) {
   const { key, model, baseUrl, configured } = getAiConfig();
   if (!configured) {
     return { ok: false, unconfigured: true,
       error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API' };
   }
-  try {
-    const body = {
-      model,
-      messages,
-      temperature: opts.temperature ?? 0.4,
-      max_tokens:  opts.maxTokens ?? 2000,
-      thinking: { type: opts.thinking === false ? 'disabled' : 'enabled' },
-    };
-    if (opts.tools) {
-      body.tools = opts.tools;
-      body.tool_choice = opts.toolChoice ?? 'auto';
+  const body = {
+    model,
+    messages,
+    temperature: opts.temperature ?? 0.4,
+    max_tokens:  opts.maxTokens ?? 2000,
+    thinking: { type: opts.thinking === false ? 'disabled' : 'enabled' },
+  };
+  if (opts.tools) {
+    body.tools = opts.tools;
+    body.tool_choice = opts.toolChoice ?? 'auto';
+  }
+
+  // The free tier rate-limits (429) and occasionally 500s under bursty load —
+  // both transient, so retry those a couple of times with backoff. A client
+  // timeout is NOT retried: a slow/hung request is likely to hang again, and
+  // doubling the wait doesn't help the caller.
+  const maxAttempts = opts.retries ?? 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${key}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        console.error(`[ai] HTTP ${res.status} (attempt ${attempt}/${maxAttempts}): ${text.slice(0, 300)}`);
+        if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts) {
+          await sleep(attempt * 4000);
+          continue;
+        }
+        return { ok: false, error: `مزوّد الذكاء الاصطناعي رفض الطلب (HTTP ${res.status}) — راجع المفتاح واسم الموديل في الإعدادات` };
+      }
+      const json    = await res.json().catch(() => null);
+      const msg     = json?.choices?.[0]?.message;
+      const toolCalls = msg?.tool_calls?.length ? msg.tool_calls : null;
+      const text    = msg?.content;
+      // When the model requests a tool call, `content` is legitimately empty —
+      // only treat empty content as an error when there's no tool call either.
+      if (!toolCalls && (!text || typeof text !== 'string')) {
+        return { ok: false, error: 'رد غير متوقع من مزوّد الذكاء الاصطناعي' };
+      }
+      return { ok: true, text: (text || '').trim(), toolCalls, model };
+    } catch (err) {
+      const msg = err?.name === 'TimeoutError'
+        ? 'مزوّد الذكاء الاصطناعي بطيء جداً — حاول تاني'
+        : `تعذّر الاتصال بمزوّد الذكاء الاصطناعي: ${err.message}`;
+      console.error(`[ai] ${err.message}`);
+      return { ok: false, error: msg };
     }
-    const res = await fetch(baseUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${key}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.error(`[ai] HTTP ${res.status}: ${text.slice(0, 300)}`);
-      return { ok: false, error: `مزوّد الذكاء الاصطناعي رفض الطلب (HTTP ${res.status}) — راجع المفتاح واسم الموديل في الإعدادات` };
-    }
-    const json    = await res.json().catch(() => null);
-    const msg     = json?.choices?.[0]?.message;
-    const toolCalls = msg?.tool_calls?.length ? msg.tool_calls : null;
-    const text    = msg?.content;
-    // When the model requests a tool call, `content` is legitimately empty —
-    // only treat empty content as an error when there's no tool call either.
-    if (!toolCalls && (!text || typeof text !== 'string')) {
-      return { ok: false, error: 'رد غير متوقع من مزوّد الذكاء الاصطناعي' };
-    }
-    return { ok: true, text: (text || '').trim(), toolCalls, model };
-  } catch (err) {
-    const msg = err?.name === 'TimeoutError'
-      ? 'مزوّد الذكاء الاصطناعي بطيء جداً — حاول تاني'
-      : `تعذّر الاتصال بمزوّد الذكاء الاصطناعي: ${err.message}`;
-    console.error(`[ai] ${err.message}`);
-    return { ok: false, error: msg };
   }
 }
 

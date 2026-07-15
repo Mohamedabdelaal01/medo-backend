@@ -3866,7 +3866,7 @@ app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, re
       maxTokens: 2500,
       temperature: 0.3,
       tools: [ADMIN_SQL_TOOL],
-      timeoutMs: 55000,
+      timeoutMs: 90000,
     });
 
     if (!result.ok) {
