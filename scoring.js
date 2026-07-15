@@ -135,25 +135,29 @@ function computeDecayedScore(totalScore, lastActivity, decay, nowMs = Date.now()
 }
 
 /**
- * Classify a lead based on total score and flags.
+ * Classify a lead based strictly on earned total score and flags.
  * 'purchased' is NEVER returned here — it is set directly by the purchases route.
+ *
+ * A lead's tier is dictated ONLY by score — requesting a branch location is a
+ * real high-intent signal but does NOT upgrade the tier by itself (it used to,
+ * via a score>=40 override; that mixed a 40-point window-shopper with a
+ * genuinely 75+ engaged lead under the same "hot" label, diluting sales
+ * reps' focus — measured at ~1.2% real conversion for that inflated bucket).
+ * location_requested is still recorded on the lead and should be shown as a
+ * separate UI flag (📍) so reps see the signal without it distorting the tier.
+ *
  * @param {number}  totalScore
  * @param {boolean} visitConfirmed
- * @param {boolean} locationRequested
  * @param {string}  currentClass  — pass existing class so purchased leads are never downgraded
  * @param {{warm:number,hot:number}} [thresholds] - defaults to DEFAULT_THRESHOLDS
  * @returns {string} 'cold' | 'warm' | 'hot' | 'visited' | 'purchased' (preserved)
  */
-function classifyLead(totalScore, visitConfirmed = false, locationRequested = false, currentClass = '', thresholds = DEFAULT_THRESHOLDS) {
+function classifyLead(totalScore, visitConfirmed = false, currentClass = '', thresholds = DEFAULT_THRESHOLDS) {
   // Purchased is terminal — never downgrade a buyer
   if (currentClass === 'purchased') return 'purchased';
 
   // Visit confirmed → visited (was 'converted' in v1; legacy rows still read as converted)
   if (visitConfirmed) return 'visited';
-
-  // Location requested means at minimum HOT — strongest intent signal short of visit.
-  // This literal 40 is independent of the configurable hot/warm thresholds.
-  if (locationRequested && totalScore >= 40) return 'hot';
 
   if (totalScore >= thresholds.hot)  return 'hot';
   if (totalScore >= thresholds.warm) return 'warm';
@@ -192,19 +196,9 @@ function processScore(profile, eventType, eventValue, alreadyScored = false, con
 
   const visitConfirmed  = eventType === 'visit_confirmed' || profile.visit_confirmed === 1;
 
-  // Must match the isLocationEvent list in server.js exactly.
-  // entry_location was missing here, causing an inconsistency:
-  // server.js wrote location_requested=1 to DB for entry_location,
-  // but this function did not treat it as a location event during classification.
-  const locationRequested = eventType === 'location_request'
-    || eventType === 'branch_selected'
-    || eventType === 'entry_location'
-    || profile.location_requested === 1;
-
   const newLeadClass = classifyLead(
     newTotalScore,
     visitConfirmed,
-    locationRequested,
     profile.lead_class || '',   // preserve 'purchased' / 'visited' from DB
     thresholds
   );

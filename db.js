@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { classifyLead } = require('./scoring');
 
 // ── Persistent DB path resolution ─────────────────────────────────────────
 // Priority:
@@ -878,6 +879,35 @@ function initializeDatabase(dbPath = DB_PATH) {
     `).run();
     db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('scoring_settings_v2', '1', datetime('now'))`).run();
     console.log('✅ Migration: normalized dead scoring thresholds to match live behavior (warm=31, hot=75)');
+  }
+
+  // ── One-time backfill: retire the location-request hot override ─────────
+  // classifyLead() used to grant 'hot' to any lead with total_score>=40 who
+  // had requested a branch location — mixing a 40-point window-shopper with
+  // a genuinely 75+ engaged lead under the same label (measured ~1.2% real
+  // conversion for the inflated bucket). The override is now removed from
+  // scoring.js, but lead_class only updates when a NEW event arrives — a
+  // stored 'hot' row doesn't fix itself. Backfill once so this ships
+  // corrected immediately rather than gradually as leads happen to re-engage.
+  const scoringV3 = db.prepare(`SELECT value FROM settings WHERE key = 'scoring_settings_v3'`).get();
+  if (!scoringV3) {
+    const hotRow  = db.prepare(`SELECT value FROM settings WHERE key = 'scoring_hot_threshold'`).get();
+    const warmRow = db.prepare(`SELECT value FROM settings WHERE key = 'scoring_warm_threshold'`).get();
+    const thresholds = {
+      hot:  parseInt(hotRow?.value, 10)  || 75,
+      warm: parseInt(warmRow?.value, 10) || 31,
+    };
+    const candidates = db.prepare(`
+      SELECT user_id, total_score, visit_confirmed FROM lead_profiles WHERE lead_class = 'hot'
+    `).all();
+    const updateClass = db.prepare(`UPDATE lead_profiles SET lead_class = ? WHERE user_id = ?`);
+    let demoted = 0;
+    for (const row of candidates) {
+      const newClass = classifyLead(row.total_score, row.visit_confirmed === 1, 'hot', thresholds);
+      if (newClass !== 'hot') { updateClass.run(newClass, row.user_id); demoted++; }
+    }
+    db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('scoring_settings_v3', '1', datetime('now'))`).run();
+    console.log(`✅ Migration: reclassified ${demoted} lead(s) previously marked hot only via the retired location-request override`);
   }
 
   console.log('✅ Database initialized at:', dbPath);

@@ -3482,6 +3482,7 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
       lp.first_name,
       COALESCE(lp.total_score, 0)     AS total_score,
       COALESCE(lp.lead_class, 'cold') AS lead_class,
+      lp.location_requested,
       lp.last_activity,
       lp.last_category,
       lp.last_product,
@@ -6842,8 +6843,7 @@ function runScoreDecayForDb(db) {
   if (!config.decay.enabled) return;
 
   const rows = db.prepare(`
-    SELECT user_id, first_name, total_score, lead_class, last_activity,
-           visit_confirmed, location_requested
+    SELECT user_id, first_name, total_score, lead_class, last_activity, visit_confirmed
     FROM lead_profiles
     WHERE lead_class IN ('warm','hot')
       AND last_activity < datetime('now', '-' || ? || ' days')
@@ -6854,7 +6854,6 @@ function runScoreDecayForDb(db) {
     const newClass = classifyLead(
       decayedScore,
       row.visit_confirmed === 1,
-      row.location_requested === 1,
       row.lead_class,
       config.thresholds
     );
