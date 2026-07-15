@@ -744,6 +744,7 @@ function initializeDatabase(dbPath = DB_PATH) {
     CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at);
     CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases(created_at);
     CREATE INDEX IF NOT EXISTS idx_events_branch_type ON events(branch, event_type);
+    CREATE INDEX IF NOT EXISTS idx_lead_profiles_class_activity ON lead_profiles(lead_class, last_activity);
   `);
 
   // ── Seed default admin (idempotent) ───────────────────────────────────────
@@ -774,9 +775,28 @@ function initializeDatabase(dbPath = DB_PATH) {
     ['manychat_flow_reengage',     ''],   // warm/hot lead inactive ≥ 3 days
     ['openai_api_key',             ''],
     ['facebook_pixel_id',      ''],
-    ['scoring_hot_threshold',  '40'],
-    ['scoring_warm_threshold', '15'],
+    ['scoring_hot_threshold',  '75'],
+    ['scoring_warm_threshold', '31'],
     ['lead_expiry_days',       '30'],
+    // Per-event scoring rules — admin-editable list mirroring scoring.js's
+    // DEFAULT_SCORE_MAP. Read by scoring.getScoringConfig(); falls back to
+    // the hardcoded defaults if this row is missing/corrupt.
+    ['scoring_rules', JSON.stringify([
+      { event_type: 'entry_offer',      points: 5,   active: true },
+      { event_type: 'entry_catalog',    points: 5,   active: true },
+      { event_type: 'category_request', points: 10,  active: true },
+      { event_type: 'entry_location',   points: 10,  active: true },
+      { event_type: 'product_details',  points: 20,  active: true },
+      { event_type: 'contact_request',  points: 15,  active: true },
+      { event_type: 'branch_selected',  points: 30,  active: true },
+      { event_type: 'location_request', points: 40,  active: true },
+      { event_type: 'visit_confirmed',  points: 100, active: true },
+      { event_type: 'map_click',        points: 25,  active: true },
+    ])],
+    // Score decay for dormant leads — off by default (zero behavior change
+    // until an admin opts in). See scoring.computeDecayedScore.
+    ['scoring_decay_enabled',           'false'],
+    ['scoring_decay_points_per_day',    '2'],
     // Webhook security — secret is auto-generated below; enforcement is opt-in
     // so existing ManyChat setups don't break the moment this ships.
     ['webhook_enforce',        'false'],
@@ -839,6 +859,25 @@ function initializeDatabase(dbPath = DB_PATH) {
         console.log('✅ Migrated active_branches to {id,name}[] format');
       }
     } catch (_) {}
+  }
+
+  // ── One-time correction: scoring_hot_threshold/scoring_warm_threshold ────
+  // These settings were seeded but never read by any code — scoring.js used
+  // hardcoded warm:31/hot:75 the whole time. Now that scoring.getScoringConfig
+  // actually reads them, force them to match the behavior every user has
+  // already experienced, so this deploy changes nothing observable. Runs once.
+  const scoringV2 = db.prepare(`SELECT value FROM settings WHERE key = 'scoring_settings_v2'`).get();
+  if (!scoringV2) {
+    db.prepare(`
+      INSERT INTO settings (key, value, updated_at) VALUES ('scoring_hot_threshold', '75', datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = '75', updated_at = datetime('now')
+    `).run();
+    db.prepare(`
+      INSERT INTO settings (key, value, updated_at) VALUES ('scoring_warm_threshold', '31', datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = '31', updated_at = datetime('now')
+    `).run();
+    db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('scoring_settings_v2', '1', datetime('now'))`).run();
+    console.log('✅ Migration: normalized dead scoring thresholds to match live behavior (warm=31, hot=75)');
   }
 
   console.log('✅ Database initialized at:', dbPath);

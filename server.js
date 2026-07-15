@@ -6,10 +6,11 @@ require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
 const crypto   = require('crypto'); // built-in — no install needed
+const fs       = require('fs');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
-const { getDb, getLiveDb, getDemoDb, wipeDemoDb, cloneLiveToDemo } = require('./db');
-const { processScore }     = require('./scoring');
+const { getDb, getLiveDb, getDemoDb, wipeDemoDb, cloneLiveToDemo, DEMO_DB_PATH } = require('./db');
+const { processScore, getScoringConfig, computeDecayedScore, classifyLead, DEFAULT_SCORE_MAP } = require('./scoring');
 const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./services/scheduler');
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
@@ -555,7 +556,8 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     profile,
     event_type,
     event_value,
-    alreadyScored
+    alreadyScored,
+    getScoringConfig(db)
   );
 
   // ── 7. Detect context-specific flags ─────────────────────────────────
@@ -5212,6 +5214,56 @@ app.put('/api/interests', requireAuth, requireRole('admin'), (req, res) => {
   return res.json({ ok: true, interests: clean });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/scoring-rules — the admin-editable per-event-type point values that
+//                          drive backend/scoring.js's classification. Admin
+//                          only (unlike /api/branches, this is business config,
+//                          not something reception needs to read).
+// PUT /api/scoring-rules — replace the full rule list.
+// Stored in settings under 'scoring_rules' as JSON — see scoring.getScoringConfig.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/scoring-rules', requireAuth, requireRole('admin'), (req, res) => {
+  const db  = getDb();
+  const row = db.prepare(`SELECT value FROM settings WHERE key = 'scoring_rules'`).get();
+  let rules = null;
+  try {
+    const parsed = JSON.parse(row?.value || 'null');
+    if (Array.isArray(parsed)) rules = parsed;
+  } catch (_) { rules = null; }
+  const defaults = Object.entries(DEFAULT_SCORE_MAP).map(([event_type, points]) => ({ event_type, points, active: true }));
+  return res.json({ rules: rules || defaults, defaults });
+});
+
+app.put('/api/scoring-rules', requireAuth, requireRole('admin'), (req, res) => {
+  const { rules } = req.body || {};
+  if (!Array.isArray(rules) || rules.length > 50) {
+    return res.status(400).json({ error: 'rules must be an array of at most 50 entries' });
+  }
+  const seen = new Set();
+  const clean = [];
+  for (const r of rules) {
+    const eventType = String(r?.event_type ?? '').trim();
+    if (!eventType || !/^[a-z0-9_]+$/i.test(eventType)) {
+      return res.status(400).json({ error: `اسم الحدث غير صالح: "${eventType}"` });
+    }
+    if (seen.has(eventType)) {
+      return res.status(400).json({ error: `اسم الحدث مكرر: "${eventType}"` });
+    }
+    seen.add(eventType);
+    const points = parseInt(r?.points, 10);
+    if (!Number.isFinite(points) || points < 0 || points > 500) {
+      return res.status(400).json({ error: `نقاط "${eventType}" لازم تكون رقم من 0 لـ 500` });
+    }
+    clean.push({ event_type: eventType, points, active: r?.active !== false });
+  }
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES ('scoring_rules', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(JSON.stringify(clean));
+  return res.json({ ok: true, rules: clean });
+});
+
 // Settings endpoints — GET /api/settings, PUT /api/settings/:key
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
@@ -6007,6 +6059,10 @@ function seedDemoData(db) {
     // Extra — for pre-visit followup
     { id: `${PREFIX}19`, name: 'سارة نبيل',     cls: 'warm',      score: 67, phone: '01751234565', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 6,  sessions: 3 },
     { id: `${PREFIX}20`, name: 'تامر فتحي',     cls: 'hot',       score: 84, phone: '01861234566', product: 'غرفة نوم مودرن كاملة', cat: 'غرف النوم',  src: 'إنستجرام',  views: 10, sessions: 6 },
+    // Dormant hot/warm — last_activity forced to ~40 days ago so the score-decay
+    // job (once an admin enables it) has something real to demote in the sandbox.
+    { id: `${PREFIX}21`, name: 'وليد سمير',     cls: 'hot',       score: 85, phone: '01971234567', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 9,  sessions: 5, staleDays: 40 },
+    { id: `${PREFIX}22`, name: 'منى إبراهيم',   cls: 'warm',      score: 55, phone: '01081234568', product: 'انتريه 5 مقاعد',       cat: 'الانتريهات', src: 'إنستجرام',  views: 4,  sessions: 2, staleDays: 40 },
   ];
 
   const insLead = db.prepare(`
@@ -6038,8 +6094,13 @@ function seedDemoData(db) {
 
   db.transaction(() => {
     for (const l of leads) {
-      const createdAgo = Math.floor(Math.random() * 14) + 7;
-      const actAgo     = Math.floor(Math.random() * 5) + 1;
+      const actAgo     = l.staleDays ?? (Math.floor(Math.random() * 5) + 1);
+      // created_at must be >= last_activity — a lead can't have been active
+      // before it existed. Normal leads: created 7-20 days ago. Dormant demo
+      // leads (staleDays set): created a bit before their stale last_activity.
+      const createdAgo = l.staleDays
+        ? l.staleDays + Math.floor(Math.random() * 5) + 3
+        : Math.floor(Math.random() * 14) + 7;
       insLead.run(
         l.id, l.name, l.score, l.cls, BRANCH,
         l.product, l.cat, l.views, l.sessions,
@@ -6767,6 +6828,55 @@ function runAbandonedIntentJob() {
 setTimeout(() => {
   runAbandonedIntentJob();
   setInterval(runAbandonedIntentJob, 60 * 60 * 1000);
+}, 5000);
+
+// ── Score decay reclassification job ──────────────────────────────────────
+// lead_class only gets recomputed when a NEW event arrives (see processScore
+// call site above) — a lead that goes silent keeps its stale hot/warm class
+// forever otherwise. This job periodically re-evaluates dormant leads using
+// an analytically decayed score (never mutates total_score/last_activity, so
+// a lead that re-engages is instantly re-promoted from its full raw score).
+// Ships a no-op until an admin enables scoring_decay_enabled.
+function runScoreDecayForDb(db) {
+  const config = getScoringConfig(db);
+  if (!config.decay.enabled) return;
+
+  const rows = db.prepare(`
+    SELECT user_id, first_name, total_score, lead_class, last_activity,
+           visit_confirmed, location_requested
+    FROM lead_profiles
+    WHERE lead_class IN ('warm','hot')
+      AND last_activity < datetime('now', '-' || ? || ' days')
+  `).all(config.decay.graceDays);
+
+  for (const row of rows) {
+    const decayedScore = computeDecayedScore(row.total_score, row.last_activity, config.decay);
+    const newClass = classifyLead(
+      decayedScore,
+      row.visit_confirmed === 1,
+      row.location_requested === 1,
+      row.lead_class,
+      config.thresholds
+    );
+    if (newClass !== row.lead_class) {
+      db.prepare(`UPDATE lead_profiles SET lead_class = ? WHERE user_id = ?`).run(newClass, row.user_id);
+      console.log(`[Cron] Decay: ${row.first_name || row.user_id} ${row.lead_class}→${newClass} (score ${row.total_score}, decayed ${Math.round(decayedScore)})`);
+    }
+  }
+}
+
+function runScoreDecayJob() {
+  try {
+    runScoreDecayForDb(getLiveDb());
+    if (fs.existsSync(DEMO_DB_PATH)) runScoreDecayForDb(getDemoDb());
+  } catch (err) {
+    console.error('[Cron] Error running score decay job:', err);
+  }
+}
+
+setTimeout(() => {
+  runScoreDecayJob();
+  setInterval(runScoreDecayJob, 60 * 60 * 1000);
 }, 5000);
 
 // ── MCP Cloud SSE Server ──────────────────────────────────────────────────────
