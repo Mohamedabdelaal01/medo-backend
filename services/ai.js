@@ -55,6 +55,13 @@ async function callAi(messages, opts = {}) {
         messages,
         temperature: opts.temperature ?? 0.4,
         max_tokens:  opts.maxTokens ?? 500,
+        // GLM's reasoning-capable models (e.g. glm-4.7-flash) burn the entire
+        // token budget on hidden `reasoning_content` and leave `content` EMPTY
+        // unless thinking is explicitly turned off — confirmed against z.ai:
+        // with thinking enabled, 300 tokens produced zero visible content;
+        // disabled, a real answer came back in ~4s. Our use case (short
+        // structured business text) never needs a visible reasoning chain.
+        thinking: { type: 'disabled' },
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });

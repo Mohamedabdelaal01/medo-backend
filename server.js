@@ -3711,6 +3711,60 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Admin AI control panel — status/test/oversight for the z.ai integration.
+//   GET  /api/admin/ai/status        — configured? which model? usage counts.
+//   POST /api/admin/ai/test          — fires one trivial live call, times it.
+//   GET  /api/admin/ai/recent-briefs — last 20 generated briefs (oversight —
+//                                      admin can literally read what the AI
+//                                      is producing for real customers).
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/ai/status', requireAuth, requireRole('admin'), (req, res) => {
+  const { configured, model, baseUrl } = getAiConfig();
+  const db = getDb();
+  const stats = db.prepare(`
+    SELECT COUNT(*) AS briefs_generated,
+      MAX(updated_at) AS last_generated_at
+    FROM ai_briefs
+  `).get();
+  return res.json({
+    configured, model,
+    base_url_custom: baseUrl !== 'https://api.z.ai/api/paas/v4/chat/completions',
+    briefs_generated:   stats.briefs_generated || 0,
+    last_generated_at:  stats.last_generated_at || null,
+  });
+});
+
+app.post('/api/admin/ai/test', requireAuth, requireRole('admin'), async (req, res) => {
+  const { configured, model } = getAiConfig();
+  if (!configured) {
+    return res.status(400).json({ ok: false, unconfigured: true,
+      error: 'مفيش مفتاح z.ai متسجّل — حطّه فوق في نفس الصفحة أو من الإعدادات' });
+  }
+  const start = Date.now();
+  const result = await callAi(
+    [{ role: 'user', content: 'رد بكلمة "تمام" بس، من غير أي شرح.' }],
+    { maxTokens: 20, temperature: 0 }
+  );
+  const latencyMs = Date.now() - start;
+  if (!result.ok) {
+    return res.status(502).json({ ok: false, error: result.error, latency_ms: latencyMs, model });
+  }
+  return res.json({ ok: true, model: result.model, latency_ms: latencyMs, reply: result.text });
+});
+
+app.get('/api/admin/ai/recent-briefs', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT b.user_id, lp.first_name, b.brief, b.draft_message, b.model, b.updated_at
+    FROM ai_briefs b
+    LEFT JOIN lead_profiles lp ON lp.user_id = b.user_id
+    ORDER BY b.updated_at DESC
+    LIMIT 20
+  `).all();
+  return res.json({ briefs: rows });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Pre-visit follow-up LOG — the rep can record SEVERAL follow-ups over time for
 // a customer who hasn't visited yet (updates/timeline), not just one. Append-only
 // (followup_log), scoped to the rep the customer is assigned to.
