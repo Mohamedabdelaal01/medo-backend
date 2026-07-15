@@ -15,7 +15,7 @@ const { getDb } = require('../db');
 
 const DEFAULT_BASE_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
 const DEFAULT_MODEL    = 'glm-4.7-flash'; // free tier on z.ai
-const TIMEOUT_MS       = 25000;
+const TIMEOUT_MS       = 45000; // thinking is enabled by default — verified up to ~17s for a short reply
 
 function getAiConfig() {
   let key = null, model = DEFAULT_MODEL, baseUrl = DEFAULT_BASE_URL;
@@ -33,9 +33,14 @@ function getAiConfig() {
 
 /**
  * One chat completion. Never throws.
- * @param {Array<{role:string,content:string}>} messages
- * @param {object} [opts]  { maxTokens?, temperature? }
- * @returns {Promise<{ok:true,text:string,model:string}|{ok:false,error:string,unconfigured?:true}>}
+ * @param {Array<object>} messages
+ * @param {object} [opts]  { maxTokens?, temperature?, thinking?, tools?, toolChoice?, timeoutMs? }
+ *   thinking defaults to ON (glm-4.7-flash is free — the user wants full
+ *   reasoning always; empirically verified 2000 max_tokens comfortably covers
+ *   reasoning + a real answer for our prompt sizes, ~17s typical latency).
+ *   Pass tools (OpenAI-style function definitions) to enable tool-calling —
+ *   the reply may come back as toolCalls instead of / alongside text.
+ * @returns {Promise<{ok:true,text:string,toolCalls:Array|null,model:string}|{ok:false,error:string,unconfigured?:true}>}
  */
 async function callAi(messages, opts = {}) {
   const { key, model, baseUrl, configured } = getAiConfig();
@@ -44,38 +49,41 @@ async function callAi(messages, opts = {}) {
       error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API' };
   }
   try {
+    const body = {
+      model,
+      messages,
+      temperature: opts.temperature ?? 0.4,
+      max_tokens:  opts.maxTokens ?? 2000,
+      thinking: { type: opts.thinking === false ? 'disabled' : 'enabled' },
+    };
+    if (opts.tools) {
+      body.tools = opts.tools;
+      body.tool_choice = opts.toolChoice ?? 'auto';
+    }
     const res = await fetch(baseUrl, {
       method: 'POST',
       headers: {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${key}`,
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: opts.temperature ?? 0.4,
-        max_tokens:  opts.maxTokens ?? 500,
-        // GLM's reasoning-capable models (e.g. glm-4.7-flash) burn the entire
-        // token budget on hidden `reasoning_content` and leave `content` EMPTY
-        // unless thinking is explicitly turned off — confirmed against z.ai:
-        // with thinking enabled, 300 tokens produced zero visible content;
-        // disabled, a real answer came back in ~4s. Our use case (short
-        // structured business text) never needs a visible reasoning chain.
-        thinking: { type: 'disabled' },
-      }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       console.error(`[ai] HTTP ${res.status}: ${text.slice(0, 300)}`);
       return { ok: false, error: `مزوّد الذكاء الاصطناعي رفض الطلب (HTTP ${res.status}) — راجع المفتاح واسم الموديل في الإعدادات` };
     }
-    const json = await res.json().catch(() => null);
-    const text = json?.choices?.[0]?.message?.content;
-    if (!text || typeof text !== 'string') {
+    const json    = await res.json().catch(() => null);
+    const msg     = json?.choices?.[0]?.message;
+    const toolCalls = msg?.tool_calls?.length ? msg.tool_calls : null;
+    const text    = msg?.content;
+    // When the model requests a tool call, `content` is legitimately empty —
+    // only treat empty content as an error when there's no tool call either.
+    if (!toolCalls && (!text || typeof text !== 'string')) {
       return { ok: false, error: 'رد غير متوقع من مزوّد الذكاء الاصطناعي' };
     }
-    return { ok: true, text: text.trim(), model };
+    return { ok: true, text: (text || '').trim(), toolCalls, model };
   } catch (err) {
     const msg = err?.name === 'TimeoutError'
       ? 'مزوّد الذكاء الاصطناعي بطيء جداً — حاول تاني'

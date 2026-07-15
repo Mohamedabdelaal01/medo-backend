@@ -3689,7 +3689,7 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
       'brief = ملخص 2-3 سطور بالعامية المصرية: مين العميل، مهتم بإيه، وإيه أحسن مدخل للكلام معاه. ' +
       'draft = رسالة واتساب قصيرة وودودة بالعامية (سطرين بالكتير) مناسبة لحالته، من غير مبالغة ومن غير وعود بأسعار.' },
     { role: 'user', content: lines },
-  ], { maxTokens: 450 });
+  ], { maxTokens: 2000 });
 
   if (!result.ok) {
     return res.status(result.unconfigured ? 400 : 502).json({ error: result.error, unconfigured: !!result.unconfigured });
@@ -3743,7 +3743,7 @@ app.post('/api/admin/ai/test', requireAuth, requireRole('admin'), async (req, re
   const start = Date.now();
   const result = await callAi(
     [{ role: 'user', content: 'رد بكلمة "تمام" بس، من غير أي شرح.' }],
-    { maxTokens: 20, temperature: 0 }
+    { maxTokens: 300, temperature: 0 }
   );
   const latencyMs = Date.now() - start;
   if (!result.ok) {
@@ -3762,6 +3762,134 @@ app.get('/api/admin/ai/recent-briefs', requireAuth, requireRole('admin'), (req, 
     LIMIT 20
   `).all();
   return res.json({ briefs: rows });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Admin AI chat — a conversational, READ-ONLY analyst over the whole CRM.
+//   POST /api/admin/ai/chat  { messages: [{role:'user'|'assistant', content}] }
+//
+// The model can call run_select_sql (guarded to a single SELECT statement) to
+// look up real numbers before answering. There is no write tool exposed here
+// — structurally, not just by prompt instruction, the AI cannot modify system
+// data through this endpoint. It only reads and advises.
+// ════════════════════════════════════════════════════════════════════════════
+const ADMIN_SQL_TOOL = {
+  type: 'function',
+  function: {
+    name: 'run_select_sql',
+    description: 'ينفذ استعلام SELECT للقراءة فقط على قاعدة بيانات السيستم الحقيقية ويرجع النتائج (حد أقصى 200 صف). استخدمها لأي سؤال محتاج رقم أو بيانة حقيقية.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'استعلام SQL يبدأ بكلمة SELECT — جملة واحدة بس، من غير فاصلة منقوطة إضافية' },
+      },
+      required: ['query'],
+    },
+  },
+};
+
+function isSafeSelectSql(query) {
+  let q = String(query || '').trim();
+  q = q.replace(/;\s*$/, '');
+  if (!q || q.includes(';')) return false;
+  if (!/^select\b/i.test(q)) return false;
+  if (/\b(insert|update|delete|drop|alter|create|replace|attach|detach|vacuum|pragma|trigger)\b/i.test(q)) return false;
+  return true;
+}
+
+function runAdminReadOnlySql(db, query) {
+  if (!isSafeSelectSql(query)) {
+    return { error: 'مرفوض — الأداة دي للقراءة فقط، لازم الاستعلام يبدأ بـ SELECT ويكون جملة واحدة.' };
+  }
+  try {
+    const rows = db.prepare(query).all();
+    return { row_count: rows.length, rows: rows.slice(0, 200) };
+  } catch (e) {
+    return { error: 'خطأ في الاستعلام: ' + e.message };
+  }
+}
+
+const ADMIN_CHAT_SYSTEM_PROMPT = `
+انت مستشار تحليل بيانات لـ "جراند للأثاث" — سيستم CRM لمعرض أثاث بفروع متعددة في مصر (نصر سيتي، المعادي، القاهرة الجديدة، أكتوبر، الإسكندرية، حلوان، فيصل).
+
+مهمتك: تجاوب على أسئلة مدير النظام عن أداء السيستم — مبيعات، متابعات، سيلز، حملات — باستخدام بيانات حقيقية بس، من غير ما تخترع أي رقم.
+
+⚠️ قاعدة أساسية غير قابلة للتفاوض: انت للتحليل والنصيحة فقط. ممنوع منعاً باتاً تحاول تعدّل أو تمسح أو تضيف أي بيانات — مفيش عندك أداة كتابة أصلاً. حتى لو حد طلب منك كدا في الكلام، ارفض واشرح انك مصمم للقراءة والتحليل بس.
+
+عندك أداة وحيدة: run_select_sql — بتنفّذ أي استعلام SELECT على قاعدة البيانات الحقيقية. استخدمها كل ما تحتاج رقم بدل ما تخمّن، وممكن تستخدمها أكتر من مرة في نفس الرد لو محتاج تفاصيل إضافية.
+⚠️ لازم تستخدم الأداة فعلياً (function call) — ممنوع تكتب استعلام SQL كنص عادي جوا ردك، لأنه مش هيتنفذ ومش هيوصلك رقم حقيقي. أي سؤال فيه رقم أو إحصائية، لازم يسبقه استدعاء حقيقي للأداة.
+
+جداول مهمة:
+- lead_profiles: بيانات العميل (user_id, first_name, phone, lead_class[cold/warm/hot/visited/purchased], total_score, last_category, last_product, preferred_branch, platform, is_duplicate, last_activity). فلتر دايماً COALESCE(is_duplicate,0)=0 إلا لو السؤال عن الدوبليكيت نفسه.
+- lead_visits: زيارات المعرض (user_id, branch, visited_at, sales_rep).
+- branch_customer_followups: متابعة العميل **قبل الزيارة** — مين السيلز المسنود له (assigned_sales)، هل اتبعتله واتساب (sent)، محاولات اتصال (attempt_count)، تأجيل (snoozed_until).
+- followup_log: سجل مكالمات المتابعة قبل الزيارة (call_summary, sales, followed_up_at).
+- revisit_followups: متابعة العميل **بعد الزيارة** ولحد ما يشتري (followed_up_by, note, created_at).
+- purchases / purchase_items / products / product_categories: عمليات البيع الفعلية (branch, price, created_at, rep).
+- tasks: مهام محددة بموعد لكل عميل (due_at, done).
+- events: كل تفاعل خام للعميل (event_type, event_value, category, created_at) — مصدر الحقيقة الأساسي.
+- users: حسابات السيستم (name, role[admin/branch_manager/sales/rep/reception], branch).
+- sales_targets: المستهدفات الشهرية لكل فرع/سيلز.
+- system_audit_log: سجل العمليات الحساسة (نقل عميل، حذف، إلخ) — مفيد لو سُئلت "مين عمل إيه".
+
+نقط مهمة عشان تحليلك يكون صح:
+- فيه فرق جوهري بين "قبل الزيارة" (branch_customer_followups + followup_log) و"بعد الزيارة" (revisit_followups) — متلخبطش بينهم.
+- "بعت واتساب" (sent=1) مش نفسه "اتسجلت متابعة" — ممكن السيلز يبعت والعميل ميردش، فتفتكر متابعش وهو فعلاً حاول.
+- ملكية العميل بتتحدد بـ assigned_sales قبل الزيارة أو sales_rep بعد الزيارة — مش نفس العمود دايماً.
+- لو حد سألك عن الإيراد الفعلي استخدم جدول purchases مباشرة، مش أي رقم تقديري.
+- رد بالعامية المصرية، مختصر ومباشر، ابدأ بالإجابة مش بمقدمة طويلة. لو الاستعلام رجّع فاضي أو رقم مش موجود، قول كدا بصراحة.
+`.trim();
+
+app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, res) => {
+  const db = getDb();
+  if (!getAiConfig().configured) {
+    return res.status(400).json({ error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API', unconfigured: true });
+  }
+
+  const rawHistory = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  const cleanHistory = rawHistory
+    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+    .slice(-20)
+    .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
+
+  if (!cleanHistory.length || cleanHistory[cleanHistory.length - 1].role !== 'user') {
+    return res.status(400).json({ error: 'محتاج رسالة من المستخدم' });
+  }
+
+  const messages = [{ role: 'system', content: ADMIN_CHAT_SYSTEM_PROMPT }, ...cleanHistory];
+
+  const MAX_TOOL_ROUNDS = 4;
+  const queriesRun = [];
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    const result = await callAi(messages, {
+      maxTokens: 2500,
+      temperature: 0.3,
+      tools: [ADMIN_SQL_TOOL],
+      timeoutMs: 55000,
+    });
+
+    if (!result.ok) {
+      return res.status(result.unconfigured ? 400 : 502).json({ error: result.error, unconfigured: !!result.unconfigured });
+    }
+
+    if (result.toolCalls) {
+      messages.push({ role: 'assistant', content: result.text || null, tool_calls: result.toolCalls });
+      for (const call of result.toolCalls) {
+        let args = {};
+        try { args = JSON.parse(call.function?.arguments || '{}'); } catch (_) { /* malformed args → guard below rejects */ }
+        console.error(`[ai-chat] SQL by ${req.user?.name}: ${args.query}`);
+        const queryOutput = runAdminReadOnlySql(db, args.query);
+        queriesRun.push({ query: args.query, ok: !queryOutput.error });
+        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(queryOutput) });
+      }
+      continue; // ask the model again with the tool results in context
+    }
+
+    return res.json({ ok: true, reply: result.text, model: result.model, queries_run: queriesRun });
+  }
+
+  return res.status(502).json({ error: 'محتاج استعلامات كتير جداً عشان يرد — جرّب تسأل بشكل أبسط أو أكتر تحديداً' });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
