@@ -3858,15 +3858,19 @@ app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, re
 
   const messages = [{ role: 'system', content: ADMIN_CHAT_SYSTEM_PROMPT }, ...cleanHistory];
 
-  const MAX_TOOL_ROUNDS = 4;
+  // The admin explicitly wants deep, patient analysis over speed — no cost
+  // concern (free/cheap tiers), so give the loop lots of room to investigate
+  // before giving up. Still bounded, not literally infinite: a runaway loop
+  // would just hang the request and burn provider quota for no benefit.
+  const MAX_TOOL_ROUNDS = 20;
   const queriesRun = [];
 
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     const result = await callAi(messages, {
-      maxTokens: 2500,
+      maxTokens: 4000,
       temperature: 0.3,
       tools: [ADMIN_SQL_TOOL],
-      timeoutMs: 90000,
+      timeoutMs: 120000,
     });
 
     if (!result.ok) {
