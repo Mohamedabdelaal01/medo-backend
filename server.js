@@ -2820,6 +2820,156 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// PATCH /api/branch/customers/bulk-reassign — move a SET of specific pre-visit
+// customers to a new sales rep in one call. Two entry points, same mechanism:
+//   1) redistribute load off a rep who's still active but overloaded
+//   2) unstick a rep who's been deactivated — their customers stay fully
+//      assigned/visible (see /api/admin/users/sales-rep archive mode +
+//      toggle-active — neither clears assigned_sales) until a human moves them
+// The SOURCE rep's active status is deliberately NOT checked — that's the
+// whole point of case (2). The DESTINATION rep must be active, in-branch,
+// sales/rep role — identical guard to the single-row /assign endpoint.
+// Body: { user_ids: string[], sales, branch? (admin only) }
+// ════════════════════════════════════════════════════════════════════════════
+app.patch('/api/branch/customers/bulk-reassign', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
+  const role = req.user?.role;
+  const branch = role === 'branch_manager'
+    ? (req.user.branch || null)
+    : (req.body?.branch || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const userIds = Array.isArray(req.body?.user_ids)
+    ? [...new Set(req.body.user_ids.map(String))]
+    : [];
+  if (!userIds.length) return res.status(400).json({ error: 'user_ids_required' });
+  if (userIds.length > 1000) return res.status(400).json({ error: 'too_many_ids' });
+
+  const sales = (req.body?.sales && String(req.body.sales).trim()) || null;
+  if (!sales) return res.status(400).json({ error: 'sales_required' });
+
+  const db = getDb();
+
+  // Destination guard — byte-identical to the single-row /assign endpoint's
+  // repInBranch check. Requires active=1: you can move customers OUT of an
+  // inactive rep, never INTO one.
+  const repInBranch = db.prepare(
+    `SELECT 1 FROM users WHERE TRIM(name) = TRIM(?) AND role IN ('sales','rep') AND branch = ? AND active = 1`
+  ).get(sales, branch);
+  if (!repInBranch) {
+    return res.status(400).json({
+      error: 'السيلز ده مش في الفرع ده — حدّث الصفحة واختار من القائمة الجديدة',
+    });
+  }
+
+  // Current state of exactly the requested ids, scoped to THIS branch (a
+  // branch_manager can never touch another branch's rows). No filter on
+  // assigned_sales, no join to users.active — this is what ALLOWS the source
+  // rep to be inactive.
+  const placeholders = userIds.map(() => '?').join(',');
+  const curRows = db.prepare(`
+    SELECT * FROM branch_customer_followups
+    WHERE branch = ? AND user_id IN (${placeholders})
+  `).all(branch, ...userIds);
+  const curByUser = new Map(curRows.map(r => [r.user_id, r]));
+
+  // IDs with no existing branch_customer_followups row in this branch would
+  // otherwise silently get a brand-new row inserted by the upsert below —
+  // that's how a crafted user_id list (bypassing both UIs, which only ever
+  // send ids already scoped to the branch's own customer list) could plant a
+  // customer who never actually engaged with this branch into a rep's queue.
+  // Require the same real membership signal GET /api/branch/customers uses
+  // (a branch_selected event matching this branch) before allowing that.
+  const newIds = userIds.filter(uid => !curByUser.has(uid));
+  const validNewIds = new Set();
+  if (newIds.length) {
+    const newPh = newIds.map(() => '?').join(',');
+    for (const r of db.prepare(`
+      SELECT DISTINCT user_id FROM events
+      WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
+        AND user_id IN (${newPh})
+    `).all(branch, branch, ...newIds)) {
+      validNewIds.add(r.user_id);
+    }
+  }
+
+  // Moving to the rep they're already with is a no-op.
+  const toMove = userIds.filter(uid => {
+    const cur = curByUser.get(uid);
+    if (cur) return !cur.assigned_sales || cur.assigned_sales.trim() !== sales;
+    return validNewIds.has(uid);
+  });
+  const rejected = userIds.filter(uid => !curByUser.has(uid) && !validNewIds.has(uid));
+
+  if (!toMove.length) {
+    return res.json({
+      ok: true, branch, sales,
+      requested: userIds.length, moved: 0,
+      already_assigned: userIds.length - rejected.length,
+      rejected: rejected.length, rejected_user_ids: rejected,
+      moved_user_ids: [],
+    });
+  }
+
+  // Same upsert + same reset-on-owner-change field set as the single-row
+  // /assign endpoint's resetCycle branch — new owner starts a fresh
+  // follow-up cycle; prior call summaries stay in followup_log.
+  const upsertReset = db.prepare(`
+    INSERT INTO branch_customer_followups
+      (branch, user_id, assigned_sales, assigned_at, assigned_by, followed_up, followed_up_at, followed_up_by, call_summary, auto_assigned)
+    VALUES (?, ?, ?, datetime('now'), ?, 0, NULL, NULL, NULL, 0)
+    ON CONFLICT(branch, user_id) DO UPDATE SET
+      assigned_sales = excluded.assigned_sales,
+      assigned_at    = excluded.assigned_at,
+      assigned_by    = excluded.assigned_by,
+      auto_assigned  = 0,
+      followed_up    = 0,
+      followed_up_at = NULL,
+      followed_up_by = NULL,
+      call_summary   = NULL,
+      snoozed_until  = NULL
+  `);
+
+  const by = req.user?.name || null;
+  const movedRows = [];
+  db.transaction(() => {
+    for (const uid of toMove) {
+      upsertReset.run(branch, uid, sales, by);
+      movedRows.push({ user_id: uid, from: curByUser.get(uid)?.assigned_sales || null });
+    }
+  })();
+
+  const fromCounts = movedRows.reduce((acc, r) => {
+    const k = r.from || '(غير مسند)';
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {});
+
+  auditLog(db, req.user?.name, 'bulk_reassign_customers', `${branch}:${sales}`, {
+    type: 'bulk_reassign_customers',
+    branch, to: sales,
+    rows: movedRows.map(r => ({
+      table: 'branch_customer_followups',
+      where: { branch, user_id: r.user_id },
+      row: curByUser.get(r.user_id) || null,
+    })),
+  });
+
+  const fromSummary = Object.entries(fromCounts).map(([k, v]) => `${v} من ${k}`).join('، ');
+  createNotification(db, 'admin', 'bulk_reassign_customers',
+    `${by || 'مدير الفرع'} نقل ${movedRows.length} عميل (${fromSummary}) إلى ${sales} في فرع ${branch}`);
+
+  return res.json({
+    ok: true, branch, sales,
+    requested: userIds.length,
+    moved: movedRows.length,
+    already_assigned: userIds.length - movedRows.length - rejected.length,
+    rejected: rejected.length, rejected_user_ids: rejected,
+    from_counts: fromCounts,
+    moved_user_ids: movedRows.map(r => r.user_id),
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/branch/customers/bulk-assign — "وزّع تلقائياً": distributes every
 // UNASSIGNED pre-visit customer in the branch across its active sales reps in
 // one shot, balancing against each rep's CURRENT pending load (the rep with
