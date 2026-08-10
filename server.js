@@ -207,6 +207,16 @@ function validateSecret(req, res, next) {
 // Runs after validateSecret, before rate limiter and business logic.
 // Enforces required fields and type safety on event_value.
 function validatePayload(req, res, next) {
+  // Accept `psid` as an alias for `user_id`. Several ManyChat External Request
+  // nodes send only `psid` (both are mapped to the same [Contact Id] merge tag
+  // in the flows that send both, so they are literally the same value). Without
+  // this, those nodes got a 400 and ManyChat aborted the rest of the flow —
+  // which silently stopped the "leave your phone number" step from ever being
+  // sent, and with it the phone captures that feed the Meta CAPI Lead event.
+  if (req.body && !req.body.user_id && typeof req.body.psid === 'string' && req.body.psid.trim() !== '') {
+    req.body.user_id = req.body.psid.trim();
+  }
+
   const { user_id, event_type, event_value } = req.body || {};
 
   if (!user_id || typeof user_id !== 'string' || user_id.trim() === '') {
