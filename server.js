@@ -4825,6 +4825,20 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
     GROUP BY TRIM(f.assigned_sales)
   `).all();
 
+  // 6) Customers ASSIGNED to each rep per day (by assignment date), plus how
+  //    many of that day's batch the rep has contacted. NOTE: "contacted" is the
+  //    customer's CURRENT state (followed up OR WhatsApp'd OR attempted a call
+  //    at any point since), NOT their state on the assignment day itself — so
+  //    the counter keeps climbing as the rep works through that day's batch.
+  const assignedRows = db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, date(assigned_at) AS day, COUNT(*) AS n,
+           COALESCE(SUM(CASE WHEN followed_up = 1 OR COALESCE(sent, 0) = 1 OR COALESCE(attempt_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS contacted
+    FROM branch_customer_followups
+    WHERE assigned_sales IS NOT NULL AND TRIM(assigned_sales) != ''
+      AND assigned_at IS NOT NULL AND assigned_at >= datetime('now', ?)
+    GROUP BY rep, day
+  `).all(since);
+
   // Merge, keyed by TRIMMED rep name (codebase convention for name matching).
   const byRep = new Map();
   for (const r of reps) {
@@ -4833,19 +4847,24 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
       branch: r.branch || null,
       active: r.active,
       pending: 0,
-      totals: { followed: 0, post_followed: 0, sent: 0, attempts: 0 },
+      totals: { followed: 0, post_followed: 0, sent: 0, attempts: 0, assigned: 0, assigned_contacted: 0 },
       dayMap: new Map(),
     });
   }
+  // Get-or-create the day object for a rep (shared by bump + the two-count merge).
+  const dayOf = (rep, day) => {
+    let d = rep.dayMap.get(day);
+    if (!d) {
+      d = { day, followed: 0, post_followed: 0, sent: 0, attempts: 0, assigned: 0, assigned_contacted: 0 };
+      rep.dayMap.set(day, d);
+    }
+    return d;
+  };
   const bump = (rows, field) => {
     for (const row of rows) {
       const rep = byRep.get(row.rep);
       if (!rep || !row.day) continue;
-      let d = rep.dayMap.get(row.day);
-      if (!d) {
-        d = { day: row.day, followed: 0, post_followed: 0, sent: 0, attempts: 0 };
-        rep.dayMap.set(row.day, d);
-      }
+      const d = dayOf(rep, row.day);
       d[field] += row.n;
       rep.totals[field] += row.n;
     }
@@ -4854,6 +4873,16 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
   bump(postRows, 'post_followed');
   bump(sentRows, 'sent');
   bump(attemptRows, 'attempts');
+  // Two-count merge for the assignment query: n → assigned, contacted → assigned_contacted.
+  for (const row of assignedRows) {
+    const rep = byRep.get(row.rep);
+    if (!rep || !row.day) continue;
+    const d = dayOf(rep, row.day);
+    d.assigned += row.n;
+    d.assigned_contacted += row.contacted;
+    rep.totals.assigned += row.n;
+    rep.totals.assigned_contacted += row.contacted;
+  }
   for (const row of pendingRows) {
     const rep = byRep.get(row.rep);
     if (rep) rep.pending = row.n;
