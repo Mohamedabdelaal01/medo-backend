@@ -4756,6 +4756,119 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/sales-daily-activity — the SIMPLE per-rep, per-DAY activity
+// view: on which day each rep followed up, how many, and how many they reached
+// out to (WhatsApp sent / called with no answer) — plus their pending backlog.
+// Grouped queries across ALL reps (no per-rep loops), merged in JS.
+// Query param: days (int, default 14, clamped 1..60).
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+  const db = getDb();
+
+  // Same scoping as the follow-up monitor above: admin sees every showroom rep;
+  // a branch manager sees ONLY their own branch's reps (inactive included —
+  // their history still matters).
+  const myBranch = req.user?.role === 'branch_manager' ? (req.user.branch || null) : null;
+  if (req.user?.role === 'branch_manager' && !myBranch) {
+    return res.status(400).json({ error: 'branch_required' });
+  }
+  const reps = myBranch
+    ? db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') AND branch = ? ORDER BY name`).all(myBranch)
+    : db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') ORDER BY branch, name`).all();
+
+  const days = Math.min(60, Math.max(1, parseInt(req.query.days, 10) || 14));
+  const since = `-${days} days`;
+
+  // 1) Completed PRE-visit follow-ups per rep/day (append-only followup_log).
+  const preRows = db.prepare(`
+    SELECT TRIM(sales) AS rep, date(followed_up_at) AS day, COUNT(*) AS n
+    FROM followup_log
+    WHERE followed_up_at >= datetime('now', ?)
+    GROUP BY rep, day
+  `).all(since);
+
+  // 2) Completed POST-visit follow-ups per rep/day (append-only revisit_followups).
+  const postRows = db.prepare(`
+    SELECT TRIM(followed_up_by) AS rep, date(created_at) AS day, COUNT(*) AS n
+    FROM revisit_followups
+    WHERE created_at >= datetime('now', ?)
+    GROUP BY rep, day
+  `).all(since);
+
+  // 3) WhatsApp outreach sends per rep/day. sent_at holds the LATEST send per
+  //    customer, so this counts customers whose latest send fell on that day.
+  const sentRows = db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, date(sent_at) AS day, COUNT(*) AS n
+    FROM branch_customer_followups
+    WHERE sent = 1 AND sent_at IS NOT NULL AND sent_at >= datetime('now', ?)
+    GROUP BY rep, day
+  `).all(since);
+
+  // 4) Unanswered call attempts per rep/day. Only the LAST attempt's timestamp
+  //    is stored per customer, so this counts customers whose latest unanswered
+  //    attempt fell on that day — an acceptable approximation of daily effort.
+  const attemptRows = db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, date(last_attempt_at) AS day, COUNT(*) AS n
+    FROM branch_customer_followups
+    WHERE COALESCE(attempt_count, 0) > 0 AND last_attempt_at IS NOT NULL
+      AND last_attempt_at >= datetime('now', ?)
+    GROUP BY rep, day
+  `).all(since);
+
+  // 5) Pending backlog per rep (assigned, not yet visited, not yet followed up)
+  //    — same shape as the monitor's preAgg, but grouped across all reps.
+  const pendingRows = db.prepare(`
+    SELECT TRIM(f.assigned_sales) AS rep, COUNT(*) AS n
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE COALESCE(lp.visit_confirmed, 0) = 0 AND f.followed_up = 0
+    GROUP BY TRIM(f.assigned_sales)
+  `).all();
+
+  // Merge, keyed by TRIMMED rep name (codebase convention for name matching).
+  const byRep = new Map();
+  for (const r of reps) {
+    byRep.set((r.name || '').trim(), {
+      sales_rep: r.name,
+      branch: r.branch || null,
+      active: r.active,
+      pending: 0,
+      totals: { followed: 0, post_followed: 0, sent: 0, attempts: 0 },
+      dayMap: new Map(),
+    });
+  }
+  const bump = (rows, field) => {
+    for (const row of rows) {
+      const rep = byRep.get(row.rep);
+      if (!rep || !row.day) continue;
+      let d = rep.dayMap.get(row.day);
+      if (!d) {
+        d = { day: row.day, followed: 0, post_followed: 0, sent: 0, attempts: 0 };
+        rep.dayMap.set(row.day, d);
+      }
+      d[field] += row.n;
+      rep.totals[field] += row.n;
+    }
+  };
+  bump(preRows, 'followed');
+  bump(postRows, 'post_followed');
+  bump(sentRows, 'sent');
+  bump(attemptRows, 'attempts');
+  for (const row of pendingRows) {
+    const rep = byRep.get(row.rep);
+    if (rep) rep.pending = row.n;
+  }
+
+  // Every rep is included even with zero activity — the admin needs to SEE who
+  // did nothing. Days: only days with activity, newest first.
+  const out = [...byRep.values()].map(({ dayMap, ...rep }) => ({
+    ...rep,
+    days: [...dayMap.values()].sort((a, b) => (a.day < b.day ? 1 : -1)),
+  }));
+  return res.json({ days, reps: out });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/leads/:user_id/purchases — Purchase history for a lead
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
