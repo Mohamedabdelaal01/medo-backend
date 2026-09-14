@@ -2686,7 +2686,9 @@ const NOT_DUPLICATE = (uid) => `NOT EXISTS (
   WHERE ddup.user_id = ${uid} AND ddup.is_duplicate = 1)`;
 
 // Records an admin/manager action in the undo ledger. `oldState` describes how
-// to restore the affected row: { table, where: {...}, row: {...}|null }.
+// to restore the affected row: { table, where: {...}, row: {...}|null }. Only
+// types listed in REVERTABLE_AUDIT_TABLES can actually be undone; any other
+// type shows in the ledger as display-only.
 function auditLog(db, operator, actionType, targetId, oldState) {
   try {
     db.prepare(`
@@ -5965,6 +5967,71 @@ app.post('/api/admin/cleanup-orphan-reps', requireAuth, requireRole('admin'), (r
 // ════════════════════════════════════════════════════════════════════════════
 // Admin undo ledger — list recent assignment actions and revert human errors.
 // ════════════════════════════════════════════════════════════════════════════
+
+// Action types the ledger can undo → the only table their old_state may restore.
+//   assign_customer / set_sales stored the FULL pre-action row (null when the
+//     action created it) → put that row back verbatim, or delete the new row.
+//   assign_post_visit changed only lead_visits.sales_rep and stored just that
+//     column ({ where: { id }, row: { sales_rep } }) → UPDATE it back in place
+//     (INSERT OR REPLACE with that partial row fails NOT NULL on user_id).
+// Every other type — bulk_assign, bulk_reassign_customers, swap_reps,
+// transfer_rep, mark_duplicate, rep_history_repair (one-off repair trace, no
+// table by design) — is display-only: its old_state is a summary, not a row.
+const REVERTABLE_AUDIT_TABLES = {
+  assign_customer:   'branch_customer_followups',
+  set_sales:         'lead_visits',
+  assign_post_visit: 'lead_visits',
+};
+
+// old_state keys are interpolated into SQL as column names → only a non-empty
+// plain object of identifiers is accepted.
+function isAuditColumnMap(obj) {
+  return !!obj && typeof obj === 'object' && !Array.isArray(obj) &&
+    Object.keys(obj).length > 0 && Object.keys(obj).every(k => /^[A-Za-z_]\w*$/.test(k));
+}
+
+// Shared by the list (its `revertable` flag gates the UI's undo button) and the
+// revert endpoint, so the button only shows when the revert can really run.
+// → { revert(db) } — which returns false when the target row is gone — or { error }.
+function planAuditRevert(log) {
+  const table = REVERTABLE_AUDIT_TABLES[log.action_type];
+  if (!table) return { error: 'action_not_revertable' };
+
+  let state;
+  try { state = JSON.parse(log.old_state || 'null'); } catch (_) { state = null; }
+  if (!state || state.table !== table || !isAuditColumnMap(state.where) ||
+      (state.row != null && !isAuditColumnMap(state.row))) {
+    return { error: 'bad_old_state' };
+  }
+  const { where, row } = state;
+
+  if (log.action_type === 'assign_post_visit') {
+    if (where.id == null || !row || !('sales_rep' in row)) return { error: 'bad_old_state' };
+    return {
+      revert: (db) => db.prepare(`UPDATE lead_visits SET sales_rep = ? WHERE id = ?`)
+        .run(row.sales_rep, where.id).changes > 0,
+    };
+  }
+
+  return {
+    revert: (db) => {
+      if (!row) {
+        // The row did not exist before the action → undo = delete it.
+        const keys = Object.keys(where);
+        db.prepare(`DELETE FROM ${table} WHERE ${keys.map(k => `${k} = ?`).join(' AND ')}`)
+          .run(...keys.map(k => where[k]));
+      } else {
+        // Restore the row exactly as it was (row includes the primary key).
+        const cols = Object.keys(row);
+        db.prepare(
+          `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+        ).run(...cols.map(c => row[c]));
+      }
+      return true;
+    },
+  };
+}
+
 app.get('/api/admin/audit-logs', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
   const logs = db.prepare(`
@@ -5972,7 +6039,7 @@ app.get('/api/admin/audit-logs', requireAuth, requireRole('admin'), (req, res) =
     FROM system_audit_log
     ORDER BY created_at DESC, id DESC
     LIMIT 200
-  `).all();
+  `).all().map(log => ({ ...log, revertable: !planAuditRevert(log).error }));
   return res.json({ logs });
 });
 
@@ -5982,34 +6049,18 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
   if (!log) return res.status(404).json({ error: 'log_not_found' });
   if (log.reverted) return res.status(400).json({ error: 'already_reverted' });
 
-  let state;
-  try { state = JSON.parse(log.old_state || 'null'); } catch (_) { state = null; }
-  if (!state || !state.table) return res.status(400).json({ error: 'bad_old_state' });
+  const plan = planAuditRevert(log);
+  if (plan.error) return res.status(400).json({ error: plan.error });
 
-  // Whitelist the tables the ledger is allowed to touch.
-  const ALLOWED = ['branch_customer_followups', 'lead_visits'];
-  if (!ALLOWED.includes(state.table)) {
-    return res.status(400).json({ error: 'table_not_revertable' });
-  }
-
-  const whereKeys = Object.keys(state.where || {});
-  const whereSql  = whereKeys.map(k => `${k} = ?`).join(' AND ');
-  const whereVals = whereKeys.map(k => state.where[k]);
-
-  db.transaction(() => {
-    if (!state.row) {
-      // The row did not exist before the action → undo = delete it.
-      db.prepare(`DELETE FROM ${state.table} WHERE ${whereSql}`).run(...whereVals);
-    } else {
-      // Restore the row exactly as it was (row includes the primary key).
-      const cols = Object.keys(state.row);
-      db.prepare(
-        `INSERT OR REPLACE INTO ${state.table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
-      ).run(...cols.map(c => state.row[c]));
-    }
+  const restored = db.transaction(() => {
+    if (!plan.revert(db)) return false;
     // Mark the ledger entry as reverted so the UI reflects it.
     db.prepare(`UPDATE system_audit_log SET reverted = 1 WHERE id = ?`).run(log.id);
+    return true;
   })();
+  if (!restored) {
+    return res.status(409).json({ error: 'البيانات اللي الإجراء ده عدّلها اتمسحت — مفيش حاجة ترجع' });
+  }
 
   console.log(`↩️  AUDIT REVERT: log#${log.id} (${log.action_type}) by ${req.user?.name}`);
   return res.json({ ok: true, reverted: log.action_type, target_id: log.target_id });
