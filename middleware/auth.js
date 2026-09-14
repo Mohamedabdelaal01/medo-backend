@@ -61,10 +61,17 @@ function requireAuth(req, res, next) {
     try {
       const db  = getDb();
       const row = req.user?.id != null
-        ? db.prepare('SELECT active FROM users WHERE id = ?').get(req.user.id)
-        : db.prepare('SELECT active FROM users WHERE name = ?').get(req.user?.name);
+        ? db.prepare('SELECT active, name FROM users WHERE id = ?').get(req.user.id)
+        : db.prepare('SELECT active, name FROM users WHERE name = ?').get(req.user?.name);
       if (row && row.active === 0) {
         return res.status(401).json({ error: 'الحساب موقوف — تواصل مع مدير النظام', suspended: true });
+      }
+      // Same for a renamed or deleted account: writes stamp rows with req.user.name,
+      // and a rename / delete frees that name for another account at once — a stale
+      // token must not keep acting under it for 7 days. 401 → the client logs out,
+      // and the next login signs the current name.
+      if (!row || row.name !== req.user.name) {
+        return res.status(401).json({ error: 'بيانات الحساب اتغيّرت — سجّل دخول تاني' });
       }
     } catch (_) {
       // A lookup failure must never lock everyone out — fail open on errors only.

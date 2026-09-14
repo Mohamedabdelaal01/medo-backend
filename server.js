@@ -4145,6 +4145,9 @@ app.post('/api/branch/sales', requireAuth, (req, res) => {
   // would never equal it and the rep "loses" all their customers).
   name = String(name).trim();
   const db = getDb();
+  // Names are unique system-wide — a twin in another branch would share its history.
+  const nameError = staffCreateError(db, name);
+  if (nameError) return res.status(409).json({ error: nameError });
   try {
     const result = db.prepare(
       `INSERT INTO users (name, email, password_hash, role, branch, active)
@@ -4173,7 +4176,7 @@ app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
   if (!loadOwnedSales(db, req.params.id, scope.branch)) {
     return res.status(404).json({ error: 'الحساب مش موجود في فرعك' });
   }
-  const cur = db.prepare(`SELECT name FROM users WHERE id = ?`).get(req.params.id);
+  const cur = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(req.params.id);
   let { name, email, password, active } = req.body || {};
   if (name != null) name = String(name).trim();
   const updates = [];
@@ -4183,6 +4186,11 @@ app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
   if (password)           { updates.push('password_hash = ?'); params.push(bcrypt.hashSync(password, 10)); }
   if (active !== undefined) { updates.push('active = ?');       params.push(active ? 1 : 0); }
   if (!updates.length) return res.status(400).json({ error: 'مفيش حاجة تتعدّل' });
+  // Only a real name change can collide / cascade (the edit modal always resends the name).
+  if (name && cur && name !== cur.name) {
+    const renameError = staffRenameError(db, cur, name);
+    if (renameError) return res.status(409).json({ error: renameError });
+  }
   params.push(req.params.id);
   try {
     // Renaming a rep must carry their assignments with them, or they orphan.
@@ -4206,8 +4214,11 @@ app.delete('/api/branch/sales/:id', requireAuth, (req, res) => {
   if (!loadOwnedSales(db, req.params.id, scope.branch)) {
     return res.status(404).json({ error: 'الحساب مش موجود في فرعك' });
   }
-  db.prepare(`DELETE FROM users WHERE id = ?`).run(req.params.id);
-  return res.json({ ok: true });
+  // Archive (freeze), don't hard-delete: a deleted rep leaves customers, visits
+  // and purchases orphaned under a name. Freezing keeps that history attached and
+  // the name reserved — reversible via toggle-active, the manager UI's only "remove".
+  db.prepare(`UPDATE users SET active = 0 WHERE id = ?`).run(req.params.id);
+  return res.json({ ok: true, archived: true });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5632,6 +5643,9 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
   // Branch only meaningful for reception accounts
   const branchVal = ['reception', 'sales', 'branch_manager'].includes(role) ? (branch || null) : null;
   const db   = getDb();
+  // History is linked by name — a duplicate would share / steal another rep's work.
+  const nameError = staffCreateError(db, name);
+  if (nameError) return res.status(409).json({ error: nameError });
   const hash = bcrypt.hashSync(password, 10);
   try {
     const result = db.prepare(
@@ -5681,7 +5695,12 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   if (!updates.length) {
     return res.status(400).json({ error: 'Nothing to update' });
   }
-  const cur = db.prepare(`SELECT name FROM users WHERE id = ?`).get(req.params.id);
+  const cur = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(req.params.id);
+  // Only a real name change can collide / cascade (the edit modal always resends the name).
+  if (name && cur && name !== cur.name) {
+    const renameError = staffRenameError(db, cur, name);
+    if (renameError) return res.status(409).json({ error: renameError });
+  }
   params.push(req.params.id);
   // Renaming a rep must carry their assignments/history with them, or they orphan.
   db.transaction(() => {
@@ -5724,6 +5743,85 @@ function renameRepReferences(db, oldName, newName) {
   db.prepare(`UPDATE followup_log SET sales = ? WHERE sales = ?`).run(newName, oldName);
   db.prepare(`UPDATE revisit_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE sales_targets SET scope_name = ? WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(newName, oldName);
+}
+
+// ── Unique staff names ──────────────────────────────────────────────────────
+// Every column above is keyed by display name, so two accounts with the same
+// name share — and on rename, SWEEP — each other's customers, visits and
+// purchases. That happened Aug/Sep 2026: new Alexandria accounts got temp names
+// identical to Ain Shams / Faisal reps, and renaming them carried those reps'
+// history away. So a name belongs to ONE account system-wide (any role, active
+// or frozen), compared loosely: NFKC + trim + collapsed spaces + case-insensitive.
+function normalizeStaffName(s) {
+  return String(s ?? '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+// → { id, name, role, branch } of ANOTHER account whose name collides, or null.
+// excludeId = the account being edited, so it can re-case / re-space its own name.
+// users is a small table, so normalizing every row in JS is fine.
+function findStaffNameConflict(db, name, excludeId = null) {
+  const target = normalizeStaffName(name);
+  const skipId = excludeId == null ? null : Number(excludeId);
+  return db.prepare(`SELECT id, name, role, branch FROM users`).all()
+    .find(u => u.id !== skipId && normalizeStaffName(u.name) === target) || null;
+}
+
+function staffNameTakenMessage(conflict) {
+  return `الاسم ده مستخدم لحساب تاني (${String(conflict.name).trim()}) — اختار اسم مختلف (زوّد اسم العيلة مثلاً)`;
+}
+
+// A name no account carries can still be written on history rows (the columns
+// renameRepReferences cascades), left by a deleted account: plain deletes, and
+// scrubs that keep assigned_by / followed_up_by. A new or renamed account taking
+// it would inherit those customers, visits and purchases, and its next rename
+// would sweep them away. → the 409 message, or null.
+// Rare admin action and the DISTINCT name lists are short → normalize in JS.
+function staffNameHistoryError(db, name) {
+  const target = normalizeStaffName(name);
+  const sources = [
+    `SELECT DISTINCT assigned_rep   AS n FROM lead_profiles             WHERE assigned_rep IS NOT NULL`,
+    `SELECT DISTINCT sales_rep      AS n FROM lead_visits               WHERE sales_rep IS NOT NULL`,
+    `SELECT DISTINCT pre_visit_rep  AS n FROM lead_visits               WHERE pre_visit_rep IS NOT NULL`,
+    `SELECT DISTINCT assigned_sales AS n FROM branch_customer_followups WHERE assigned_sales IS NOT NULL`,
+    `SELECT DISTINCT assigned_by    AS n FROM branch_customer_followups WHERE assigned_by IS NOT NULL`,
+    `SELECT DISTINCT followed_up_by AS n FROM branch_customer_followups WHERE followed_up_by IS NOT NULL`,
+    `SELECT DISTINCT rep            AS n FROM purchases                 WHERE rep IS NOT NULL`,
+    `SELECT DISTINCT sales          AS n FROM followup_log              WHERE sales IS NOT NULL`,
+    `SELECT DISTINCT followed_up_by AS n FROM revisit_followups         WHERE followed_up_by IS NOT NULL`,
+    `SELECT DISTINCT scope_name     AS n FROM sales_targets             WHERE scope_type = 'sales_rep' AND scope_name IS NOT NULL`,
+  ];
+  const taken = sources.some(q => db.prepare(q).all().some(r => normalizeStaffName(r.n) === target));
+  return taken
+    ? 'الاسم ده لسه متسجّل على شغل قديم (عملاء / زيارات / مبيعات) لحساب اتحذف — اختار اسم مختلف، أو خلّي مدير النظام يشغّل «تنظيف بيانات السيلز المحذوفين» الأول'
+    : null;
+}
+
+// Create guard for POST /api/users and POST /api/branch/sales.
+// Returns the 409 message, or null when the name is free.
+function staffCreateError(db, name) {
+  const conflict = findStaffNameConflict(db, name);
+  if (conflict) return staffNameTakenMessage(conflict);
+  return staffNameHistoryError(db, name);
+}
+
+// Rename guard for PUT /api/users/:id and PUT /api/branch/sales/:id — run it
+// BEFORE the write transaction. cur = the account's current { id, name }.
+// Returns the 409 message, or null when the rename is safe.
+function staffRenameError(db, cur, newName) {
+  const conflict = findStaffNameConflict(db, newName, cur.id);
+  if (conflict) return staffNameTakenMessage(conflict);
+  // Re-casing / re-spacing its own name can't land on someone else's history.
+  if (normalizeStaffName(newName) !== normalizeStaffName(cur.name)) {
+    const historyError = staffNameHistoryError(db, newName);
+    if (historyError) return historyError;
+  }
+  // Legacy twins (from before this guard): another account still carries the
+  // exact current name, so the rename cascade would move THAT account's work too.
+  const twin = db.prepare(
+    `SELECT id FROM users WHERE id != ? AND TRIM(name) = TRIM(?) LIMIT 1`
+  ).get(cur.id, cur.name);
+  if (twin) return 'مينفعش تغيير الاسم: في حساب تاني بنفس الاسم الحالي، وتغيير الاسم هينقل شغل الحساب التاني كمان';
+  return null;
 }
 
 // DELETE /api/users/:id — admin removes a user account permanently.
@@ -6677,7 +6775,20 @@ app.post('/api/admin/generate-demo-accounts', requireAuth, requireRole('admin'),
         role = excluded.role, branch = excluded.branch, active = 1
     `);
     demo.transaction(() => {
-      for (const a of accounts) upsert.run(a.name, a.email, hash, a.role, a.branch);
+      for (const a of accounts) {
+        // The sandbox is a fresh clone of production: if a real account's name
+        // collides with a demo name (e.g. "Demo_Sales"), rename that account's
+        // SANDBOX copy (+ its name-keyed rows) instead of failing or leaving a
+        // name twin. Production is never touched here.
+        const own = demo.prepare(`SELECT id FROM users WHERE email = ?`).get(a.email);
+        let clash;
+        while ((clash = findStaffNameConflict(demo, a.name, own?.id))) {
+          const renamed = `${String(clash.name).trim()} #${clash.id}`;
+          demo.prepare(`UPDATE users SET name = ? WHERE id = ?`).run(renamed, clash.id);
+          renameRepReferences(demo, clash.name, renamed);
+        }
+        upsert.run(a.name, a.email, hash, a.role, a.branch);
+      }
     })();
 
     // Step C — seed realistic fake data for the عين شمس demo branch.
