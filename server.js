@@ -3281,16 +3281,43 @@ function leadInBranch(db, userId, branch) {
   `).get(userId, branch, branch, userId, branch, userId, branch);
 }
 
+// ── Name / phone search terms ───────────────────────────────────────────────
+// ONE dialect for every "ابحث بالاسم أو رقم التليفون" box (عملاء الفرع +
+// متابعات بعد الزيارة) so typing behaves the same on every page:
+//   • the phone term goes through normalizePhone → "+2 0100-123 4567",
+//     "0100 123 4567" and "01001234567" all hit the same stored number,
+//     while a partial ("234567") stays as typed so LIKE still matches it.
+//   • % and _ are escaped (the SQL must say ESCAPE '\') → a manager who types
+//     "%" gets zero results instead of the whole branch.
+//   • no digits typed (an Arabic name) → the phone term falls back to the text,
+//     so the phone LIKEs simply never match instead of becoming '%%' = everyone.
+//   • Arabic-Indic digits (٠١٢…) are folded to ASCII first: the Egyptian Arabic
+//     keyboard types them by default, and normalizePhone's /\D/ is ASCII-only —
+//     it would strip the WHOLE number away and the page would then tell the
+//     manager the customer doesn't exist. Folded here and not inside
+//     normalizePhone, which also feeds storage/ingestion.
+// Returns null when there's nothing usable to search for (empty / spaces only).
+const SEARCH_MAX_LEN = 100;   // a customer name or phone is never longer
+const asciiDigits = (s) => s
+  .replace(/[٠-٩]/g, (d) => d.charCodeAt(0) - 0x0660)   // ٠-٩
+  .replace(/[۰-۹]/g, (d) => d.charCodeAt(0) - 0x06F0);  // ۰-۹ (extended)
+function searchTerms(raw) {
+  const q = String(raw ?? '').trim().slice(0, SEARCH_MAX_LEN);
+  if (!q) return null;
+  const esc   = (s) => s.replace(/[\\%_]/g, '\\$&');
+  const phone = normalizePhone(asciiDigits(q));
+  return {
+    q, like: `%${esc(q)}%`, phoneLike: `%${esc(phone || q)}%`,
+    phoneDigits: phone ? phone.length : 0,   // how selective the typed number is
+  };
+}
+
 app.get('/api/branch/leads', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const branch = branchScopeOf(req);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const db = getDb();
-  const q = (req.query.q && String(req.query.q).trim()) || '';
-  const like = `%${q}%`;
-  // Phone search ignores spaces/symbols the manager might type ("0100 123").
-  const digits = q.replace(/\D/g, '');
-  const digitsLike = `%${digits}%`;
+  const search = searchTerms(req.query.q);   // { like, phoneLike } | null
 
   const rows = db.prepare(`
     SELECT
@@ -3322,16 +3349,16 @@ app.get('/api/branch/leads', requireAuth, authorizeRoles('branch_manager', 'admi
     ) u
     LEFT JOIN lead_profiles lp ON lp.user_id = u.user_id
     LEFT JOIN branch_customer_followups f ON f.user_id = u.user_id AND f.branch = ?
-    ${q ? `WHERE (
-      lp.first_name LIKE ?
-      OR EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = u.user_id AND ph.phone LIKE ?)
-      OR COALESCE(lp.phone,'') LIKE ?
+    ${search ? `WHERE (
+      lp.first_name LIKE ? ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = u.user_id AND ph.phone LIKE ? ESCAPE '\\')
+      OR COALESCE(lp.phone,'') LIKE ? ESCAPE '\\'
     )` : ''}
     ORDER BY lp.last_activity DESC, lp.total_score DESC
     LIMIT 1000
   `).all(...[
     branch, branch, branch, branch, branch, branch,
-    ...(q ? [like, digitsLike, digitsLike] : []),
+    ...(search ? [search.like, search.phoneLike, search.phoneLike] : []),
   ]);
 
   return res.json({ branch, count: rows.length, customers: rows });
@@ -4373,16 +4400,16 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
   const db   = getDb();
   const role = req.user?.role;
 
-  let statusWhere;
-  if (status === 'bought') {
-    statusWhere = `(lp.lead_class = 'purchased' OR lp.purchased_at IS NOT NULL)`;
-  } else if (status === 'lost') {
-    statusWhere = `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
-                   AND lp.revisit_status = 'lost'`;
-  } else {
-    statusWhere = `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
-                   AND (lp.revisit_status IS NULL OR lp.revisit_status = 'pending')`;
-  }
+  // One clause per tab — a function because the cross-tab counter below needs
+  // the other two tabs' clauses with the SAME search + role scoping.
+  const statusClause = (s) => {
+    if (s === 'bought') return `(lp.lead_class = 'purchased' OR lp.purchased_at IS NOT NULL)`;
+    if (s === 'lost')   return `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+                                AND lp.revisit_status = 'lost'`;
+    return `lp.lead_class != 'purchased' AND lp.purchased_at IS NULL
+            AND (lp.revisit_status IS NULL OR lp.revisit_status = 'pending')`;
+  };
+  const statusWhere = statusClause(status);
 
   let rbacWhere = '1=1';
   const params = [];
@@ -4416,6 +4443,27 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
       ) = ?` : ''}`;
     params.push(me);
     if (myBranch) params.push(myBranch);
+  }
+
+  // Optional name/phone search (?q=) — same dialect as عملاء الفرع, so a number
+  // typed with spaces / dashes / +2 still matches. It sits INSIDE the same WHERE
+  // as the status + RBAC clauses (never widening either), so the manager searches
+  // the WHOLE scoped set — not just the newest 300 rows the list shows.
+  const search = searchTerms(req.query.q);
+  // A 1-3 digit fragment isn't a phone search: '%50%' hits nearly every number
+  // in the branch and floods the 300-row list — pushing the row the manager
+  // actually typed (a NAME containing "50") out of it. Only run the phone LIKEs
+  // once the typed number is selective enough to mean something.
+  const byPhone = !!search && search.phoneDigits >= 4;
+  const searchWhere = search ? `(
+        lp.first_name LIKE ? ESCAPE '\\'${byPhone ? `
+        OR COALESCE(lp.phone,'') LIKE ? ESCAPE '\\'
+        OR EXISTS (SELECT 1 FROM lead_phones ph
+                   WHERE ph.user_id = lp.user_id AND ph.phone LIKE ? ESCAPE '\\')` : ''}
+      )` : '1=1';
+  if (search) {
+    params.push(search.like);
+    if (byPhone) params.push(search.phoneLike, search.phoneLike);
   }
 
   const customers = db.prepare(`
@@ -4452,11 +4500,36 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
       AND COALESCE(lp.is_duplicate, 0) = 0
       AND ${statusWhere}
       AND ${rbacWhere}
+      AND ${searchWhere}
     ORDER BY COALESCE(lp.revisit_updated_at, lp.purchased_at, lp.last_activity) DESC
     LIMIT 300
   `).all(...params);
 
-  return res.json({ status, count: customers.length, customers });
+  // Searching? Tell the UI how many rows the SAME search (and the SAME role
+  // scoping) hits in each tab — that's what lets the page say "لقيته في: اشتروا"
+  // when the manager types a number while standing on the wrong tab.
+  const otherTabMatches = search ? {} : null;
+  if (search) {
+    for (const s of ['pending', 'bought', 'lost']) {
+      otherTabMatches[s] = db.prepare(`
+        SELECT COUNT(*) AS n FROM lead_profiles lp
+        WHERE lp.visit_confirmed = 1
+          AND COALESCE(lp.is_duplicate, 0) = 0
+          AND ${statusClause(s)}
+          AND ${rbacWhere}
+          AND ${searchWhere}
+      `).get(...params).n;
+    }
+  }
+
+  return res.json({
+    status, count: customers.length, customers, other_tab_matches: otherTabMatches,
+    // The list is capped at 300 rows. When the search matches more, send the REAL
+    // total (already counted just above) so the page can say "بيظهر أول 300 من N"
+    // — otherwise a manager whose customer fell past the cap reads "300 عميل" as
+    // "everyone" and concludes the customer isn't in the CRM.
+    total: otherTabMatches ? otherTabMatches[status] : null,
+  });
 });
 
 // POST /api/revisit/:userId/close — sales/manager closes a customer who won't
@@ -6790,6 +6863,19 @@ function seedDemoData(db) {
       iso(daysAgo(0))
     );
   })();
+
+  // ── Post-visit "اتقفلوا" demo — one visited customer the rep closed, so the
+  // three tabs of متابعات بعد الزيارة all have data and the name/phone search
+  // there can show its "لقيته في: ..." cross-tab hint in the sandbox. Every demo
+  // lead already carries a lead_phones row, so the search finds them all.
+  db.prepare(`
+    UPDATE lead_profiles SET
+      revisit_status     = 'lost',
+      revisit_note       = ?,
+      revisit_updated_by = ?,
+      revisit_updated_at = ?
+    WHERE user_id = ?
+  `).run('اشترى من معرض تاني — قال السعر عنده أوفر', SALES, iso(daysAgo(1)), `${PREFIX}14`);
 
   // ── Duplicate-flag demo: mark one junk lead so the branch manager's
   // "عملاء الفرع" view shows the duplicate badge, and so the exclusion from the
