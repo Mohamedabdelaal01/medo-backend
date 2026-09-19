@@ -5016,6 +5016,7 @@ app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 // Contracts module — purchases viewed as contracts.
 //   GET    /api/contracts      — RBAC: sales→own, branch_manager→branch, admin→all
+//                                ?month=YYYY-MM → that calendar month only.
 //   PUT    /api/contracts/:id  — admin / branch_manager (manager → own branch)
 //   DELETE /api/contracts/:id  — admin / branch_manager (manager → own branch)
 //                                + smart reversion when a customer's last
@@ -5036,9 +5037,33 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     params.push(req.user.name);
   }
 
-  // Optional filters — date range, branch & rep (admin/manager scoping above
-  // already constrains non-admins, so these only narrow further).
+  // Role scope on its own — the months list below must stay on THIS clause so
+  // the picker keeps showing every month the caller is allowed to see.
+  const roleWhere  = where;
+  const roleParams = [...params];
+
+  // Optional filters — month, date range, branch & rep (admin/manager scoping
+  // above already constrains non-admins, so these only narrow further).
   const { startDate, endDate, branch: fBranch, rep: fRep } = req.query;
+
+  // month=YYYY-MM → التعاقدات بتاعة الشهر ده بس. A month here is a UTC calendar
+  // month, exactly like currentMonth()/monthRevenue() and the targets screen —
+  // we don't invent a Cairo-local month just for this page. Bad input is a 400,
+  // never a silent "here's everything".
+  const monthRaw = String(req.query.month ?? '').trim();
+  let month = null;
+  if (monthRaw) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(monthRaw)) {
+      return res.status(400).json({ error: 'الشهر لازم يكون بصيغة YYYY-MM (مثال: 2026-09)' });
+    }
+    month = monthRaw;
+    // strftime('%Y-%m', …) normalises BOTH date formats living in this table
+    // ("YYYY-MM-DD HH:MM:SS" written by us, and ISO "…T…Z" from older rows) —
+    // a raw substr(p.created_at,1,7) would too, but only by luck of the prefix.
+    where += ` AND strftime('%Y-%m', p.created_at) = ?`;
+    params.push(month);
+  }
+
   const dr = dateRangeClause('p.created_at', startDate, endDate);
   where += dr.clause;
   params.push(...dr.params);
@@ -5048,6 +5073,10 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     params.push(fRep);
   }
 
+  // Listing cap — sent back to the client so the page can say "دي أول 500" بدل
+  // ما يبان إن الباقي اتمسح (الملخص تحت بيعدّ من غير الحد ده).
+  const LIST_LIMIT = 500;
+
   const contracts = db.prepare(`
     SELECT p.id, p.user_id, p.price, p.contract_number, p.branch, p.rep,
            p.product_id, p.notes, p.created_at,
@@ -5056,7 +5085,7 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
     WHERE ${where}
     ORDER BY p.created_at DESC
-    LIMIT 500
+    LIMIT ${LIST_LIMIT}
   `).all(...params);
 
   // Attach the products on each contract (what the customer actually took), so
@@ -5078,7 +5107,41 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     for (const c of contracts) c.products = [];
   }
 
-  return res.json({ contracts });
+  // Header summary for the SAME filter set — counted WITHOUT the 500-row LIMIT,
+  // so a busy month still reports the true number instead of a flat "500".
+  // (lead_profiles.user_id is the PK, so dropping the LEFT JOIN can't change
+  //  the count.)
+  const totals = db.prepare(`
+    SELECT COUNT(*) AS count, COALESCE(SUM(p.price), 0) AS total
+    FROM purchases p
+    WHERE ${where}
+  `).get(...params);
+
+  // Every month that actually HAS contracts for this user — feeds the month
+  // picker (and the "أقرب شهر فيه تعاقدات" shortcut when the chosen month is
+  // empty), so it's scoped by role only and ignores the month filter itself.
+  const months = db.prepare(`
+    SELECT strftime('%Y-%m', p.created_at) AS month,
+           COUNT(*) AS count,
+           COALESCE(SUM(p.price), 0) AS total
+    FROM purchases p
+    WHERE ${roleWhere}
+    GROUP BY month
+    HAVING month IS NOT NULL
+    ORDER BY month DESC
+  `).all(...roleParams);
+
+  return res.json({
+    contracts,                       // unchanged shape — old callers keep working
+    month,                           // the applied month, or null when unfiltered
+    count: totals.count,
+    total: totals.total,
+    // count/total describe the whole filter set while `contracts` stops at
+    // LIST_LIMIT — تقول للواجهة إن القائمة اتقصّت عشان ما تناقضش العدّاد فوقها.
+    limit: LIST_LIMIT,
+    truncated: totals.count > contracts.length,
+    months,
+  });
 });
 
 app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
@@ -6541,6 +6604,12 @@ function seedDemoData(db) {
   const ymd = (d) => d.toISOString().slice(0, 10);
   const iso = (d) => d.toISOString().replace('T', ' ').slice(0, 19);
   const daysAgo  = (n) => { const d = new Date(NOW); d.setDate(d.getDate() - n); return d; };
+  // Day 15 (midday UTC) of the calendar month N months back — always lands
+  // INSIDE that month whatever day the sandbox is generated on. Used to spread
+  // the demo contracts over several months so the month picker on صفحة
+  // التعاقدات has something real to switch between.
+  const monthsAgo = (n) =>
+    new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth() - n, 15, 12, 0, 0));
   const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
 
   // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
@@ -6678,12 +6747,17 @@ function seedDemoData(db) {
     });
   })();
 
-  // ── 3. Purchases — 3 completed sales by demo_sales ──────────────────────
+  // ── 3. Purchases — 5 completed sales by demo_sales ──────────────────────
+  // The last two are older repeat contracts sitting in the two PREVIOUS
+  // calendar months, so the month filter on صفحة التعاقدات always has at least
+  // two different months of data to show in the sandbox.
   const purchaseData = [
     { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش',        daysAgoN: 6,  products: ['غرفة نوم كلاسيك ملكي'] },
     { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور', daysAgoN: 8,  products: ['طقم سفرة 8 كراسي فاخر'] },
     // Bedroom set repeats here → it becomes the best-seller overall + in غرف النوم.
     { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد + غرفة نوم — دفع كاش',  daysAgoN: 10, products: ['كنبة 4 مقاعد جلد', 'غرفة نوم كلاسيك ملكي'] },
+    { uid: `${PREFIX}16`, price: 15750, contract: 'CNT-2026-0028', note: 'طقم سفرة 6 كراسي — الشهر اللي فات',      monthsAgoN: 1, products: ['طقم سفرة 6 كراسي'] },
+    { uid: `${PREFIX}17`, price: 21000, contract: 'CNT-2026-0014', note: 'انتريه كلاسيك — تعاقد قديم',             monthsAgoN: 2, products: ['انتريه كلاسيك'] },
   ];
   const insPurchase = db.prepare(`
     INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
@@ -6724,7 +6798,7 @@ function seedDemoData(db) {
   };
   db.transaction(() => {
     purchaseData.forEach((p) => {
-      const pDate = iso(daysAgo(p.daysAgoN));
+      const pDate = iso(p.monthsAgoN != null ? monthsAgo(p.monthsAgoN) : daysAgo(p.daysAgoN));
       const result = insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
       const purchaseId = result.lastInsertRowid;
 
@@ -6734,10 +6808,13 @@ function seedDemoData(db) {
       if (!productIds.length) productIds = pickRandomProducts(1 + Math.floor(Math.random() * 2));
       for (const pid of productIds) insPurchaseItem.run(purchaseId, pid);
 
-      // set purchased_at so the "اشتروا" tab in revisit works
+      // set purchased_at so the "اشتروا" tab in revisit works. A repeat buyer
+      // has more than one contract here, so only ever move the date FORWARD —
+      // an older back-dated contract must not rewind their last purchase.
       db.prepare(`
-        UPDATE lead_profiles SET purchased_at = ? WHERE user_id = ?
-      `).run(pDate, p.uid);
+        UPDATE lead_profiles SET purchased_at = ?
+        WHERE user_id = ? AND (purchased_at IS NULL OR purchased_at < ?)
+      `).run(pDate, p.uid, pDate);
     });
   })();
 
@@ -6882,7 +6959,7 @@ function seedDemoData(db) {
   // rep queues/KPIs is visible in the sandbox. Reversible from the UI.
   db.prepare(`UPDATE lead_profiles SET is_duplicate = 1 WHERE user_id = ?`).run(`${PREFIX}02`);
 
-  console.log(`🌱 Demo seed: ${leads.length} leads+events, ${allVisited.length} visits, 3 purchases, 4 pre-visit fups, 3 revisit logs, 3 tasks, 1 duplicate — branch: ${BRANCH}`);
+  console.log(`🌱 Demo seed: ${leads.length} leads+events, ${allVisited.length} visits, ${purchaseData.length} purchases (over 3 months), 4 pre-visit fups, 3 revisit logs, 3 tasks, 1 duplicate — branch: ${BRANCH}`);
 }
 
 // Account-based cloned sandbox — interconnected demo_* training accounts.
