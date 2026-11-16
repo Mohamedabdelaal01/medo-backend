@@ -89,6 +89,43 @@ function normalizeBranch(raw) {
   return _branchAliasLookup.get(key) || String(raw).trim();
 }
 
+// ── Cairo calendar day ────────────────────────────────────────────────────────
+// Reception's «زيارة اليوم» is a CAIRO day, not a UTC day (a customer confirmed
+// at 01:00 Cairo is "today" there but "yesterday" in UTC). Everything stored
+// stays UTC (datetime('now') → 'YYYY-MM-DD HH:MM:SS'); these helpers only turn
+// "today in Cairo" into UTC bounds. Intl knows Egypt's summer time — never
+// hard-code +2/+3 and never use SQLite 'localtime' (the server runs in UTC).
+// The existing UTC "today"/month counters (dashboard, targets) are NOT moved.
+const CAIRO_TZ = 'Africa/Cairo';
+const _cairoFmt = new Intl.DateTimeFormat('en-CA', { timeZone: CAIRO_TZ, year: 'numeric', month: '2-digit',
+  day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+function cairoParts(d) { const o = {}; for (const p of _cairoFmt.formatToParts(d)) o[p.type] = p.value; return o; }
+// 'YYYY-MM-DD' of `d` in Cairo.
+function cairoDay(d = new Date()) { const p = cairoParts(d); return `${p.year}-${p.month}-${p.day}`; }
+function cairoOffsetMs(d) {
+  const p = cairoParts(d);
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(d.getTime() / 1000) * 1000;
+}
+// Date of 00:00 Cairo (or the summer-time jump instant) on `day` ('YYYY-MM-DD').
+function cairoDayStart(day) {
+  const [y, m, dd] = day.split('-').map(Number); const g = Date.UTC(y, m - 1, dd);
+  let t = g - cairoOffsetMs(new Date(g)); t = g - cairoOffsetMs(new Date(t)); return new Date(t);
+}
+function toSqlUtc(d) { return d.toISOString().slice(0, 19).replace('T', ' '); }
+// [start, end) of a Cairo day as UTC SQL strings — compare with datetime(col).
+function cairoDayBoundsSql(day) {
+  const [y, m, dd] = day.split('-').map(Number);
+  const next = new Date(Date.UTC(y, m - 1, dd + 1)).toISOString().slice(0, 10);
+  return [toSqlUtc(cairoDayStart(day)), toSqlUtc(cairoDayStart(next))];
+}
+// A stored UTC 'YYYY-MM-DD HH:MM:SS' (no zone) → Date.
+function sqlUtcToDate(s) {
+  if (!s) return null; const v = String(s);
+  return new Date(/Z$|[+-]\d\d:\d\d$/.test(v) ? v : v.replace(' ', 'T') + 'Z');
+}
+// 'HH:MM' (24h) of `d` in Cairo.
+function cairoHHMM(d) { const p = cairoParts(d); return `${p.hour}:${p.minute}`; }
+
 // ── Auto-assignment ───────────────────────────────────────────────────────────
 // Assigns an unassigned lead to the rep with the FEWEST active leads
 // (active = not purchased/converted). Returns the rep name or null.
@@ -1177,6 +1214,7 @@ app.delete('/api/leads/:user_id', requireAuth, requireRole('admin'), (req, res) 
     db.prepare(`DELETE FROM events          WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM lead_phones     WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM lead_visits     WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM visit_checkins  WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM tasks           WHERE lead_id = ?`).run(user_id);
     db.prepare(`DELETE FROM purchases       WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM messages_sent   WHERE user_id = ?`).run(user_id);
@@ -1373,6 +1411,153 @@ const actsAsReception = (req) =>
   req.user?.role === 'reception' ||
   (req.user?.role === 'branch_manager' && RECEPTION_MANAGER_BRANCHES.includes(req.user.branch));
 
+// Records that the customer ARRIVED at this branch today (Cairo day) — feeds
+// reception's «قايمة العملاء زيارة اليوم». One row per (customer, branch, day):
+// a second confirm the same day keeps the FIRST arrival time. Written with the
+// exact branch value of the lead_visits row (call it right after that insert).
+function recordCheckin(db, { userId, branch, source, recordedBy }) {
+  if (!userId || !branch) return;
+  db.prepare(`INSERT INTO visit_checkins (user_id, branch, visit_day, source, recorded_by)
+              VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, branch, visit_day) DO NOTHING`)
+    .run(userId, branch, cairoDay(), source, recordedBy || null);
+}
+
+// Today's (Cairo) check-in of a customer at a branch, or null.
+function todayCheckin(db, userId, branch) {
+  return db.prepare(
+    `SELECT * FROM visit_checkins WHERE user_id = ? AND branch = ? AND visit_day = ?`
+  ).get(userId, branch, cairoDay()) || null;
+}
+
+// lead_visits keeps ONE row per (customer, branch), so its sales_rep may be the
+// salesperson of an EARLIER visit. It counts as this visit's only when it was
+// set at/after the check-in (sales_rep_set_at >= checked_in_at). Both are UTC
+// SQL strings; normalized through Date so a stray 'T'/'Z' never breaks the compare.
+function repSetThisVisit(lvSalesRep, salesRepSetAt, checkedInAt) {
+  if (!lvSalesRep || !salesRepSetAt || !checkedInAt) return false;
+  const set = sqlUtcToDate(salesRepSetAt), inAt = sqlUtcToDate(checkedInAt);
+  if (!set || !inAt || isNaN(set) || isNaN(inAt)) return false;
+  return toSqlUtc(set) >= toSqlUtc(inAt);
+}
+
+// An ACTIVE showroom salesperson (role='sales') of `branch` by name (TRIM match)
+// → { id, name } with the DB's exact name, or null. Same set of names
+// GET /api/sales/reps offers — staff names are join keys (targets, contracts,
+// ownership), so a free-typed or cross-branch name is never stored.
+function findBranchSalesRep(db, name, branch) {
+  return db.prepare(`SELECT id, name FROM users WHERE TRIM(name) = TRIM(?) AND role = 'sales'
+                     AND active = 1 AND branch = ?`).get(String(name || ''), branch) || null;
+}
+
+// Links the showroom salesperson to the customer's visit at `branch` — the
+// shared body of POST /api/visits/set-sales and of a reception-recorded sale
+// (POST /api/reception/sales). Call it INSIDE a db.transaction.
+//   → { preVisitRep, unchanged }
+function linkVisitSales(db, { userId, branch, salesRep, operator }) {
+  // Full old row captured for the audit/undo ledger (it carries
+  // sales_rep_set_at too, so an undo puts the old "set at" back with the row).
+  const existing = db.prepare(
+    `SELECT * FROM lead_visits WHERE user_id=? AND branch=?`
+  ).get(userId, branch);
+
+  // A RE-link: the visit already got its salesperson at THIS visit (set at/after
+  // today's check-in) and reception corrects it. The follow-up row was then
+  // written by that first link, so its assigned_sales is the showroom
+  // salesperson, not who followed the customer up before the visit — keep the
+  // pre-visit rep the first link recorded instead of reading it from there.
+  const checkin = todayCheckin(db, userId, branch);
+  const relink  = !!(existing && checkin &&
+    repSetThisVisit(existing.sales_rep, existing.sales_rep_set_at, checkin.checked_in_at));
+  if (relink && existing.sales_rep === salesRep) {
+    return { preVisitRep: existing.pre_visit_rep || null, unchanged: true }; // same person again → nothing to do
+  }
+
+  // Step A — who followed this lead up online BEFORE the visit.
+  const fuRow = db.prepare(
+    `SELECT assigned_sales FROM branch_customer_followups WHERE user_id = ? AND branch = ?`
+  ).get(userId, branch);
+  const preVisitRep = relink ? (existing.pre_visit_rep || null) : (fuRow?.assigned_sales || null);
+
+  // Step B — store BOTH the showroom rep and the pre-visit rep on the visit.
+  // Create the row if the salesperson is set without a prior confirm (robust).
+  if (existing) {
+    db.prepare(`UPDATE lead_visits SET sales_rep=?, pre_visit_rep=?, sales_rep_set_at=datetime('now') WHERE id=?`)
+      .run(salesRep, preVisitRep, existing.id);
+  } else {
+    db.prepare(
+      `INSERT INTO lead_visits (user_id, branch, sales_rep, pre_visit_rep, sales_rep_set_at)
+       VALUES (?,?,?,?,datetime('now'))`
+    ).run(userId, branch, salesRep, preVisitRep);
+  }
+
+  // Step C — handoff: the pre-visit rep is NOT the showroom rep. Log the
+  // handoff and move the follow-up record over to the showroom rep.
+  if (preVisitRep && preVisitRep !== salesRep) {
+    const logSummary = `العميل زار الفرع. تابعه قبل الزيارة [${preVisitRep}]، ولكن استقبله في الصالة [${salesRep}].`;
+    logFollowup(db, branch, userId, salesRep, logSummary);
+    db.prepare(`
+      UPDATE branch_customer_followups SET
+        assigned_sales = ?,
+        assigned_by    = ?,
+        followed_up    = 0,
+        followed_up_at = NULL,
+        call_summary   = ?,
+        auto_assigned  = 1
+      WHERE branch = ? AND user_id = ?
+    `).run(salesRep, operator || null, logSummary, branch, userId);
+
+    // Transfer primary ownership of the lead to the showroom rep so the
+    // pre-visit rep STOPS seeing this customer in /revisit (post-visit
+    // follow-up). Their pre-visit work is still preserved in followup_log
+    // and lead_visits.pre_visit_rep — this only stops new responsibility.
+    db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
+      .run(salesRep, userId);
+  } else {
+    // Step C′ — no pre-visit rep (or same rep). The customer is now linked to a
+    // showroom rep, so AUTO-assign them in the branch follow-up queue so the
+    // manager doesn't have to distribute them manually. auto_assigned=1 lets
+    // the UI show a "اسناد تلقائي" tag. Don't overwrite a manual manager
+    // assignment (auto_assigned=0 AND assigned_sales set).
+    const bcf = db.prepare(
+      `SELECT id, assigned_sales, auto_assigned FROM branch_customer_followups
+         WHERE branch=? AND user_id=?`
+    ).get(branch, userId);
+    const manualAlreadySet = bcf && bcf.assigned_sales && bcf.auto_assigned === 0;
+    if (!manualAlreadySet) {
+      if (bcf) {
+        db.prepare(`
+          UPDATE branch_customer_followups SET
+            assigned_sales = ?,
+            assigned_at    = datetime('now'),
+            assigned_by    = ?,
+            auto_assigned  = 1
+          WHERE id = ?
+        `).run(salesRep, operator || 'reception', bcf.id);
+      } else {
+        db.prepare(`
+          INSERT INTO branch_customer_followups
+            (branch, user_id, assigned_sales, assigned_at, assigned_by, auto_assigned)
+          VALUES (?, ?, ?, datetime('now'), ?, 1)
+        `).run(branch, userId, salesRep, operator || 'reception');
+      }
+    }
+    // A re-link back to the pre-visit rep: the first link's handoff had moved
+    // the customer's owner to the showroom rep it named — move it back too.
+    if (relink && existing.pre_visit_rep && existing.pre_visit_rep !== existing.sales_rep) {
+      db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ? AND assigned_rep = ?`)
+        .run(salesRep, userId, existing.sales_rep);
+    }
+  }
+
+  auditLog(db, operator, 'set_sales', userId, {
+    table: 'lead_visits',
+    where: { user_id: userId, branch },
+    row:   existing || null,
+  });
+
+  return { preVisitRep, unchanged: false };
+}
+
 app.post('/api/visits/confirm', requireAuth, (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
   const { phone, visit_code, branch, user_id } = req.body || {};
@@ -1446,6 +1631,9 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     db.prepare(`
       INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)
     `).run(lead.user_id, visitBranch);
+    // Today's arrival → reception's «قايمة العملاء زيارة اليوم» (returning
+    // customers too — lead_visits above only keeps the first visit).
+    recordCheckin(db, { userId: lead.user_id, branch: visitBranch, source: 'confirm', recordedBy: req.user?.name });
   }
 
   // Resurrect a "lost" lead — they were closed in the re-visit funnel but
@@ -1605,11 +1793,13 @@ app.get('/api/reception/leads', requireAuth, authorizeRoles('reception', 'admin'
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/sales/reps — list showroom salespeople (role='sales').
-//   reception → locked to its own branch. admin → all or ?branch=
+//   reception / any branch manager → locked to own branch (a manager's
+//   «البيعة تتحسب لمين؟» lists his own team). admin → all or ?branch=
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/reps', requireAuth, authorizeRoles('reception', 'admin', 'sales', 'branch_manager'), (req, res) => {
-  if (denyNonReceptionManager(req, res)) return;
-  const branch = actsAsReception(req) ? (req.user.branch || null) : (req.query.branch || null);
+  const branch = (actsAsReception(req) || req.user?.role === 'branch_manager')
+    ? (req.user.branch || null) : (req.query.branch || null);
+  if (req.user?.role === 'branch_manager' && !branch) return res.status(400).json({ error: 'branch_required' });
   const db = getDb();
   const rows = branch
     ? db.prepare(`SELECT name, branch FROM users WHERE role='sales' AND active=1 AND branch=? ORDER BY name`).all(branch)
@@ -1632,89 +1822,25 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
 
   const db = getDb();
 
-  // Step A — who followed this lead up online BEFORE the visit.
-  const fuRow = db.prepare(
-    `SELECT assigned_sales FROM branch_customer_followups WHERE user_id = ? AND branch = ?`
-  ).get(user_id, branch);
-  const preVisitRep = fuRow?.assigned_sales || null;
-
-  // Step B — store BOTH the showroom rep and the pre-visit rep on the visit.
-  // Create the row if the salesperson is set without a prior confirm (robust).
-  // Full old row captured for the audit/undo ledger.
-  const existing = db.prepare(
-    `SELECT * FROM lead_visits WHERE user_id=? AND branch=?`
-  ).get(user_id, branch);
-  if (existing) {
-    db.prepare(`UPDATE lead_visits SET sales_rep=?, pre_visit_rep=? WHERE id=?`)
-      .run(sales_rep, preVisitRep, existing.id);
-  } else {
-    db.prepare(
-      `INSERT INTO lead_visits (user_id, branch, sales_rep, pre_visit_rep) VALUES (?,?,?,?)`
-    ).run(user_id, branch, sales_rep, preVisitRep);
+  // Only an active salesperson of THIS branch (the names /api/sales/reps
+  // offers) — the stored name is the DB's exact one, never the client's string.
+  const repRow = findBranchSalesRep(db, sales_rep, branch);
+  if (!repRow) {
+    return res.status(400).json({
+      error: 'السيلز ده مش من سيلز الفرع (أو متوقف) — اختار من القايمة',
+      code:  'rep_not_in_branch',
+    });
   }
 
-  // Step C — handoff: the pre-visit rep is NOT the showroom rep. Log the
-  // handoff and move the follow-up record over to the showroom rep.
-  if (preVisitRep && preVisitRep !== sales_rep) {
-    const logSummary = `العميل زار الفرع. تابعه قبل الزيارة [${preVisitRep}]، ولكن استقبله في الصالة [${sales_rep}].`;
-    logFollowup(db, branch, user_id, sales_rep, logSummary);
-    db.prepare(`
-      UPDATE branch_customer_followups SET
-        assigned_sales = ?,
-        assigned_by    = ?,
-        followed_up    = 0,
-        followed_up_at = NULL,
-        call_summary   = ?,
-        auto_assigned  = 1
-      WHERE branch = ? AND user_id = ?
-    `).run(sales_rep, req.user?.name || null, logSummary, branch, user_id);
+  // Steps A–C (pre-visit rep, the visit row, the handoff/auto-assign) + the
+  // revertable set_sales audit row — shared with the reception-recorded sale.
+  const { preVisitRep } = db.transaction(() => linkVisitSales(db, {
+    userId: user_id, branch, salesRep: repRow.name, operator: req.user?.name,
+  }))();
 
-    // Transfer primary ownership of the lead to the showroom rep so the
-    // pre-visit rep STOPS seeing this customer in /revisit (post-visit
-    // follow-up). Their pre-visit work is still preserved in followup_log
-    // and lead_visits.pre_visit_rep — this only stops new responsibility.
-    db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
-      .run(sales_rep, user_id);
-  } else {
-    // Step C′ — no pre-visit rep (or same rep). The customer is now linked to a
-    // showroom rep, so AUTO-assign them in the branch follow-up queue so the
-    // manager doesn't have to distribute them manually. auto_assigned=1 lets
-    // the UI show a "اسناد تلقائي" tag. Don't overwrite a manual manager
-    // assignment (auto_assigned=0 AND assigned_sales set).
-    const bcf = db.prepare(
-      `SELECT id, assigned_sales, auto_assigned FROM branch_customer_followups
-         WHERE branch=? AND user_id=?`
-    ).get(branch, user_id);
-    const manualAlreadySet = bcf && bcf.assigned_sales && bcf.auto_assigned === 0;
-    if (!manualAlreadySet) {
-      if (bcf) {
-        db.prepare(`
-          UPDATE branch_customer_followups SET
-            assigned_sales = ?,
-            assigned_at    = datetime('now'),
-            assigned_by    = ?,
-            auto_assigned  = 1
-          WHERE id = ?
-        `).run(sales_rep, req.user?.name || 'reception', bcf.id);
-      } else {
-        db.prepare(`
-          INSERT INTO branch_customer_followups
-            (branch, user_id, assigned_sales, assigned_at, assigned_by, auto_assigned)
-          VALUES (?, ?, ?, datetime('now'), ?, 1)
-        `).run(branch, user_id, sales_rep, req.user?.name || 'reception');
-      }
-    }
-  }
-
-  auditLog(db, req.user?.name, 'set_sales', user_id, {
-    table: 'lead_visits',
-    where: { user_id, branch },
-    row:   existing || null,
-  });
-
-  console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${sales_rep}` +
-    (preVisitRep && preVisitRep !== sales_rep ? ` (pre-visit: ${preVisitRep})` : ''));
-  return res.json({ ok: true, user_id, branch, sales_rep, pre_visit_rep: preVisitRep });
+  console.log(`👥 SALES LINK: ${user_id} @ ${branch} → ${repRow.name}` +
+    (preVisitRep && preVisitRep !== repRow.name ? ` (pre-visit: ${preVisitRep})` : ''));
+  return res.json({ ok: true, user_id, branch, sales_rep: repRow.name, pre_visit_rep: preVisitRep });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1795,6 +1921,8 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
     // Record the actual showroom visit.
     db.prepare(`INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)`)
       .run(userId, branch);
+    // …and today's arrival for reception's «قايمة العملاء زيارة اليوم».
+    recordCheckin(db, { userId, branch, source: 'walkin', recordedBy: req.user?.name });
   });
   tx();
 
@@ -1830,6 +1958,203 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
     lead_class:      'visited',
     walk_in:         true,
     existed,
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/reception/today-visits — «قايمة العملاء زيارة اليوم»: everyone whose
+// visit was confirmed TODAY (Cairo day) at the branch — walk-ins and returning
+// customers included (visit_checkins) — with the arrival time, the salesperson
+// they stood with THIS visit, and the sales already recorded for them today.
+//   reception / faisal + nasr_city managers → locked to own branch.
+//   admin → ?branch=<id> required.
+// Read-only: no CAPI, no ManyChat, no writes.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/reception/today-visits', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const branch = actsAsReception(req)
+    ? (req.user.branch || null)
+    : ((typeof req.query.branch === 'string' && req.query.branch.trim()) || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const db  = getDb();
+  const day = cairoDay();
+  const [start, end] = cairoDayBoundsSql(day);
+
+  const rows = db.prepare(`
+    SELECT c.user_id, c.checked_in_at, c.source,
+           lp.first_name, lp.lead_class, lp.campaign_source, lp.phone AS profile_phone,
+           (SELECT GROUP_CONCAT(ph.phone, ' ، ') FROM lead_phones ph WHERE ph.user_id = c.user_id) AS phones,
+           lv.sales_rep AS lv_sales_rep, lv.sales_rep_set_at
+    FROM visit_checkins c
+    JOIN lead_profiles lp ON lp.user_id = c.user_id
+    LEFT JOIN lead_visits lv ON lv.user_id = c.user_id AND lv.branch = c.branch
+    WHERE c.branch = ? AND c.visit_day = ?
+    ORDER BY c.checked_in_at DESC, c.id DESC
+  `).all(branch, day);
+
+  // Today's sales for these customers at this branch (Cairo-day bounds, UTC).
+  const salesByUser = new Map();
+  if (rows.length) {
+    const ids = [...new Set(rows.map(r => r.user_id))];
+    const sales = db.prepare(`
+      SELECT id, user_id, contract_number, rep, price, created_at, entered_by, entered_via
+      FROM purchases
+      WHERE branch = ? AND user_id IN (${ids.map(() => '?').join(', ')})
+        AND datetime(created_at) >= ? AND datetime(created_at) < ?
+      ORDER BY created_at, id
+    `).all(branch, ...ids, start, end);
+    for (const p of sales) {
+      if (!salesByUser.has(p.user_id)) salesByUser.set(p.user_id, []);
+      salesByUser.get(p.user_id).push(p);
+    }
+  }
+
+  const isoZ = (s) => { const d = sqlUtcToDate(s); return d && !isNaN(d) ? d.toISOString().slice(0, 19) + 'Z' : null; };
+
+  const visits = rows.map(r => {
+    const setThisVisit = repSetThisVisit(r.lv_sales_rep, r.sales_rep_set_at, r.checked_in_at);
+    const arrived      = sqlUtcToDate(r.checked_in_at);
+    const salesToday   = (salesByUser.get(r.user_id) || []).map(p => ({
+      purchase_id:     p.id,
+      contract_number: p.contract_number || null,
+      rep:             p.rep || null,
+      price:           p.price ?? null,
+      created_at:      isoZ(p.created_at),
+      entered_by:      p.entered_by || null,
+      entered_via:     p.entered_via || null,
+    }));
+    return {
+      user_id:            r.user_id,
+      first_name:         r.first_name || null,
+      phones:             r.phones || r.profile_phone || null,
+      lead_class:         r.lead_class || null,
+      campaign_source:    r.campaign_source || null,
+      walk_in:            r.source === 'walkin',
+      checked_in_at:      isoZ(r.checked_in_at),
+      arrival_time:       arrived && !isNaN(arrived) ? cairoHHMM(arrived) : null,
+      sales_rep:          setThisVisit ? r.lv_sales_rep : null,
+      previous_sales_rep: setThisVisit ? null : (r.lv_sales_rep || null),
+      sales_today:        salesToday,
+      sold_today:         salesToday.length > 0,
+    };
+  });
+
+  return res.json({ branch, day, count: visits.length, visits });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/reception/sales — reception records a sale FOR a salesperson
+// (owner 2026-11-16: «الريسبشن هو اللي بيسجل البيع للسيلز وبيكتب بيانات العقد»).
+// The sale is stored IN THE SALESPERSON'S NAME (purchases.rep — it counts for
+// his target exactly as before) with who typed it in (purchases.entered_*).
+// When no salesperson was linked at THIS visit yet, the visit is linked to the
+// sale's salesperson in the same transaction (same handoff + revertable
+// set_sales audit as /api/visits/set-sales). A visit that already has its
+// salesperson from this visit is never moved by a sale — a second contract for
+// another salesperson («+ عقد تاني») is credited to him and the visit, the
+// follow-up and the customer's owner stay with the first one (changing the
+// visit's salesperson is the list's explicit «غيّر» → set-sales).
+// Body: { user_id, sales_rep?, product_ids[], contract_number, price?, notes?,
+//         branch? (admin only) }
+//   reception / faisal + nasr_city managers → locked to own branch.
+// Only for a customer checked in TODAY (Cairo day) at the branch. Everything
+// up to the commit is synchronous, so a double click is serialized and the
+// second one hits the duplicate-contract guard (409).
+// Errors: { error: <Arabic>, code }
+// ════════════════════════════════════════════════════════════════════════════
+app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const body = req.body || {};
+  const fail = (status, code, error, extra = {}) => res.status(status).json({ error, code, ...extra });
+
+  const branch = actsAsReception(req)
+    ? (req.user.branch || null)
+    : ((typeof body.branch === 'string' && body.branch.trim()) || null);
+  if (!branch) return fail(400, 'branch_required', 'اختار الفرع');
+
+  const userId = typeof body.user_id === 'string' ? body.user_id.trim() : '';
+  if (!userId) return fail(400, 'user_id_required', 'اختار العميل');
+
+  const db = getDb();
+  const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
+  if (!lead) return fail(404, 'lead_not_found', 'العميل ده مش موجود');
+
+  // Only a customer who ARRIVED today at this branch (the «زيارة اليوم» list).
+  const checkin = todayCheckin(db, userId, branch);
+  if (!checkin) {
+    // Never just «confirm it first»: a confirm sends the customer a ManyChat
+    // visit message + a Meta event, so it is only for a customer who is here now.
+    return fail(409, 'no_visit_today',
+      'العميل ده مش متأكد وصوله النهارده في الفرع — لو هو موجود دلوقتي أكّد زيارته الأول، ' +
+      'ولو البيعة من زيارة قبل كده مدير الفرع يسجّلها من صفحة العميل باسم السيلز');
+  }
+
+  // The salesperson linked at THIS visit (not an earlier one) is the default.
+  const lv = db.prepare(`SELECT * FROM lead_visits WHERE user_id = ? AND branch = ?`).get(userId, branch);
+  const visitRep = lv && repSetThisVisit(lv.sales_rep, lv.sales_rep_set_at, checkin.checked_in_at)
+    ? lv.sales_rep : null;
+
+  const wanted = (typeof body.sales_rep === 'string' && body.sales_rep.trim()) || visitRep;
+  if (!wanted) return fail(400, 'sales_rep_required', 'اختار السيلز اللي البيعة تتحسب له');
+  const repRow = findBranchSalesRep(db, wanted, branch);
+  if (!repRow) return fail(400, 'rep_not_in_branch', 'السيلز ده مش من سيلز الفرع (أو متوقف) — اختار من القايمة');
+  const rep = repRow.name; // the DB's exact name — never the client's string
+
+  const products = validateProductIds(db, body.product_ids);
+  if (products.code) return fail(400, products.code, products.error);
+  if (!products.ids.length) {
+    return fail(400, 'products_required', 'اختار المنتج اللي اتباع للعميل قبل ما تسجّل البيعة');
+  }
+
+  const contractNumber = normalizeContractNumber(body.contract_number);
+  if (!contractNumber) return fail(400, 'contract_required', 'اكتب رقم العقد');
+  if (contractNumber.length > 60) return fail(400, 'contract_too_long', 'رقم العقد طويل أوي');
+
+  const priceParsed = parseEgpPrice(body.price);
+  if (priceParsed.error) return fail(400, 'bad_price', 'اكتب السعر أرقام بس (مثلاً 38500)');
+  const price = priceParsed.value;
+  const notes = (typeof body.notes === 'string' && body.notes.trim()) ? body.notes.trim().slice(0, 1000) : null;
+
+  const dup = findDuplicatePurchase(db, { userId, contractNumber, rep, productIds: products.ids });
+  if (dup) return fail(409, dup.code, dup.error, { purchase_id: dup.purchase_id });
+
+  // Legacy product_id text = the first product's name (old reports read it).
+  const legacyLabel = db.prepare(`SELECT name FROM products WHERE id = ?`).get(products.ids[0])?.name || null;
+
+  let linkedVisit = false;
+  let purchaseId;
+  db.transaction(() => {
+    // (a) a visit with no salesperson from THIS visit gets the sale's one
+    // (per-visit "bought" counts join pu.rep = v.sales_rep). One that already
+    // has its salesperson from this visit is never moved by a sale.
+    if (!visitRep) {
+      linkVisitSales(db, { userId, branch, salesRep: rep, operator: req.user.name });
+      linkedVisit = true;
+    }
+    // (b) the sale + its items + lead_class
+    purchaseId = insertPurchaseRows(db, {
+      userId, legacyLabel, price, branch, notes, rep, contractNumber, productIds: products.ids,
+      enteredBy: req.user.name, enteredById: req.user.id ?? null, enteredByRole: req.user.role,
+      enteredVia: 'reception',
+    });
+    // (c) display-only ledger row (not in REVERTABLE_AUDIT_TABLES)
+    auditLog(db, req.user.name, 'reception_sale', userId, {
+      table: 'purchases', where: { id: purchaseId }, row: null,
+      rep, branch, contract_number: contractNumber,
+    });
+  })();
+
+  console.log(`💰 PURCHASE (reception ${req.user.name}): user:${userId} contract:${contractNumber} ` +
+    `price:${price ?? '?'} rep:${rep} branch:${branch}${linkedVisit ? ' (visit linked)' : ''}`);
+
+  afterPurchase(db, req, {
+    userId, purchaseId, rep, branch, price, contractNumber, viaReception: true,
+  });
+
+  return res.json({
+    ok: true, purchase_id: purchaseId, lead_class: 'purchased',
+    rep, branch, contract_number: contractNumber, linked_visit: linkedVisit,
   });
 });
 
@@ -4274,26 +4599,173 @@ app.patch('/api/branch/users/:id/toggle-active', requireAuth, authorizeRoles('ad
   return res.json({ ok: true, id, active: next });
 });
 
+// ── Shared purchase helpers ─────────────────────────────────────────────────
+// Used by POST /api/purchases (staff) and POST /api/reception/sales (reception
+// records the sale for a salesperson), so both write a sale the same way.
+
+// ٠-٩ / ۰-۹ → 0-9 (reception types on Arabic keyboards).
+const toWesternDigits = (s) => String(s).replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+                                         .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0));
+// Contract number: Western digits, single spaces, trimmed → string | null.
+function normalizeContractNumber(v) {
+  if (v == null) return null;
+  const s = toWesternDigits(v).replace(/\s+/g, ' ').trim();
+  return s || null;
+}
+// Whole EGP > 0 → { value } | { error }; null/'' → { value: null }.
+// Thousands separators and «ج.م»/«جنيه» are dropped; '38.500' is refused as
+// ambiguous (38.5 or 38,500?).
+function parseEgpPrice(v) {
+  if (v == null || v === '') return { value: null };
+  const s = toWesternDigits(v).replace(/[\s,،٬']/g, '').replace(/ج\.?م|جنيه/g, '');
+  if (!/^\d+$/.test(s)) return { error: true };
+  const n = Number(s);
+  return (n > 0 && n <= 100000000) ? { value: n } : { error: true };
+}
+// Catalog product ids → { ids } (deduped, positive ints) | { code, error } when
+// one is not in the catalog — checked BEFORE anything is written.
+function validateProductIds(db, raw) {
+  const ids = [...new Set((Array.isArray(raw) ? raw : []).map(v => parseInt(v, 10)).filter(n => Number.isFinite(n) && n > 0))];
+  const missing = ids.filter(id => !db.prepare(`SELECT 1 FROM products WHERE id = ?`).get(id));
+  if (missing.length) return { code: 'unknown_product', error: 'فيه منتج مش موجود في الكتالوج — حدّث الصفحة واختار تاني' };
+  return { ids };
+}
+// Double-entry guard → { code, error, purchase_id } | null.
+//   With a contract number: the same customer + the same contract (any case,
+//   trimmed) is the same sale. Without one: only an identical resubmit (same rep
+//   + same product set) within 60 s. A different contract / product set is a
+//   real second sale and goes through (multi-contract customers).
+function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds }) {
+  if (contractNumber) {
+    const row = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND LOWER(TRIM(contract_number)) = LOWER(?)
+                            ORDER BY id DESC LIMIT 1`).get(userId, contractNumber);
+    if (row) return { code: 'duplicate_contract', purchase_id: row.id,
+      // \u2068…\u2069 isolate the (LTR) number so «123-A» doesn't flip inside the Arabic line
+      error: `العقد رقم \u2068${contractNumber}\u2069 متسجّل قبل كده للعميل ده — مش هيتسجّل تاني` };
+    return null;
+  }
+  const want = [...productIds].sort((a, b) => a - b).join(',');
+  const recent = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND rep IS ? AND COALESCE(TRIM(contract_number),'') = ''
+                             AND datetime(created_at) >= datetime('now','-60 seconds')`).all(userId, rep);
+  for (const r of recent) {
+    const have = db.prepare(`SELECT product_id FROM purchase_items WHERE purchase_id = ? ORDER BY product_id`).all(r.id)
+                   .map(x => x.product_id).join(',');
+    if (have === want) return { code: 'duplicate_recent', purchase_id: r.id, error: 'البيعة دي اتسجلت من ثواني — حدّث الصفحة' };
+  }
+  return null;
+}
+// The sale row + its catalog items + lead_class 'purchased'. Call it INSIDE a
+// db.transaction, so a failure never leaves a counted sale without its items.
+//   p: { userId, legacyLabel, price, branch, notes, rep, contractNumber, productIds,
+//        enteredBy, enteredById, enteredByRole, enteredVia }  → purchaseId
+function insertPurchaseRows(db, p) {
+  const r = db.prepare(`INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number,
+                          entered_by, entered_by_id, entered_by_role, entered_via) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(p.userId, p.legacyLabel, p.price, p.branch, p.notes, p.rep, p.contractNumber,
+         p.enteredBy, p.enteredById, p.enteredByRole, p.enteredVia);
+  const ins = db.prepare(`INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)`);
+  for (const pid of p.productIds) ins.run(r.lastInsertRowid, pid);
+  // Mark lead as purchased (terminal state — won't be overridden by scoring)
+  db.prepare(`UPDATE lead_profiles SET lead_class = 'purchased',
+      purchased_at = CASE WHEN purchased_at IS NULL THEN datetime('now') ELSE purchased_at END,
+      last_activity = datetime('now') WHERE user_id = ?`).run(p.userId);
+  return Number(r.lastInsertRowid);
+}
+// What follows a recorded sale, AFTER the commit, in this order:
+//   1) Meta CAPI "Purchase" — offline conversion back to the ad account so Meta
+//      can optimize toward real buyers. Skipped entirely for demo/training
+//      sandbox sessions (a demo_ user works on the demo DB — never pollute the
+//      ad data). Fire-and-forget — never blocks the response. No value sent.
+//   2) the admin war-room notification (reception's sale says who entered it)
+//   3) the ManyChat purchase flow (Event-Triggered Flow: Purchase Made)
+function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contractNumber, viaReception, creditedByOther = false }) {
+  if (!String(req.user?.name || '').startsWith('demo_')) {
+    const capiLead = db.prepare(`
+      SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
+                                 WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
+             lp.first_name, lp.last_name, lp.gender, lp.preferred_branch
+      FROM lead_profiles lp WHERE lp.user_id = ?
+    `).get(userId);
+    sendMetaEvent('Purchase',
+      { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
+        gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: userId },
+      `purchase_${purchaseId}`);
+  }
+
+  // Every purchase → macro alert for the admin war-room.
+  createNotification(db, 'admin', 'new_purchase',
+    `🎉 تم إغلاق تعاقد جديد (عقد: ${contractNumber || '—'}) بقيمة ` +
+    `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
+    `${rep || '؟'} في فرع ${branch || '—'}` +
+    (viaReception ? ` — اتسجّل من الاستقبال بواسطة ${req.user?.name || '؟'}`
+      : creditedByOther ? ` — سجّلها ${req.user?.name || '؟'} باسم السيلز` : ''));
+
+  // Event-Triggered Flow: Purchase Made
+  const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();
+  if (purchaseFlowSetting && purchaseFlowSetting.value && purchaseFlowSetting.value.trim() !== '') {
+    getManyChatClient().sendFlow({ user_id: userId, flow_id: purchaseFlowSetting.value.trim() })
+      .catch(err => console.error('[Event-Trigger] Purchase Flow failed:', err.message));
+  } else {
+    console.warn('[Event-Trigger] ⚠️ Purchase recorded but manychat_purchase_flow is empty — no message sent. Set it in Settings → API.');
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/purchases — Sales rep records an offline purchase for a lead.
-// Body: { user_id, product_id?, price?, branch?, notes? }
-// Returns: { ok, purchase_id, lead_class }
+// POST /api/purchases — staff record an offline purchase for a lead, credited
+// to THEMSELVES (rep = the logged-in user). Used by admin + branch managers
+// (LeadDetail «تسجيل شراء», RevisitView «اشترى»), who may instead credit an
+// active salesperson of the sale's branch (body.sales_rep — «البيعة تتحسب
+// لمين؟»: a deal closed by phone or after the visit day, which reception's
+// today list can't take; a branch manager only for his own branch). Sales /
+// legacy rep are still accepted here (the portal before 2026-11-16 posts here;
+// their buttons are gone from the new portal — reception now records their
+// sales through POST /api/reception/sales), but not for a customer reception
+// already recorded a sale for today (an old tab's second entry of the same
+// sale, often with no contract number). Reception gets 403: a sale posted here
+// would be credited to the receptionist.
+// Body: { user_id, product_ids[], product_id?, price?, branch?, notes?, contract_number?,
+//         sales_rep? (admin / branch_manager) }
+// Guards: unknown catalog product → 400; the same contract for the same
+// customer (or an identical resubmit within 60 s) → 409 { error, code, purchase_id }.
+// The sale, its items and lead_class are written in ONE transaction.
+// Returns: { ok, purchase_id, lead_class, rep }
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/purchases', requireAuth, (req, res) => {
-  const { user_id, product_id, product_ids, price, branch, notes, contract_number } = req.body || {};
+  const { user_id, product_id, product_ids, price, branch, notes, contract_number, sales_rep } = req.body || {};
+  const role = req.user?.role;
+  if (role === 'reception') {
+    return res.status(403).json({ error: 'الاستقبال بيسجّل البيع من قايمة العملاء زيارة اليوم', code: 'reception_use_today_list' });
+  }
   if (!user_id || typeof user_id !== 'string') {
     return res.status(400).json({ error: 'user_id is required' });
   }
   const db  = getDb();
-  const rep = req.user?.name || req.headers['x-rep'] || null;
+  let rep = req.user?.name || req.headers['x-rep'] || null;
 
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
 
-  // Normalize product_ids: accept array of numeric IDs from the new catalog.
-  const productIds = Array.isArray(product_ids)
-    ? product_ids.map(v => parseInt(v, 10)).filter(n => Number.isFinite(n) && n > 0)
-    : [];
+  // An old tab of a salesperson (buttons cached from before 2026-11-16) must not
+  // enter a sale reception already recorded for this customer today.
+  if (role === 'sales' || role === 'rep') {
+    const [dayStart, dayEnd] = cairoDayBoundsSql(cairoDay());
+    const already = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND entered_via = 'reception'
+                                  AND datetime(created_at) >= ? AND datetime(created_at) < ?
+                                ORDER BY id DESC LIMIT 1`).get(user_id, dayStart, dayEnd);
+    if (already) {
+      return res.status(409).json({
+        error: 'الاستقبال سجّل بيعة للعميل ده النهارده — البيع بقى بيسجّله الاستقبال، حدّث الصفحة',
+        code: 'reception_already_recorded', purchase_id: already.id,
+      });
+    }
+  }
+
+  // Normalize product_ids: accept array of numeric IDs from the new catalog —
+  // every id must exist BEFORE anything is written (an unknown id used to fail
+  // the item insert after the sale row was already counted).
+  const checked = validateProductIds(db, product_ids);
+  if (checked.code) return res.status(400).json({ error: checked.error, code: checked.code });
+  const productIds = checked.ids;
 
   // Legacy product_id text field is kept for backward compat; for new flows
   // we store the first selected product's name there so old reports still work.
@@ -4323,67 +4795,48 @@ app.post('/api/purchases', requireAuth, (req, res) => {
       || null;
   }
 
-  const result = db.prepare(`
-    INSERT INTO purchases (user_id, product_id, price, branch, notes, rep, contract_number)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(user_id, legacyProductLabel, price || null, branchVal, notes || null, rep,
-         (contract_number && String(contract_number).trim()) || null);
-
-  // Link the catalog products to this purchase (many-to-many).
-  if (productIds.length) {
-    const insertItem = db.prepare(`
-      INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)
-    `);
-    const insertMany = db.transaction((ids) => {
-      for (const pid of ids) insertItem.run(result.lastInsertRowid, pid);
-    });
-    insertMany(productIds);
+  // «البيعة تتحسب لمين؟» — admin / branch manager credit a salesperson of the
+  // sale's branch (the DB's exact name, never the client's string).
+  const creditName = (role === 'admin' || role === 'branch_manager') && typeof sales_rep === 'string'
+    ? sales_rep.trim() : '';
+  let creditedByOther = false;
+  if (creditName && creditName !== String(req.user?.name || '').trim()) {
+    if (role === 'branch_manager' && branchVal !== req.user.branch) {
+      return res.status(403).json({
+        error: 'تقدر تسجّل البيعة باسم سيلز فرعك بس، وفي فرعك', code: 'other_branch',
+      });
+    }
+    const repRow = branchVal ? findBranchSalesRep(db, creditName, branchVal) : null;
+    if (!repRow) {
+      return res.status(400).json({
+        error: 'السيلز ده مش من سيلز الفرع (أو متوقف) — اختار من القايمة', code: 'rep_not_in_branch',
+      });
+    }
+    rep = repRow.name;
+    creditedByOther = true;
   }
 
-  // Mark lead as purchased (terminal state — won't be overridden by scoring)
-  db.prepare(`
-    UPDATE lead_profiles SET
-      lead_class    = 'purchased',
-      purchased_at  = CASE WHEN purchased_at IS NULL THEN datetime('now') ELSE purchased_at END,
-      last_activity = datetime('now')
-    WHERE user_id = ?
-  `).run(user_id);
+  const contractNumber = normalizeContractNumber(contract_number);
 
-  console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}`);
+  // Double entry (the same contract, or a double click) → 409, nothing written.
+  const dup = findDuplicatePurchase(db, { userId: user_id, contractNumber, rep, productIds });
+  if (dup) return res.status(409).json({ error: dup.error, code: dup.code, purchase_id: dup.purchase_id });
 
-  // Meta CAPI "Purchase" — offline conversion back to the ad account so Meta
-  // can optimize toward real buyers. Skipped entirely for demo/training sandbox
-  // sessions (a demo_ user works on the demo DB — never pollute the ad data).
-  // Fire-and-forget — never blocks the response.
-  if (!String(req.user?.name || '').startsWith('demo_')) {
-    const capiLead = db.prepare(`
-      SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
-                                 WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
-             lp.first_name, lp.last_name, lp.gender, lp.preferred_branch
-      FROM lead_profiles lp WHERE lp.user_id = ?
-    `).get(user_id);
-    sendMetaEvent('Purchase',
-      { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
-        gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: user_id },
-      `purchase_${result.lastInsertRowid}`);
-  }
+  const purchaseId = db.transaction(() => insertPurchaseRows(db, {
+    userId: user_id, legacyLabel: legacyProductLabel, price: price || null, branch: branchVal,
+    notes: notes || null, rep, contractNumber, productIds,
+    enteredBy: req.user?.name || null, enteredById: req.user?.id ?? null,
+    enteredByRole: req.user?.role || null, enteredVia: 'staff',
+  }))();
 
-  // Every purchase → macro alert for the admin war-room.
-  createNotification(db, 'admin', 'new_purchase',
-    `🎉 تم إغلاق تعاقد جديد (عقد: ${contract_number || '—'}) بقيمة ` +
-    `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
-    `${rep || '؟'} في فرع ${branchVal || '—'}`);
+  console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}` +
+    (creditedByOther ? ` (entered by ${req.user?.name})` : ''));
 
-  // Event-Triggered Flow: Purchase Made
-  const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();
-  if (purchaseFlowSetting && purchaseFlowSetting.value && purchaseFlowSetting.value.trim() !== '') {
-    getManyChatClient().sendFlow({ user_id, flow_id: purchaseFlowSetting.value.trim() })
-      .catch(err => console.error('[Event-Trigger] Purchase Flow failed:', err.message));
-  } else {
-    console.warn('[Event-Trigger] ⚠️ Purchase recorded but manychat_purchase_flow is empty — no message sent. Set it in Settings → API.');
-  }
+  afterPurchase(db, req, {
+    userId: user_id, purchaseId, rep, branch: branchVal, price, contractNumber, viaReception: false, creditedByOther,
+  });
 
-  return res.json({ ok: true, purchase_id: result.lastInsertRowid, lead_class: 'purchased' });
+  return res.json({ ok: true, purchase_id: purchaseId, lead_class: 'purchased', rep });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5080,6 +5533,7 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   const contracts = db.prepare(`
     SELECT p.id, p.user_id, p.price, p.contract_number, p.branch, p.rep,
            p.product_id, p.notes, p.created_at,
+           p.entered_by, p.entered_by_role, p.entered_via,
            lp.first_name, lp.phone
     FROM purchases p
     LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
@@ -5146,14 +5600,28 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
 
 app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
   const db  = getDb();
-  const row = db.prepare(`SELECT id, branch, contract_number FROM purchases WHERE id = ?`).get(req.params.id);
+  const row = db.prepare(`SELECT id, user_id, branch, contract_number, rep FROM purchases WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'contract_not_found' });
   if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const { price, contract_number, product_ids } = req.body || {};
+  const { price, contract_number, product_ids, rep: repIn } = req.body || {};
   const newNumber = (contract_number && String(contract_number).trim()) || null;
+
+  // Optional: the salesperson the sale counts for (a sale entered for the wrong
+  // one). Only an active salesperson of the contract's branch, by the DB's exact
+  // name; absent / unchanged → the rep stays as it is.
+  let newRep = null;
+  if (typeof repIn === 'string' && repIn.trim() && repIn.trim() !== String(row.rep || '').trim()) {
+    const repRow = row.branch ? findBranchSalesRep(db, repIn, row.branch) : null;
+    if (!repRow) {
+      return res.status(400).json({
+        error: 'السيلز ده مش من سيلز فرع العقد (أو متوقف) — اختار من القايمة', code: 'rep_not_in_branch',
+      });
+    }
+    if (repRow.name !== row.rep) newRep = repRow.name;
+  }
 
   // Validate the products edit (when provided) BEFORE writing anything. A
   // contract must keep at least one product (product selection is mandatory).
@@ -5180,13 +5648,21 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
       // Keep the legacy single product_id in sync (first item) for older views.
       db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(validIds[0], row.id);
     }
+    if (newRep) {
+      db.prepare(`UPDATE purchases SET rep = ? WHERE id = ?`).run(newRep, row.id);
+      // display-only ledger row (not in REVERTABLE_AUDIT_TABLES)
+      auditLog(db, req.user?.name, 'contract_rep_change', row.user_id, {
+        table: 'purchases', where: { id: row.id }, row: null, from: row.rep || null, to: newRep,
+      });
+    }
   })();
 
   // Macro alert for the admin war-room.
   createNotification(db, 'admin', 'contract_modified',
-    `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]`);
+    `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]` +
+    (newRep ? ` — البيعة بقت باسم [${newRep}] بدل [${row.rep || '—'}]` : ''));
 
-  return res.json({ ok: true });
+  return res.json({ ok: true, rep: newRep || row.rep || null });
 });
 
 app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
@@ -5878,6 +6354,10 @@ function renameRepReferences(db, oldName, newName) {
   db.prepare(`UPDATE branch_customer_followups SET assigned_by = ?    WHERE assigned_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE branch_customer_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE purchases SET rep = ? WHERE rep = ?`).run(newName, oldName);
+  // Who typed a sale in / confirmed an arrival — display only (never ownership),
+  // but it should still name the account as it is called now.
+  db.prepare(`UPDATE purchases SET entered_by = ? WHERE entered_by = ?`).run(newName, oldName);
+  db.prepare(`UPDATE visit_checkins SET recorded_by = ? WHERE recorded_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE followup_log SET sales = ? WHERE sales = ?`).run(newName, oldName);
   db.prepare(`UPDATE revisit_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE sales_targets SET scope_name = ? WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(newName, oldName);
@@ -6619,6 +7099,7 @@ function seedDemoData(db) {
   db.prepare(`DELETE FROM lead_profiles      WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_phones        WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM lead_visits        WHERE user_id LIKE '${PREFIX}%'`).run();
+  db.prepare(`DELETE FROM visit_checkins     WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM purchases          WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM branch_customer_followups WHERE user_id LIKE '${PREFIX}%'`).run();
   db.prepare(`DELETE FROM revisit_followups  WHERE user_id LIKE '${PREFIX}%'`).run();
@@ -6746,6 +7227,31 @@ function seedDemoData(db) {
       `).run(vDate, uid);
     });
   })();
+
+  // ── 2b. Today's arrivals — so demo_reception's «قايمة العملاء زيارة اليوم»
+  // is never empty (the visits above are 2–12 days old). Two returning
+  // customers checked in TODAY (Cairo day), never before today's Cairo start:
+  //   11 — confirmed ~90 min ago, salesperson NOT picked yet this visit (shows
+  //        the picker + «المرة اللي فاتت كان مع: demo_sales»).
+  //   12 — walk-in ~30 min ago, already standing with demo_sales.
+  {
+    const today    = cairoDay(NOW);
+    const minStart = cairoDayStart(today).getTime() + 60 * 1000;
+    const clampTs  = (msAgo) => new Date(Math.max(NOW.getTime() - msAgo, minStart));
+    const in11 = clampTs(90 * 60 * 1000);
+    const in12 = clampTs(30 * 60 * 1000);
+    const set12 = new Date(Math.max(NOW.getTime() - 25 * 60 * 1000, in12.getTime()));
+    const insCheckin = db.prepare(`
+      INSERT OR IGNORE INTO visit_checkins (user_id, branch, visit_day, checked_in_at, source, recorded_by)
+      VALUES (?, ?, ?, ?, ?, 'demo_reception')
+    `);
+    db.transaction(() => {
+      insCheckin.run(`${PREFIX}11`, BRANCH, today, toSqlUtc(in11), 'confirm');
+      insCheckin.run(`${PREFIX}12`, BRANCH, today, toSqlUtc(in12), 'walkin');
+      db.prepare(`UPDATE lead_visits SET sales_rep_set_at = ? WHERE user_id = ? AND branch = ?`)
+        .run(toSqlUtc(set12), `${PREFIX}12`, BRANCH);
+    })();
+  }
 
   // ── 3. Purchases — 5 completed sales by demo_sales ──────────────────────
   // The last two are older repeat contracts sitting in the two PREVIOUS
@@ -7115,8 +7621,9 @@ app.post('/api/admin/reset-visits', requireAuth, requireRole('admin'), (req, res
     WHERE user_id IN (SELECT user_id FROM lead_profiles WHERE lead_class = 'new')
   `).run();
   const d4 = db.prepare(`DELETE FROM lead_visits`).run();
-  console.log(`🔄 RESET-VISITS: events=${d1.changes} profiles=${d2.changes} follow_up=${d3.changes} lead_visits=${d4.changes}`);
-  return res.json({ ok: true, events_deleted: d1.changes, profiles_reset: d2.changes, follow_up_cleared: d3.changes, lead_visits_cleared: d4.changes });
+  const d5 = db.prepare(`DELETE FROM visit_checkins`).run();
+  console.log(`🔄 RESET-VISITS: events=${d1.changes} profiles=${d2.changes} follow_up=${d3.changes} lead_visits=${d4.changes} visit_checkins=${d5.changes}`);
+  return res.json({ ok: true, events_deleted: d1.changes, profiles_reset: d2.changes, follow_up_cleared: d3.changes, lead_visits_cleared: d4.changes, visit_checkins_cleared: d5.changes });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -7281,7 +7788,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-06-13-branch-leads-duplicate-v6';
+const BUILD_VERSION = '2026-11-16-reception-sales-v2';
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
@@ -7783,6 +8290,49 @@ process.on('uncaughtException', (err) => {
     }
   } catch (e) {
     console.error('[migration] branch normalize failed:', e.message);
+  }
+})();
+
+// ── One-time data migration: today's arrivals → visit_checkins ─────────────
+// visit_checkins starts empty on deploy day, so customers confirmed EARLIER
+// that day (Cairo) would be missing from reception's «قايمة العملاء زيارة
+// اليوم». Back-fill them once from lead_visits rows first visited today, and
+// mark a salesperson already linked to them as set at the visit time. Guarded
+// by the settings marker visit_checkins_backfill_v1 (value = the day it ran).
+// Known gap: a RETURNING customer confirmed before the deploy that same day
+// can't be recovered (lead_visits keeps only the first visit per branch).
+(function backfillTodayCheckins() {
+  try {
+    const db = getDb();
+    const done = db.prepare(`SELECT value FROM settings WHERE key = 'visit_checkins_backfill_v1'`).get();
+    if (done) return;
+    const today = cairoDay();
+    const [start, end] = cairoDayBoundsSql(today);
+    let checkins = 0, reps = 0;
+    db.transaction(() => {
+      checkins = db.prepare(`
+        INSERT OR IGNORE INTO visit_checkins (user_id, branch, visit_day, checked_in_at, source, recorded_by)
+        SELECT v.user_id, v.branch, ?, datetime(v.visited_at),
+               CASE WHEN lp.manychat_source = 'walkin' THEN 'walkin' ELSE 'confirm' END, NULL
+        FROM lead_visits v
+        JOIN lead_profiles lp ON lp.user_id = v.user_id
+        WHERE v.branch IS NOT NULL
+          AND datetime(v.visited_at) >= ? AND datetime(v.visited_at) < ?
+      `).run(today, start, end).changes;
+      reps = db.prepare(`
+        UPDATE lead_visits SET sales_rep_set_at = datetime(visited_at)
+        WHERE sales_rep IS NOT NULL AND sales_rep_set_at IS NULL
+          AND datetime(visited_at) >= ? AND datetime(visited_at) < ?
+      `).run(start, end).changes;
+      db.prepare(`
+        INSERT INTO settings (key, value, updated_at)
+        VALUES ('visit_checkins_backfill_v1', ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(today);
+    })();
+    console.log(`✅ Migration: visit_checkins back-filled for ${today} — checkins:${checkins} reps:${reps}`);
+  } catch (e) {
+    console.error('[migration] visit_checkins backfill failed:', e.message);
   }
 })();
 

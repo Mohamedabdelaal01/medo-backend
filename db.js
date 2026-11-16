@@ -276,6 +276,25 @@ function initializeDatabase(dbPath = DB_PATH) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
 
+  // purchases.entered_* — WHO typed the sale in (not who it's credited to).
+  // rep stays the salesperson the sale counts for; since 2026-11-16 reception
+  // records sales FOR a salesperson, so the person who entered it is kept here.
+  //   entered_via: 'reception' (POST /api/reception/sales) | 'staff' (POST /api/purchases)
+  // No defaults: NULL means the row is older than this feature.
+  for (const { col, type } of [
+    { col: 'entered_by',      type: 'TEXT'    },
+    { col: 'entered_by_id',   type: 'INTEGER' },
+    { col: 'entered_by_role', type: 'TEXT'    },
+    { col: 'entered_via',     type: 'TEXT'    },
+  ]) {
+    try {
+      db.exec(`ALTER TABLE purchases ADD COLUMN ${col} ${type}`);
+      console.log(`✅ Migration: ${col} added to purchases`);
+    } catch (e) {
+      if (!e.message.includes('duplicate column name')) throw e;
+    }
+  }
+
   // ── Product catalog — categories + products + per-purchase line items ────
   // The catalog is admin/branch-manager managed. Sales reps pick from it when
   // recording a purchase. A single contract can include multiple products, so
@@ -447,6 +466,41 @@ function initializeDatabase(dbPath = DB_PATH) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_lead_visits_prerep ON lead_visits(pre_visit_rep)`);
+
+  // sales_rep_set_at — WHEN reception (or a sale) linked sales_rep to this visit.
+  // lead_visits keeps one row per (customer, branch), so for a returning customer
+  // sales_rep may be last time's salesperson: «زيارة اليوم» only treats it as
+  // today's when sales_rep_set_at >= today's check-in. NULL for older rows.
+  try {
+    db.exec(`ALTER TABLE lead_visits ADD COLUMN sales_rep_set_at DATETIME`);
+    console.log('✅ Migration: sales_rep_set_at column added to lead_visits');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // visit_checkins — one row per customer, per branch, per CAIRO calendar day
+  // the visit was confirmed (reception confirm or walk-in). lead_visits only
+  // keeps the FIRST visit per branch, so a returning customer would be missing
+  // from reception's «قايمة العملاء زيارة اليوم» without this.
+  // Keyed by (user_id, branch, visit_day) — never by lead_visits.id: the boot
+  // branch normalizer (UPDATE OR REPLACE) can delete lead_visits rows.
+  //   visit_day     — Cairo day 'YYYY-MM-DD', computed in JS (Intl, summer time aware)
+  //   checked_in_at — UTC, the FIRST arrival that day (a second confirm keeps it)
+  //   source        — 'confirm' | 'walkin'
+  //   recorded_by   — users.name of who confirmed
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS visit_checkins (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       TEXT NOT NULL,
+      branch        TEXT NOT NULL,
+      visit_day     TEXT NOT NULL,
+      checked_in_at DATETIME NOT NULL DEFAULT (datetime('now')),
+      source        TEXT NOT NULL,
+      recorded_by   TEXT,
+      UNIQUE(user_id, branch, visit_day)
+    );
+    CREATE INDEX IF NOT EXISTS idx_visit_checkins_branch_day ON visit_checkins(branch, visit_day);
+  `);
 
   // branch_customer_followups: live follow-up state per (branch, user_id).
   // The branch manager assigns the customer to a sales rep; that sales rep
