@@ -27,6 +27,14 @@ const DEFAULT_SCORE_MAP = {
 // Not admin-configurable — this is a data-integrity rule, not a business knob.
 const DEDUP_SCORED_EVENTS = ['product_details', 'category_request'];
 
+// Event types that score ONCE PER USER, whatever their value (C1.4): 6 card
+// taps on 6 branches = one location_request's points, not six. Every event is
+// still recorded (score_delta 0). branch_selected also needs a known phone —
+// the caller passes forceZero when there is none (server.js /api/events).
+// The caller resolves alreadyScored with a DB lookup (an earlier event of the
+// same type that earned points).
+const ONCE_PER_USER_EVENTS = ['location_request', 'map_click', 'entry_location', 'entry_catalog', 'branch_selected'];
+
 // ── Lead Classification Thresholds (defaults) ─────────────────────────────
 // 5-state system:
 //   cold      0–30   — browsed but low intent
@@ -173,9 +181,12 @@ function classifyLead(totalScore, visitConfirmed = false, currentClass = '', thr
  *                                  already scored for this user before
  *                                  (caller resolves this via a DB lookup).
  * @param {{scoreMap:object,thresholds:object}} [config] - from getScoringConfig; defaults used if omitted
+ * @param {{forceZero?:boolean, noMapClickBonus?:boolean}} [opts]
+ *   forceZero       — this event earns 0 (visit_planned; branch_selected with no phone)
+ *   noMapClickBonus — the user already earned the map_click points once
  * @returns {object} { scoreDelta, newTotalScore, newLeadClass }
  */
-function processScore(profile, eventType, eventValue, alreadyScored = false, config = null) {
+function processScore(profile, eventType, eventValue, alreadyScored = false, config = null, opts = {}) {
   const scoreMap   = config?.scoreMap   || DEFAULT_SCORE_MAP;
   const thresholds = config?.thresholds || DEFAULT_THRESHOLDS;
 
@@ -183,12 +194,13 @@ function processScore(profile, eventType, eventValue, alreadyScored = false, con
 
   // Per-value dedup: a repeated view of the SAME product or the SAME category
   // earns zero. Distinct products/categories are unaffected.
-  if (alreadyScored && DEDUP_SCORED_EVENTS.includes(eventType)) {
+  if (alreadyScored && (DEDUP_SCORED_EVENTS.includes(eventType) || ONCE_PER_USER_EVENTS.includes(eventType))) {
     scoreDelta = 0;
   }
+  if (opts.forceZero) scoreDelta = 0;
 
-  // Bonus: map click inside branch detail (independent signal — kept)
-  if (scoreDelta > 0 && eventValue && eventValue.includes('map_click')) {
+  // Bonus: map click inside branch detail (independent signal — kept, once per user)
+  if (scoreDelta > 0 && !opts.noMapClickBonus && eventValue && eventValue.includes('map_click')) {
     scoreDelta += (scoreMap.map_click ?? DEFAULT_SCORE_MAP.map_click);
   }
 
@@ -212,5 +224,5 @@ function processScore(profile, eventType, eventValue, alreadyScored = false, con
 
 module.exports = {
   getScoreDelta, classifyLead, processScore, getScoringConfig, computeDecayedScore,
-  SCORE_MAP, THRESHOLDS, DEDUP_SCORED_EVENTS, DEFAULT_SCORE_MAP, DEFAULT_THRESHOLDS,
+  SCORE_MAP, THRESHOLDS, DEDUP_SCORED_EVENTS, ONCE_PER_USER_EVENTS, DEFAULT_SCORE_MAP, DEFAULT_THRESHOLDS,
 };

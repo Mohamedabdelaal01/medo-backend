@@ -62,6 +62,20 @@ function hashPhone(raw) {
   return sha256(d);
 }
 
+/**
+ * The Lead event_id — ONE format at every call site (review r2): the phone
+ * never travels in plain text (Meta receives event_id as-is, and it is logged).
+ *   lead_{user_id}_{first 16 hex of sha256(the canonical phone)}
+ * Deterministic: the same user + phone, in any written form (+20…, 0020…,
+ * Arabic-Indic digits), always gives the same id, so Meta still dedups the
+ * live Lead against the bulk warm-up.
+ */
+function leadEventId(userId, phone) {
+  const { canonPhone } = require('./phoneMask');
+  const canon = canonPhone(phone) || '';
+  return `lead_${userId}_${sha256(canon).slice(0, 16)}`;
+}
+
 /** Normalize + hash a name-ish field (Meta: lowercase, trimmed, then SHA-256). */
 function hashText(raw) {
   if (raw == null) return null;
@@ -189,6 +203,7 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
           console.error(`[meta-capi] ${eventName} rejected (HTTP ${res.status}): ${text.slice(0, 300)}`);
         } else {
           const json = await res.json().catch(() => ({}));
+          // Event ids carry no phone (Lead ids use leadEventId's hash).
           console.log(`[meta-capi] ${eventName} sent ✓${eventId ? ` (event_id=${eventId})` : ''}`);
           if (Array.isArray(json.messages) && json.messages.length > 0) {
             console.warn(`[meta-capi] ⚠️ Meta warnings: ${JSON.stringify(json.messages)}`);
@@ -212,7 +227,7 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
  * every lead — Meta rejects events older than 7 days, and for audience building
  * (the whole point of the warm-up) the match matters, not the date.
  *
- * event_id reuses the live trigger's format (lead_{user_id}_{phone}) so leads
+ * event_id reuses the live trigger's format (leadEventId) so leads
  * that already fired a real-time Lead event are DEDUPLICATED by Meta, not
  * double-counted.
  *
@@ -262,7 +277,7 @@ async function bulkSyncHistoricalLeads(leads = []) {
         custom_data: { event_source: 'crm', lead_event_source: LEAD_EVENT_SOURCE },
         event_name: 'Lead',
         event_time: Math.floor(Date.now() / 1000),
-        event_id: `lead_${lead.user_id}_${lead.phone}`,
+        event_id: leadEventId(lead.user_id, lead.phone),
         user_data,
       });
     }
@@ -312,4 +327,4 @@ async function bulkSyncHistoricalLeads(leads = []) {
   return summary;
 }
 
-module.exports = { sendMetaEvent, bulkSyncHistoricalLeads, hashPhone, API_VERSION };
+module.exports = { sendMetaEvent, bulkSyncHistoricalLeads, hashPhone, leadEventId, API_VERSION };

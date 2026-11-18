@@ -10,14 +10,17 @@ const fs       = require('fs');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const { getDb, getLiveDb, getDemoDb, wipeDemoDb, cloneLiveToDemo, DEMO_DB_PATH } = require('./db');
-const { processScore, getScoringConfig, computeDecayedScore, classifyLead, DEFAULT_SCORE_MAP } = require('./scoring');
+const { processScore, getScoringConfig, computeDecayedScore, classifyLead, DEFAULT_SCORE_MAP, ONCE_PER_USER_EVENTS } = require('./scoring');
 const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./services/scheduler');
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
-const { sendMetaEvent, bulkSyncHistoricalLeads } = require('./services/metaCapi');
+const { sendMetaEvent, bulkSyncHistoricalLeads, leadEventId } = require('./services/metaCapi');
 const { callAi, getAiConfig, extractJson } = require('./services/ai');
 const { getManyChatClient }= require('./manychat/client');
+const counters             = require('./services/healthCounters');
+const { guardedSendFlow, SKIP_MESSAGES_AR } = require('./services/windowGuard');
+const { createPhoneMasker } = require('./services/phoneMask');
 const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
 const app  = express();
@@ -87,6 +90,73 @@ function normalizeBranch(raw) {
   const key = String(raw).toLowerCase().replace(/\s+/g, ' ').trim();
   if (!key) return null;
   return _branchAliasLookup.get(key) || String(raw).trim();
+}
+
+// ── Intake branch check (C1.1) ────────────────────────────────────────────────
+// What the bot may write as a branch on intake (preferred_branch, events.branch,
+// location_requested): one of the 6 fixed codes the bot's chips send (runbook
+// Appendix 3), a known alias of one, or an id in the live active_branches list.
+// Anything else — 'all_branches', a typo, free text — is null: never stored as
+// a branch. normalizeBranch above is untouched (visits and the branch config
+// still use it, so alexandria / new_cairo / october survive there).
+const INTAKE_BRANCH_CODES = ['nasr_city', 'maadi', 'helwan', 'faisal', 'ain_shams', 'alexandria'];
+const INTAKE_EXTRA_ALIASES = {
+  alexandria: ['alexandria', 'alex', 'الإسكندرية', 'الاسكندرية', 'إسكندرية', 'اسكندرية', 'الاسكندريه', 'اسكندريه'],
+};
+const _intakeExtraLookup = (() => {
+  const m = new Map();
+  for (const [canonical, aliases] of Object.entries(INTAKE_EXTRA_ALIASES)) {
+    for (const a of aliases) m.set(a.toLowerCase().replace(/\s+/g, ' ').trim(), canonical);
+  }
+  return m;
+})();
+// The live branch list: [{ id, nameKey }] (nameKey = the configured Arabic
+// name, lower-cased, spaces collapsed — the old bot sent names).
+function activeBranchIds(db) {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'active_branches'`).get();
+    const parsed = row && row.value ? JSON.parse(row.value) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map(b => (typeof b === 'string' ? { id: b, name: null } : { id: b && b.id, name: b && b.name }))
+      .filter(b => typeof b.id === 'string' && b.id.trim() && b.id.trim().toLowerCase() !== 'all_branches')
+      .map(b => ({ id: b.id.trim(),
+        nameKey: typeof b.name === 'string' ? b.name.toLowerCase().replace(/\s+/g, ' ').trim() : null }));
+  } catch (_) { return []; }
+}
+// opts.ids — activeBranchIds(), when the caller already read it (boot passes).
+function intakeBranch(raw, opts = {}) {
+  if (raw == null) return null;
+  const key = String(raw).toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!key || key === 'all_branches') return null;
+  if (INTAKE_BRANCH_CODES.includes(key)) return key;
+  const alias = _branchAliasLookup.get(key) || _intakeExtraLookup.get(key);
+  if (alias) return alias;
+  const live = opts.ids || activeBranchIds(opts.db || getDb());
+  const trimmed = String(raw).trim();
+  const hit = live.find(b => b.id === trimmed) || live.find(b => b.nameKey && b.nameKey === key);
+  return hit ? hit.id : null;
+}
+
+// visit_planned's day, normalised (C1.8): «النهارده» → today, «بكره» → tomorrow,
+// «الأسبوع ده» → this_week, «لسه مش متأكد» → unsure, anything else → other.
+function normalizePlannedDay(raw) {
+  if (raw == null) return null;
+  const s = String(raw).toLowerCase()
+    .replace(/[\u064B-\u0652\u0640]/g, '')          // harakat + tatweel
+    .replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي')
+    .replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  if (s === 'unsure' || s.includes('مش متاكد') || s.includes('مش عارف')) return 'unsure';
+  if (s === 'today' || s.includes('النهارده') || s.includes('انهارده') || s.includes('النهاردا')) return 'today';
+  if (s === 'tomorrow' || s.includes('بكره') || s.includes('بكرا')) return 'tomorrow';
+  if (s === 'this_week') return 'this_week';
+  if (s.includes('اسبوع')) {
+    // «الأسبوع الجاي» / «الأسبوع القادم» is NOT this week (review r2).
+    if (/(جاي|جاى|القادم|الجديد)/.test(s)) return 'other';
+    if (/(^|\s)(ده|دا|دي|هذا|هدا)(\s|$)/.test(s)) return 'this_week';
+  }
+  return 'other';
 }
 
 // ── Cairo calendar day ────────────────────────────────────────────────────────
@@ -413,6 +483,61 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   return res.json({ user: req.user });
 });
 
+// ── Intake answer keys (C1 / §2.3 R4) ─────────────────────────────────────
+// Every 200 from /api/events carries lead_class, new_score and has_phone
+// ('yes' / 'no') — skips and test answers included — so a ManyChat response
+// mapping never empties a real field. Read-only.
+function userHasPhone(db, userId) {
+  const r = db.prepare(`
+    SELECT EXISTS (SELECT 1 FROM lead_phones WHERE user_id = ?)
+        OR EXISTS (SELECT 1 FROM lead_profiles WHERE user_id = ? AND phone IS NOT NULL AND phone <> '') AS has
+  `).get(userId, userId);
+  return !!(r && r.has);
+}
+function answerKeys(db, userId) {
+  const p = db.prepare(`SELECT lead_class, total_score FROM lead_profiles WHERE user_id = ?`).get(userId);
+  return {
+    lead_class: (p && p.lead_class) || 'cold',
+    new_score:  (p && p.total_score) || 0,
+    has_phone:  userHasPhone(db, userId) ? 'yes' : 'no',
+  };
+}
+
+// A phone a chat lead sent: kept forever in lead_phones (never overwritten).
+// The Meta CAPI "Lead" fires the first time THIS user leaves THIS phone — unless
+// the phone already sits on another profile (the same person on Instagram and
+// Messenger, or a reception walk-in): then it is stored and no Lead fires
+// (C1.6, «one Lead per person»). Logged as a count, never the phone.
+function storeChatPhone(db, { userId, phone, capi }) {
+  if (!phone) return { stored: false, lead: false };
+  const ins = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, phone);
+  if (ins.changes === 0) return { stored: false, lead: false };
+  const elsewhere = db.prepare(`SELECT 1 FROM lead_phones WHERE phone = ? AND user_id <> ? LIMIT 1`).get(phone, userId)
+    || db.prepare(`SELECT 1 FROM lead_profiles WHERE phone = ? AND user_id <> ? LIMIT 1`).get(phone, userId);
+  if (elsewhere) {
+    counters.countLeadSkipped();
+    console.log('[lead-rule] Lead not sent: this phone is already on another profile (phone: present)');
+    return { stored: true, lead: false };
+  }
+  // Advanced Matching: the Messenger PSID as external_id (explicit psid, else
+  // user_id) so leads from direct m.me links (no fbclid) still match.
+  sendMetaEvent('Lead',
+    { phone, firstName: capi.firstName, lastName: capi.lastName, branch: capi.branch, gender: capi.gender,
+      externalId: capi.psid || userId },
+    leadEventId(userId, phone));
+  return { stored: true, lead: true };
+}
+
+// Cairo date for visit_planned's today / tomorrow (DST-safe: date arithmetic
+// on the Cairo calendar day, not on +24 h).
+function plannedDayDate(norm, now = new Date()) {
+  if (norm !== 'today' && norm !== 'tomorrow') return null;
+  const today = cairoDay(now);
+  if (norm === 'today') return today;
+  const [y, m, d] = today.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/events — Main Webhook Receiver
 // Called by ManyChat on every button click
@@ -504,7 +629,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     'campaign_source','ad_id','visit_code','phone','product','category',
     'last_name','gender','locale','timezone','last_input_text','subscribed_at',
     'growth_tool_id','source','branch','event_id','platform',
-    'full_name','ig_username','psid',
+    'full_name','ig_username','psid','test',
   ]);
   const extraFields = {};
   for (const k of Object.keys(req.body || {})) {
@@ -522,6 +647,22 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // We persist it via a dedicated column added below in the UPDATE.
   const productCategory = category || null;
 
+  // ── 1b. Test mode (§2.3 R5, C1.7) ────────────────────────────────────
+  // A body whose `test` is not empty is answered from the profile AS IT IS and
+  // nothing is written: no profile, no event, no phone, no Lead, no ManyChat
+  // write-back, not even the dedup memory. Only GET /health counts it (by
+  // type, phone present or not — never the phone). ManyChat sends
+  // "test":"{gate_test}", empty for every real customer.
+  // "false", "0", false, 0 and '' are NOT test (review r2).
+  const testFlag = req.body.test;
+  const isTest = testFlag === true
+    || (typeof testFlag === 'number' && testFlag !== 0 && Number.isFinite(testFlag))
+    || (typeof testFlag === 'string' && !['', 'false', '0'].includes(testFlag.trim().toLowerCase()));
+  if (isTest) {
+    counters.countTestEvent(event_type, !!normPhone);
+    return res.status(200).json({ success: true, test: true, ...answerKeys(db, user_id) });
+  }
+
   // ── 2. Phase 1 — In-memory idempotency (fast path) ───────────────────
   // Hash = user_id + event_type + event_value + 10-second time bucket.
   // Catches duplicate retries within the same server session instantly,
@@ -532,7 +673,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   if (seenEvents.has(dedupHash)) {
     console.log(`[DEDUP:MEM] Skipped — user:${user_id} type:${event_type}`);
-    return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event' });
+    return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event', ...answerKeys(db, user_id) });
   }
   seenEvents.set(dedupHash, Date.now() + DEDUP_WINDOW);
 
@@ -559,7 +700,36 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   if (existingEvent) {
     console.log(`[DEDUP:DB] Skipped — event_id:${resolvedEventId} user:${user_id} type:${event_type}`);
-    return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event_db' });
+    return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event_db', ...answerKeys(db, user_id) });
+  }
+
+  // ── 4b. Branch the bot sent (C1.1) ───────────────────────────────────
+  // event_value, or the `branch` key (visit_planned, a location_request that
+  // carries the chip there) — through intakeBranch: never 'all_branches'.
+  const bodyBranch = req.body.branch;
+  const intakeBr = event_type === 'visit_planned'
+    ? intakeBranch(bodyBranch)
+    : (intakeBranch(_rawEventValue) || intakeBranch(bodyBranch));
+
+  // ── 4c. R1 — one branch_selected per user and branch per 6 hours ──────
+  // A repeat inside 6 h adds no row and no points; a NEW phone it carries is
+  // still stored (and the Lead rule applies to it).
+  if (event_type === 'branch_selected') {
+    const repeat = db.prepare(`
+      SELECT 1 FROM events
+      WHERE user_id = ? AND event_type = 'branch_selected' AND branch IS ?
+        AND datetime(created_at) >= datetime('now', '-6 hours')
+      LIMIT 1
+    `).get(user_id, intakeBr);
+    if (repeat) {
+      if (normPhone) {
+        storeChatPhone(db, { userId: user_id, phone: normPhone,
+          capi: { firstName: effFirstName, lastName: effLastName, branch: intakeBr, gender, psid } });
+        db.prepare(`UPDATE lead_profiles SET phone = ? WHERE user_id = ?`).run(normPhone, user_id);
+      }
+      counters.countBranchRepeat();
+      return res.status(200).json({ success: true, skipped: 'branch_repeat', reason: 'branch_repeat', ...answerKeys(db, user_id) });
+    }
   }
 
   // ── 5. Get or create lead profile ────────────────────────────────────
@@ -598,18 +768,48 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     alreadyScored = !!seen;
   }
 
+  // ── 5c. Once per user (C1.4) ─────────────────────────────────────────
+  // location_request / map_click / entry_location / entry_catalog score once
+  // per user whatever the value; branch_selected once per user and only with a
+  // phone (in this request or already held); visit_planned never scores.
+  const mapClickScored = !!db.prepare(`
+    SELECT 1 FROM events
+    WHERE user_id = ? AND score_delta > 0
+      AND (event_type = 'map_click' OR event_value LIKE '%map_click%')
+    LIMIT 1
+  `).get(user_id);
+  if (ONCE_PER_USER_EVENTS.includes(event_type)) {
+    alreadyScored = event_type === 'map_click'
+      ? mapClickScored
+      : !!db.prepare(`
+          SELECT 1 FROM events WHERE user_id = ? AND event_type = ? AND score_delta > 0 LIMIT 1
+        `).get(user_id, event_type);
+  }
+  const phoneKnownBefore = userHasPhone(db, user_id);
+  const forceZero = event_type === 'visit_planned'
+    || (event_type === 'branch_selected' && !normPhone && !phoneKnownBefore);
+
   // ── 6. Calculate new score & classification ───────────────────────────
   const { scoreDelta, newTotalScore, newLeadClass } = processScore(
     profile,
     event_type,
     event_value,
     alreadyScored,
-    getScoringConfig(db)
+    getScoringConfig(db),
+    { forceZero, noMapClickBonus: mapClickScored }
   );
 
   // ── 7. Detect context-specific flags ─────────────────────────────────
   const isLocationEvent = ['location_request', 'branch_selected', 'entry_location']
     .includes(event_type);
+  // location_requested (📍, the reminder's target) — only a real branch ask:
+  // branch_selected, or a location_request that names an intake branch.
+  // entry_location (opened the branches menu) no longer sets it (C1.2).
+  const setsLocationRequested = event_type === 'branch_selected'
+    || (event_type === 'location_request' && !!intakeBr);
+  const isVisitPlanned = event_type === 'visit_planned';
+  const plannedNorm = isVisitPlanned ? (normalizePlannedDay(_rawEventValue) || 'other') : null;
+  const plannedDay  = isVisitPlanned ? plannedDayDate(plannedNorm) : null;
 
   const isProductEvent = event_type === 'product_details';
 
@@ -646,11 +846,15 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // Only treat event_value as a branch for location/branch events — for other
   // events (e.g. product_details) event_value carries a product name, not a
   // branch, so we keep the existing preferred_branch instead.
+  // Every branch written here passes intakeBranch (C1.1): 'all_branches' or an
+  // unknown value becomes null (COALESCE keeps the profile's real branch).
   const detectedBranch = visitPayload?.branch
-    ? normalizeBranch(visitPayload.branch)
-    : (isLocationEvent && event_value)
-      ? normalizeBranch(event_value)
-      : profile.preferred_branch;
+    ? intakeBranch(visitPayload.branch)
+    : isVisitPlanned
+      ? intakeBr
+      : (isLocationEvent && (event_value || bodyBranch))
+        ? intakeBr
+        : profile.preferred_branch;
 
   // Detect product from event_value (if it's a product event)
   const lastProduct = isProductEvent
@@ -702,7 +906,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     isProductEvent ? 1 : 0,
     session_count || null,
     isVisitConfirmed ? 1 : 0,
-    isLocationEvent ? 1 : 0,
+    setsLocationRequested ? 1 : 0,
     isVisitConfirmed ? 1 : 0,  // visit_at — same flag, separate param
     campaign_source || null,
     ad_id || null,
@@ -725,25 +929,12 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 
   // Keep EVERY phone the customer ever sent — never overwrite history.
   // profile.phone above stays as the latest (quick display); lead_phones is
-  // the full set the receptionist can match against.
+  // the full set the receptionist can match against. Meta CAPI "Lead" fires
+  // the first time this user leaves this phone, unless the phone already sits
+  // on another profile (C1.6) — see storeChatPhone. Fire-and-forget.
   if (normPhone) {
-    const phoneIns = db.prepare(`
-      INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)
-    `).run(user_id, normPhone);
-    // Meta CAPI "Lead": the moment a ManyChat lead leaves a NEW phone number
-    // (changes=1 → first time we see this phone for them; repeats don't refire).
-    // Fire-and-forget — never blocks or fails the webhook response.
-    if (phoneIns.changes > 0) {
-      // Advanced Matching: send the Messenger PSID as external_id so leads from
-      // direct m.me links (which carry no fbclid) still match a Meta profile.
-      // Prefer the explicit psid; fall back to user_id (itself the PSID for
-      // Messenger subscribers). If neither resolves, sendMetaEvent just omits
-      // external_id and matches on the phone alone — no error either way.
-      sendMetaEvent('Lead',
-        { phone: normPhone, firstName: effFirstName, lastName: effLastName, branch: detectedBranch, gender,
-          externalId: psid || user_id },
-        `lead_${user_id}_${normPhone}`);
-    }
+    storeChatPhone(db, { userId: user_id, phone: normPhone,
+      capi: { firstName: effFirstName, lastName: effLastName, branch: detectedBranch, gender, psid } });
   }
 
   // ── 9. Insert raw event record (with event_id) ────────────────────────
@@ -756,29 +947,30 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
       INSERT INTO events (
         event_id, user_id, first_name, event_type, event_value,
         score_delta, session_count, current_score,
-        branch, product_id, category, raw_payload
+        branch, product_id, category, raw_payload, planned_day
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       resolvedEventId,
       user_id,
       first_name || null,
       event_type,
-      event_value || null,
+      (isVisitPlanned ? plannedNorm : event_value) || null,
       scoreDelta,
       session_count || null,
       newTotalScore,
       detectedBranch || null,
       isProductEvent ? event_value : null,
       hasCategory ? productCategory : null,
-      JSON.stringify(req.body)
+      JSON.stringify(req.body),
+      plannedDay
     );
   } catch (e) {
     // Concurrent duplicate slipped past the dedup checks and lost the race on
     // the UNIQUE(event_id) constraint → treat as idempotent success, not 500.
     if (e && /UNIQUE constraint failed/i.test(e.message)) {
       console.log(`[DEDUP:RACE] Skipped — event_id:${resolvedEventId} user:${user_id}`);
-      return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event_race' });
+      return res.status(200).json({ success: true, skipped: true, reason: 'duplicate_event_race', ...answerKeys(db, user_id) });
     }
     throw e; // anything else → global error handler returns clean 500
   }
@@ -829,6 +1021,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
     lead_class: newLeadClass,
     new_score: newTotalScore,
     score_delta: scoreDelta,
+    has_phone: userHasPhone(db, user_id) ? 'yes' : 'no',
   });
 });
 
@@ -1626,7 +1819,10 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   // Record THIS branch visit separately. The receptionist's explicit choice
   // wins; fall back to the lead's last intent only if none was picked.
   // visiting حلوان later must not erase an earlier فيصل visit (one row each).
-  const visitBranch = pickedBranch || lead.preferred_branch || null;
+  // The lead's last intent goes through intakeBranch (C1, review r2) so a
+  // polluted preferred_branch ('all_branches') never lands in lead_visits /
+  // visit_checkins.
+  const visitBranch = pickedBranch || intakeBranch(lead.preferred_branch) || null;
   if (visitBranch) {
     db.prepare(`
       INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)
@@ -1674,10 +1870,12 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       `visit_confirm_${lead.user_id}_${Date.now()}`);
   }
 
-  // Event-Triggered Flow: Visit Confirmed
+  // Event-Triggered Flow: Visit Confirmed — through the 24 h window guard
+  // (C1.9): a walk-in has no chat (no_manychat_id), and ManyChat's own
+  // last_interaction must be < 23 h. Fire-and-forget; never blocks reception.
   const visitFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_visit_flow'`).get();
   if (visitFlowSetting && visitFlowSetting.value && visitFlowSetting.value.trim() !== '') {
-    getManyChatClient().sendFlow({ user_id: lead.user_id, flow_id: visitFlowSetting.value.trim() })
+    guardedSendFlow(db, { user_id: lead.user_id, flow_id: visitFlowSetting.value.trim(), site: 'visit' })
       .catch(err => console.error('[Event-Trigger] Visit Flow failed:', err.message));
   } else {
     console.warn('[Event-Trigger] ⚠️ Visit confirmed but manychat_visit_flow is empty — no message sent. Set it in Settings → API.');
@@ -1865,7 +2063,11 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   if (!np) return res.status(400).json({ error: 'invalid_phone' });
 
   const interestVal = (interest && String(interest).trim()) || null;
-  const sourceVal   = (source   && String(source).trim())   || 'زيارة مباشرة';
+  // C1.10: «زيارة مباشرة» is written only on a NEW walk-in profile. A known
+  // chat customer walking in keeps a NULL campaign_source NULL (a later ad
+  // event fills it) unless reception typed a source.
+  const typedSource = (source && String(source).trim()) || null;
+  const sourceVal   = typedSource || 'زيارة مباشرة';
 
   const db = getDb();
 
@@ -1894,7 +2096,7 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
           visit_at        = CASE WHEN visit_at IS NULL THEN datetime('now') ELSE visit_at END,
           last_activity   = datetime('now')
         WHERE user_id = ?
-      `).run(name, interestVal, sourceVal, userId);
+      `).run(name, interestVal, typedSource, userId);
     } else {
       db.prepare(`
         INSERT INTO lead_profiles
@@ -1933,7 +2135,7 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   if (phoneIsNew) {
     sendMetaEvent('Lead',
       { phone: np, firstName: name, branch, externalId: userId },
-      `lead_${userId}_${np}`);
+      leadEventId(userId, np));
   }
 
   // Meta CAPI FindLocation — standard event for a showroom walk-in. Sent with
@@ -1947,13 +2149,14 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
       `visit_walkin_${userId}_${Date.now()}`);
   }
 
-  console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${sourceVal})`);
+  const storedSource = db.prepare(`SELECT campaign_source FROM lead_profiles WHERE user_id = ?`).get(userId)?.campaign_source ?? null;
+  console.log(`🚶 WALK-IN ${existed ? 'RE-VISIT' : 'CREATED'}: ${name} → ${branch} (${storedSource || 'no campaign'})`);
 
   return res.json({
     ok:              true,
     user_id:         userId,
     first_name:      name,
-    campaign_source: sourceVal,
+    campaign_source: storedSource,
     branch,
     lead_class:      'visited',
     walk_in:         true,
@@ -4182,6 +4385,11 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
   `).get(userId);
 
   const CLASS_AR = { cold: 'بارد', warm: 'دافئ', hot: 'ساخن 🔥', visited: 'زار المعرض', purchased: 'اشترى' };
+  // C1.11: no phone reaches z.ai. Typed text (what he wrote, call summaries,
+  // notes) is masked here with the bare-10-digit rule too; callAi masks the
+  // rest by shape with the same masker, and the reply is unmasked below.
+  const masker = createPhoneMasker();
+  const typed = (t) => masker.maskText(String(t), { typed: true });
   const lines = [
     `الاسم: ${lead.first_name || 'غير معروف'}`,
     `التصنيف: ${CLASS_AR[lead.lead_class] || lead.lead_class} (نقاط: ${lead.total_score || 0})`,
@@ -4189,13 +4397,13 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
     lead.last_product    ? `آخر منتج شافه: ${lead.last_product}` : null,
     lead.preferred_branch ? `الفرع المفضّل: ${lead.preferred_branch}` : null,
     lead.platform        ? `جه من: ${lead.platform}` : null,
-    lead.last_input_text ? `آخر حاجة كتبها بنفسه: "${lead.last_input_text}"` : null,
+    lead.last_input_text ? `آخر حاجة كتبها بنفسه: "${typed(lead.last_input_text)}"` : null,
     bcf?.attempt_count   ? `محاولات اتصال بدون رد: ${bcf.attempt_count} (آخرها ${bcf.last_attempt_at || '؟'})` : null,
     bcf?.sent            ? `اتبعتله رسالة واتساب قبل كده` : null,
     events.length ? `آخر تحركاته:\n${events.map(e =>
       `- ${e.created_at}: ${e.event_type}${e.event_value ? ` (${e.event_value})` : ''}${e.category ? ` [${e.category}]` : ''}`).join('\n')}` : null,
-    fuLog.length ? `ملخصات مكالمات سابقة:\n${fuLog.map(f => `- ${f.sales || '؟'}: ${f.call_summary}`).join('\n')}` : null,
-    rvLog.length ? `متابعات بعد الزيارة:\n${rvLog.map(f => `- ${f.followed_up_by || '؟'}: ${f.note}`).join('\n')}` : null,
+    fuLog.length ? `ملخصات مكالمات سابقة:\n${fuLog.map(f => `- ${f.sales || '؟'}: ${typed(f.call_summary)}`).join('\n')}` : null,
+    rvLog.length ? `متابعات بعد الزيارة:\n${rvLog.map(f => `- ${f.followed_up_by || '؟'}: ${typed(f.note)}`).join('\n')}` : null,
   ].filter(Boolean).join('\n');
 
   const result = await callAi([
@@ -4206,14 +4414,15 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
       'brief = ملخص 2-3 سطور بالعامية المصرية: مين العميل، مهتم بإيه، وإيه أحسن مدخل للكلام معاه. ' +
       'draft = رسالة واتساب قصيرة وودودة بالعامية (سطرين بالكتير) مناسبة لحالته، من غير مبالغة ومن غير وعود بأسعار.' },
     { role: 'user', content: lines },
-  ], { maxTokens: 2000 });
+  ], { maxTokens: 2000, masker });
 
   if (!result.ok) {
     return res.status(result.unconfigured ? 400 : 502).json({ error: result.error, unconfigured: !!result.unconfigured });
   }
 
-  const parsed = extractJson(result.text);
-  const brief  = (parsed?.brief && String(parsed.brief).trim()) || result.text.slice(0, 600);
+  const replyText = masker.unmaskText(result.text);
+  const parsed = extractJson(replyText);
+  const brief  = (parsed?.brief && String(parsed.brief).trim()) || replyText.slice(0, 600);
   const draft  = (parsed?.draft && String(parsed.draft).trim()) || null;
 
   db.prepare(`
@@ -4355,6 +4564,7 @@ const ADMIN_CHAT_SYSTEM_PROMPT = `
 - ملكية العميل بتتحدد بـ assigned_sales قبل الزيارة أو sales_rep بعد الزيارة — مش نفس العمود دايماً.
 - لو حد سألك عن الإيراد الفعلي استخدم جدول purchases مباشرة، مش أي رقم تقديري.
 - رد بالعامية المصرية، مختصر ومباشر، ابدأ بالإجابة مش بمقدمة طويلة. لو الاستعلام رجّع فاضي أو رقم مش موجود، قول كدا بصراحة.
+- أرقام الموبايل بتوصلك كرموز زي ⟨phone:1…78⟩ — لو محتاج تبحث برقم، حط الرمز زي ما هو جوه الاستعلام بين علامتين '…'، وممنوع تخمّن الرقم.
 `.trim();
 
 app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, res) => {
@@ -4381,6 +4591,10 @@ app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, re
   // would just hang the request and burn provider quota for no benefit.
   const MAX_TOOL_ROUNDS = 20;
   const queriesRun = [];
+  // C1.11: ONE masker for this HTTP request, shared by every round — the
+  // model sees ⟨phone:N…XY⟩ tokens, never a phone; its SQL is unmasked here
+  // before it runs; the reply and queries_run are unmasked for the admin.
+  const masker = createPhoneMasker();
 
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     const result = await callAi(messages, {
@@ -4388,6 +4602,7 @@ app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, re
       temperature: 0.3,
       tools: [ADMIN_SQL_TOOL],
       timeoutMs: 120000,
+      masker,
     });
 
     if (!result.ok) {
@@ -4399,15 +4614,22 @@ app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, re
       for (const call of result.toolCalls) {
         let args = {};
         try { args = JSON.parse(call.function?.arguments || '{}'); } catch (_) { /* malformed args → guard below rejects */ }
-        console.error(`[ai-chat] SQL by ${req.user?.name}: ${args.query}`);
-        const queryOutput = runAdminReadOnlySql(db, args.query);
+        // The model's SQL as it wrote it — tokens, never a phone (masked again
+        // by the same masker in case the model ever typed a raw number).
+        console.error(`[ai-chat] SQL by ${req.user?.name}: ${masker.maskText(String(args.query))}`);
+        const un = masker.unmaskSql(args.query);
+        const queryOutput = un.ok
+          ? runAdminReadOnlySql(db, un.sql)
+          : { error: 'رقم مش معروف في المحادثة دي — استخدم الرمز زي ما وصلك' };
         queriesRun.push({ query: args.query, ok: !queryOutput.error });
+        // Real rows go into the history; the next callAi round masks them.
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(queryOutput) });
       }
       continue; // ask the model again with the tool results in context
     }
 
-    return res.json({ ok: true, reply: result.text, model: result.model, queries_run: queriesRun });
+    return res.json({ ok: true, reply: masker.unmaskText(result.text), model: result.model,
+      queries_run: queriesRun.map(q => ({ ...q, query: masker.unmaskText(q.query) })) });
   }
 
   return res.status(502).json({ error: 'محتاج استعلامات كتير جداً عشان يرد — جرّب تسأل بشكل أبسط أو أكتر تحديداً' });
@@ -4700,10 +4922,11 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
     (viaReception ? ` — اتسجّل من الاستقبال بواسطة ${req.user?.name || '؟'}`
       : creditedByOther ? ` — سجّلها ${req.user?.name || '؟'} باسم السيلز` : ''));
 
-  // Event-Triggered Flow: Purchase Made
+  // Event-Triggered Flow: Purchase Made — through the 24 h window guard (C1.9).
+  // A walk-in sale (walkin_…) is skipped as no_manychat_id with no API call.
   const purchaseFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_purchase_flow'`).get();
   if (purchaseFlowSetting && purchaseFlowSetting.value && purchaseFlowSetting.value.trim() !== '') {
-    getManyChatClient().sendFlow({ user_id: userId, flow_id: purchaseFlowSetting.value.trim() })
+    guardedSendFlow(db, { user_id: userId, flow_id: purchaseFlowSetting.value.trim(), site: 'purchase' })
       .catch(err => console.error('[Event-Trigger] Purchase Flow failed:', err.message));
   } else {
     console.warn('[Event-Trigger] ⚠️ Purchase recorded but manychat_purchase_flow is empty — no message sent. Set it in Settings → API.');
@@ -5753,8 +5976,17 @@ app.post('/api/trigger-message', requireAuth, authorizeRoles('admin', 'branch_ma
       return res.status(400).json({ error: 'no_action_available' });
     }
 
-    const client = getManyChatClient();
-    await client.sendFlow({ user_id, flow_id: chosenFlow });
+    // The 24 h window guard (C1.9) — ManyChat's own last_interaction, asked
+    // right now; fail closed. A skip is answered with its reason and the line
+    // SendFlowButton shows; nothing is recorded as sent.
+    const sent = await guardedSendFlow(db, { user_id, flow_id: chosenFlow, site: 'rep' });
+    if (!sent.sent && sent.reason) {
+      return res.status(409).json({ error: 'not_sent', reason: sent.reason,
+        message: SKIP_MESSAGES_AR[sent.reason] || 'مش هيتبعت' });
+    }
+    if (!sent.sent) {
+      return res.status(502).json({ error: 'مش اتبعتت — ManyChat رفض الإرسال، جرّب تاني بعد شوية', reason: 'send_failed' });
+    }
 
     db.prepare(`
       INSERT INTO messages_sent (user_id, sent_by_rep, action_type, flow_id, message_text)
@@ -7788,12 +8020,47 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-11-16-reception-sales-v2';
+const BUILD_VERSION = '2026-11-18-c1-crm-intake-r2';
+// How many old rows still hold 'all_branches' (never rewritten — review r2)
+// and how many profiles the one-time cleanup backed up. Counts only, cached
+// 5 minutes (Railway pings /health constantly).
+let _allBranchesCache = { at: 0, value: null };
+function allBranchesCounts() {
+  if (_allBranchesCache.value && Date.now() - _allBranchesCache.at < 5 * 60 * 1000) return _allBranchesCache.value;
+  try {
+    const db = getDb();
+    const n = (sql) => db.prepare(sql).get().n;
+    const hasBackup = !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migr_all_branches_backup'`).get();
+    const value = {
+      lead_visits:    n(`SELECT COUNT(*) AS n FROM lead_visits WHERE LOWER(TRIM(branch)) = 'all_branches'`),
+      visit_checkins: n(`SELECT COUNT(*) AS n FROM visit_checkins WHERE LOWER(TRIM(branch)) = 'all_branches'`),
+      events:         n(`SELECT COUNT(*) AS n FROM events WHERE LOWER(TRIM(branch)) = 'all_branches'`),
+      lead_profiles:  n(`SELECT COUNT(*) AS n FROM lead_profiles WHERE LOWER(TRIM(preferred_branch)) = 'all_branches'`),
+      backup_rows:    hasBackup ? n(`SELECT COUNT(*) AS n FROM migr_all_branches_backup`) : 0,
+    };
+    _allBranchesCache = { at: Date.now(), value };
+    return value;
+  } catch (_) {
+    return null;
+  }
+}
+// Counts only, since boot (C1.12) — no ids, names, phones or keys. They make
+// the bot's test mode, the window guard and the ManyChat key checkable from
+// outside with a plain GET.
 app.get('/health', (req, res) => {
+  const c = counters.snapshot();
   res.json({
     status:    'ok',
     timestamp: new Date().toISOString(),
     version:   BUILD_VERSION,
+    migr_all_branches_done: getSetting('migr_all_branches_done', 'false') === 'true',
+    all_branches_rows: allBranchesCounts(),
+    counters_since: c.since,
+    test_events:    c.test_events,
+    manychat_api:   c.manychat_api,
+    window_skips:   c.window_skips,
+    lead_rule:      c.lead_rule,
+    branch_repeats: c.branch_repeats,
   });
 });
 
@@ -7928,6 +8195,10 @@ app.delete('/api/products/:id', requireAuth, canEditCatalog, (req, res) => {
 function runAbandonedIntentJob() {
   try {
     const db = getDb();
+    // OFF unless an admin turns it on (C1.9): its targets are idle > 3 days,
+    // i.e. outside Meta's 24 h window. Even when on, each send passes the
+    // window guard (local_stale pre-filter, then ManyChat getInfo).
+    if (getSetting('reminder_job_enabled', 'false') !== 'true') return;
     const reminderFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_reminder_flow'`).get();
     
     if (!reminderFlowSetting || !reminderFlowSetting.value || reminderFlowSetting.value.trim() === '') {
@@ -7946,8 +8217,9 @@ function runAbandonedIntentJob() {
     `).all();
 
     for (const target of targets) {
-      getManyChatClient().sendFlow({ user_id: target.user_id, flow_id: reminderFlowSetting.value.trim() })
-        .then(() => {
+      guardedSendFlow(db, { user_id: target.user_id, flow_id: reminderFlowSetting.value.trim(), site: 'reminder' })
+        .then((r) => {
+          if (!r.sent) return; // skipped (logged + counted by the guard) or failed — not marked as sent
           db.prepare(`UPDATE lead_profiles SET location_reminder_sent = datetime('now') WHERE user_id = ?`)
             .run(target.user_id);
           console.log(`[Cron] Sent abandoned intent reminder to ${target.user_id}`);
@@ -8214,9 +8486,14 @@ process.on('uncaughtException', (err) => {
 // Old rows stored the branch under whatever ManyChat sent (Arabic free text,
 // alt spellings) so one branch was counted as several. Collapse them all to
 // the canonical slug. Idempotent — safe to run on every startup.
+// The events and profiles passes go through intakeBranch (C1.3): they never
+// write a value that isn't intake-valid ('all_branches', unknown text) — such
+// a row is skipped, so the one-time cleanup below is not undone on the next
+// boot. The visits and active_branches passes keep normalizeBranch.
 (function normalizeHistoricalBranches() {
   try {
     const db = getDb();
+    const ids = activeBranchIds(db);
 
     const eventRows = db.prepare(`
       SELECT id, event_value, branch FROM events
@@ -8227,7 +8504,7 @@ process.on('uncaughtException', (err) => {
     db.transaction(() => {
       for (const r of eventRows) {
         const source    = (r.branch && r.branch.trim()) || r.event_value;
-        const canonical = normalizeBranch(source);
+        const canonical = intakeBranch(source, { ids });
         if (canonical && canonical !== r.branch) { updEvent.run(canonical, r.id); eventsFixed++; }
       }
     })();
@@ -8251,7 +8528,7 @@ process.on('uncaughtException', (err) => {
     let profilesFixed = 0;
     db.transaction(() => {
       for (const r of profileRows) {
-        const canonical = normalizeBranch(r.preferred_branch);
+        const canonical = intakeBranch(r.preferred_branch, { ids });
         if (canonical && canonical !== r.preferred_branch) { updProfile.run(canonical, r.user_id); profilesFixed++; }
       }
     })();
@@ -8290,6 +8567,88 @@ process.on('uncaughtException', (err) => {
     }
   } catch (e) {
     console.error('[migration] branch normalize failed:', e.message);
+  }
+})();
+
+// ── One-time cleanup: the bot's 'all_branches' (C1.5, review r2) ──────────
+// The gallery sent location_request 'all_branches' (the old §06a body); it
+// passed normalizeBranch and overwrote real branches. Runs ONCE (settings flag
+// migr_all_branches_done), never through normalizeBranch, and changes ONE
+// thing: a preferred_branch that is not intake-valid ('all_branches', unknown
+// text) → the latest intake-valid branch in ANY of the lead's events
+// (visit_confirmed's JSON branch included), else his latest lead_visits
+// branch, else NULL.
+// Reversible: before a row changes, (user_id, old preferred_branch, old
+// location_requested) is copied into migr_all_branches_backup in the SAME
+// transaction. /health shows counts only.
+// NOT done here, on purpose: location_requested (📍) is never cleared — the
+// old bot taught 'all_branches' for real location asks, and the reset waits
+// for F0's reading of what the old bot sends. events / lead_visits /
+// visit_checkins rows are not rewritten either; /health reports how many
+// still hold 'all_branches'.
+(function cleanupAllBranches() {
+  try {
+    const db = getDb();
+    if (getSetting('migr_all_branches_done', 'false') === 'true') return;
+    const ids = activeBranchIds(db);
+    let profilesFixed = 0, profilesNulled = 0;
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS migr_all_branches_backup (
+          id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id                TEXT NOT NULL,
+          old_preferred_branch   TEXT,
+          old_location_requested INTEGER,
+          new_preferred_branch   TEXT,
+          backed_up_at           DATETIME NOT NULL DEFAULT (datetime('now'))
+        )
+      `);
+      const evStmt = db.prepare(`
+        SELECT event_type, branch, event_value FROM events
+        WHERE user_id = ? ORDER BY datetime(created_at) DESC, id DESC
+      `);
+      const visitStmt = db.prepare(`
+        SELECT branch FROM lead_visits WHERE user_id = ? ORDER BY datetime(visited_at) DESC, id DESC
+      `);
+      const LOCATION_TYPES = new Set(['branch_selected', 'location_request', 'entry_location', 'map_click']);
+      const eventBranch = (e) => {
+        let b = intakeBranch(e.branch, { ids });
+        if (!b && LOCATION_TYPES.has(e.event_type)) b = intakeBranch(e.event_value, { ids });
+        if (!b && e.event_type === 'visit_confirmed' && e.event_value) {
+          try { const v = JSON.parse(e.event_value); if (v && typeof v === 'object') b = intakeBranch(v.branch, { ids }); }
+          catch (_) { b = intakeBranch(e.event_value, { ids }); }
+        }
+        return b;
+      };
+      const backup = db.prepare(`
+        INSERT INTO migr_all_branches_backup (user_id, old_preferred_branch, old_location_requested, new_preferred_branch)
+        VALUES (?, ?, ?, ?)
+      `);
+      const updPref = db.prepare(`UPDATE lead_profiles SET preferred_branch = ? WHERE user_id = ?`);
+      const rows = db.prepare(`
+        SELECT user_id, preferred_branch, location_requested FROM lead_profiles
+        WHERE preferred_branch IS NOT NULL AND TRIM(preferred_branch) <> ''
+      `).all();
+      for (const r of rows) {
+        if (intakeBranch(r.preferred_branch, { ids })) continue;      // already a real branch
+        let best = null;
+        for (const e of evStmt.all(r.user_id)) { best = eventBranch(e); if (best) break; }
+        if (!best) {
+          for (const v of visitStmt.all(r.user_id)) { best = intakeBranch(v.branch, { ids }); if (best) break; }
+        }
+        backup.run(r.user_id, r.preferred_branch, r.location_requested, best);
+        updPref.run(best, r.user_id);
+        if (best) profilesFixed++; else profilesNulled++;
+      }
+      db.prepare(`
+        INSERT INTO settings (key, value, updated_at) VALUES ('migr_all_branches_done', 'true', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run();
+    })();
+    console.log(`✅ Migration (once): preferred_branch cleaned — re-pointed:${profilesFixed} emptied:${profilesNulled} ` +
+      `(backed up in migr_all_branches_backup; 📍 flags untouched)`);
+  } catch (e) {
+    console.error('[migration] all_branches cleanup failed:', e.message);
   }
 })();
 

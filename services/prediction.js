@@ -66,12 +66,15 @@ function getForecastWeights() {
 function getDailySeries(days = 14) {
   const db = getDb();
 
-  // High-intent: branch_selected users (all have phone in this flow)
+  // High-intent: branch_selected users WITH a phone the CRM holds (C1.8 / R1:
+  // a branch pick without a phone is not the 80 % bucket — reception can't
+  // match it and nobody can remind him).
   const branchRows = db.prepare(`
     SELECT user_id, substr(created_at, 1, 10) AS day
-    FROM events
-    WHERE event_type = 'branch_selected'
-      AND created_at >= datetime('now', ?)
+    FROM events e
+    WHERE e.event_type = 'branch_selected'
+      AND e.created_at >= datetime('now', ?)
+      AND EXISTS (SELECT 1 FROM lead_phones p WHERE p.user_id = e.user_id)
   `).all(`-${days} days`);
 
   // Low-intent: location_request users with NO phone ever recorded.

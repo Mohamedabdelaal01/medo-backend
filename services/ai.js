@@ -12,6 +12,7 @@
 // later means changing two settings, not code.
 
 const { getDb } = require('../db');
+const { createPhoneMasker } = require('./phoneMask');
 
 const DEFAULT_BASE_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
 const DEFAULT_MODEL    = 'glm-4.7-flash'; // free tier on z.ai
@@ -34,7 +35,13 @@ function getAiConfig() {
 /**
  * One chat completion. Never throws.
  * @param {Array<object>} messages
- * @param {object} [opts]  { maxTokens?, temperature?, thinking?, tools?, toolChoice?, timeoutMs? }
+ * @param {object} [opts]  { maxTokens?, temperature?, thinking?, tools?, toolChoice?, timeoutMs?, masker? }
+ *   PHONES NEVER LEAVE (C1.11): every message is sent as a masked COPY (the
+ *   caller's array is not changed) — phones become ⟨phone:N…XY⟩ tokens.
+ *   With opts.masker (the admin chat: one masker per HTTP request, all its
+ *   tool rounds) text/toolCalls come back exactly as the model wrote them
+ *   (tokens) and the CALLER unmasks. Without one, callAi makes a per-call
+ *   masker and returns text already unmasked through it.
  *   thinking defaults to ON (glm-4.7-flash is free — the user wants full
  *   reasoning always; empirically verified 2000 max_tokens comfortably covers
  *   reasoning + a real answer for our prompt sizes, ~17s typical latency).
@@ -50,9 +57,15 @@ async function callAi(messages, opts = {}) {
     return { ok: false, unconfigured: true,
       error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API' };
   }
+  const ownMasker = !opts.masker;
+  const masker = opts.masker || createPhoneMasker();
+  const before = masker.count();
+  const safeMessages = masker.maskMessages(messages);
+  const maskedNow = masker.count() - before;
+  if (maskedNow > 0) console.log(`[ai] masked: ${maskedNow}`);
   const body = {
     model,
-    messages,
+    messages: safeMessages,
     temperature: opts.temperature ?? 0.4,
     max_tokens:  opts.maxTokens ?? 2000,
     thinking: { type: opts.thinking === false ? 'disabled' : 'enabled' },
@@ -96,7 +109,8 @@ async function callAi(messages, opts = {}) {
       if (!toolCalls && (!text || typeof text !== 'string')) {
         return { ok: false, error: 'رد غير متوقع من مزوّد الذكاء الاصطناعي' };
       }
-      return { ok: true, text: (text || '').trim(), toolCalls, model };
+      const outText = (text || '').trim();
+      return { ok: true, text: ownMasker ? masker.unmaskText(outText) : outText, toolCalls, model };
     } catch (err) {
       const msg = err?.name === 'TimeoutError'
         ? 'مزوّد الذكاء الاصطناعي بطيء جداً — حاول تاني'

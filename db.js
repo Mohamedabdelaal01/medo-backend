@@ -77,6 +77,14 @@ function initializeDatabase(dbPath = DB_PATH) {
   } catch (e) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
+  // ── C1.8 — visit_planned's stated day as a Cairo date ('YYYY-MM-DD') ──
+  // Filled only for «النهارده» / «بكره»; NULL for every other event. Additive.
+  try {
+    db.exec(`ALTER TABLE events ADD COLUMN planned_day TEXT`);
+    console.log('✅ Migration: planned_day column added to events table');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
   // Composite index powers the per-user "already scored this product/category"
   // dedup lookups in POST /api/events without a full table scan.
   db.exec(`
@@ -865,6 +873,10 @@ function initializeDatabase(dbPath = DB_PATH) {
     // will actually show up, split by whether they shared a phone number.
     ['forecast_with_phone_weight',    '80'],
     ['forecast_without_phone_weight', '35'],
+    // The 3-day «abandoned intent» reminder (runAbandonedIntentJob) — OFF by
+    // default (C1.9): its targets are idle > 3 days, i.e. outside Meta's 24 h
+    // window. Even when on, every send passes the window guard.
+    ['reminder_job_enabled',          'false'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
