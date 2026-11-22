@@ -45,7 +45,12 @@ function getSetting(key, fallback = null) {
 //   → all become "01012345678"
 function normalizePhone(raw) {
   if (raw == null) return null;
-  let d = String(raw).replace(/\D/g, '');          // digits only
+  // Arabic-Indic (٠-٩) and extended (۰-۹) digits → ASCII first: customers in
+  // Egypt often type their number that way, and \D would drop every digit.
+  let d = String(raw)
+    .replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06F0))
+    .replace(/\D/g, '');                             // digits only
   if (!d) return null;
   d = d.replace(/^00/, '');                          // drop intl "00" prefix
   if (d.startsWith('20') && d.length >= 11) d = d.slice(2); // drop EG country code
@@ -236,6 +241,9 @@ function autoAssignLead(db, userId, leadName) {
 const rateLimitMap = new Map();
 const RATE_LIMIT_MAX    = 20;          // max events allowed per window
 const RATE_LIMIT_WINDOW = 60 * 1000;  // 60-second rolling window (ms)
+// Key for the phone part of the dedup hash: random per boot, never stored or
+// logged (a retry across a restart inside 10 s is the only thing it can miss).
+const DEDUP_PHONE_KEY = crypto.randomBytes(32);
 
 // Phase 1 Idempotency: tracks recently seen event hashes to reject duplicates
 // Fast path — caught before any DB read. Complements Phase 2 DB-level check.
@@ -347,6 +355,12 @@ function validatePayload(req, res, next) {
 // Uses a sliding-window counter stored in rateLimitMap.
 // Rejects the request if count exceeds RATE_LIMIT_MAX within RATE_LIMIT_WINDOW.
 function rateLimiter(req, res, next) {
+  // A request that carries a usable phone is never refused: the bot sends the
+  // phone once and ManyChat doesn't retry, so a 429 here would lose it. Same
+  // rule as the handler (a "{{…}}" placeholder is no phone). Repeats: the 10 s
+  // dedup for all, R1 for branch_selected; other types have no cap here.
+  const p = req.body.phone;
+  if (!isBrokenPlaceholder(p) && /^01\d{9}$/.test(normalizePhone(p) || '')) return next();
   const userId = req.body.user_id;
   const now    = Date.now();
   const state  = rateLimitMap.get(userId);
@@ -358,6 +372,7 @@ function rateLimiter(req, res, next) {
   }
 
   if (state.count >= RATE_LIMIT_MAX) {
+    counters.countRateLimited(req.body.event_type);
     return res.status(429).json({ success: false, error: 'rate_limited' });
   }
 
@@ -554,7 +569,7 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   const brokenFields = [];
   for (const k of Object.keys(req.body || {})) {
     if (!PLACEHOLDER_SKIP.has(k) && isBrokenPlaceholder(req.body[k])) {
-      brokenFields.push(`${k}=${req.body[k]}`);
+      brokenFields.push(k);   // the field name only: a value can hold a phone or a name
       req.body[k] = null;
     }
   }
@@ -668,7 +683,11 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // Catches duplicate retries within the same server session instantly,
   // before any DB reads. Phase 2 below handles cross-restart durability.
   const timeBucket = Math.floor(Date.now() / DEDUP_WINDOW); // changes every 10 s
-  const dedupRaw   = `${user_id}:${event_type}:${event_value ?? ''}:${timeBucket}`;
+  // The phone is part of the key (a repeat that brings a new phone is not a
+  // duplicate) only as a keyed HMAC: the hash becomes events.event_id, which the
+  // admin AI can read, and a plain sha256 of a phone is reversible in seconds.
+  const phoneTag   = normPhone ? crypto.createHmac('sha256', DEDUP_PHONE_KEY).update(normPhone).digest('hex').slice(0, 16) : '';
+  const dedupRaw   = `${user_id}:${event_type}:${event_value ?? ''}:${phoneTag}:${timeBucket}`;
   const dedupHash  = crypto.createHash('sha256').update(dedupRaw).digest('hex');
 
   if (seenEvents.has(dedupHash)) {
@@ -3820,10 +3839,9 @@ function leadInBranch(db, userId, branch) {
 //   • no digits typed (an Arabic name) → the phone term falls back to the text,
 //     so the phone LIKEs simply never match instead of becoming '%%' = everyone.
 //   • Arabic-Indic digits (٠١٢…) are folded to ASCII first: the Egyptian Arabic
-//     keyboard types them by default, and normalizePhone's /\D/ is ASCII-only —
-//     it would strip the WHOLE number away and the page would then tell the
-//     manager the customer doesn't exist. Folded here and not inside
-//     normalizePhone, which also feeds storage/ingestion.
+//     keyboard types them by default. Since 2026-11-22 normalizePhone folds them
+//     itself too (storage and intake); folding here as well is harmless and keeps
+//     the partial-term LIKE path, which doesn't go through normalizePhone.
 // Returns null when there's nothing usable to search for (empty / spaces only).
 const SEARCH_MAX_LEN = 100;   // a customer name or phone is never longer
 const asciiDigits = (s) => s
@@ -8020,7 +8038,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-11-18-c1-crm-intake-r2';
+const BUILD_VERSION = '2026-11-22-phone-safe-intake';
 // How many old rows still hold 'all_branches' (never rewritten — review r2)
 // and how many profiles the one-time cleanup backed up. Counts only, cached
 // 5 minutes (Railway pings /health constantly).
@@ -8061,6 +8079,7 @@ app.get('/health', (req, res) => {
     window_skips:   c.window_skips,
     lead_rule:      c.lead_rule,
     branch_repeats: c.branch_repeats,
+    rate_limited:   c.rate_limited,
   });
 });
 

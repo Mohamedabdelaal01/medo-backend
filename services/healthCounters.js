@@ -10,7 +10,9 @@
 //   window_skips   — sends the 24 h window guard stopped, by site and reason;
 //   lead_rule      — CAPI Leads not fired because the phone already sits on
 //                    another profile (C1.6);
-//   branch_repeats — branch_selected repeats inside 6 h (R1) answered as skips.
+//   branch_repeats — branch_selected repeats inside 6 h (R1) answered as skips;
+//   rate_limited   — intake requests answered 429 (20 a minute per contact), by
+//                    known event_type (else "other"); a request with a phone is never one.
 // Reset on every restart (a Railway redeploy) — they are a since-boot view.
 
 const API_NAMES = ['getInfo', 'setCustomField', 'addTag', 'sendFlow'];
@@ -29,6 +31,7 @@ const state = {
   window_skips: Object.fromEntries(SITES.map(s => [s, {}])),   // site → reason → n
   lead_rule: { skipped_other_profile: 0 },
   branch_repeats: 0,
+  rate_limited: {},                      // type → n
 };
 
 function countTestEvent(type, phonePresent) {
@@ -55,11 +58,15 @@ function countWindowSkip(site, reason) {
 
 function countLeadSkipped() { state.lead_rule.skipped_other_profile++; }
 function countBranchRepeat() { state.branch_repeats++; }
+function countRateLimited(type) {
+  const key = KNOWN_EVENT_TYPES.has(type) ? type : 'other';
+  state.rate_limited[key] = (state.rate_limited[key] || 0) + 1;
+}
 
 function snapshot() {
   return JSON.parse(JSON.stringify(state));
 }
 
 module.exports = {
-  countTestEvent, countManyChatApi, countWindowSkip, countLeadSkipped, countBranchRepeat, snapshot,
+  countTestEvent, countManyChatApi, countWindowSkip, countLeadSkipped, countBranchRepeat, countRateLimited, snapshot,
 };
