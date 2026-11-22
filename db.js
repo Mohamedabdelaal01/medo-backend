@@ -85,6 +85,9 @@ function initializeDatabase(dbPath = DB_PATH) {
   } catch (e) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
+  // O6 «جايين النهارده» looks visit_planned up by its day (partial: only the
+  // few rows that carry one).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_events_planned_day ON events(planned_day) WHERE planned_day IS NOT NULL`);
   // Composite index powers the per-user "already scored this product/category"
   // dedup lookups in POST /api/events without a full table scan.
   db.exec(`
@@ -877,6 +880,10 @@ function initializeDatabase(dbPath = DB_PATH) {
     // default (C1.9): its targets are idle > 3 days, i.e. outside Meta's 24 h
     // window. Even when on, every send passes the window guard.
     ['reminder_job_enabled',          'false'],
+    // O4 — the follow-up SLA (hours) for a lead who said he comes today /
+    // tomorrow (visit_planned): /api/branch/sla-alerts flags him after this
+    // many hours with zero effort (the general SLA stays 48 h).
+    ['sla_hours_planned',             '4'],
   ];
   const insertSetting = db.prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`

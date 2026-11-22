@@ -21,6 +21,7 @@ const { getManyChatClient }= require('./manychat/client');
 const counters             = require('./services/healthCounters');
 const { guardedSendFlow, SKIP_MESSAGES_AR } = require('./services/windowGuard');
 const { createPhoneMasker } = require('./services/phoneMask');
+const visitIntent           = require('./services/visitIntent');
 const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
 
 const app  = express();
@@ -543,6 +544,15 @@ function storeChatPhone(db, { userId, phone, capi }) {
   return { stored: true, lead: true };
 }
 
+// The body's "test" key (§2.3 R5): test mode only for these values (trimmed,
+// case-insensitive) or boolean true. A number counts by its digits (1 → "1").
+const TEST_FLAG_VALUES = new Set(['ask', 'known', 'true', '1', 'yes', 'test']);
+function isTestFlag(v) {
+  if (v === true) return true;
+  if (typeof v !== 'string' && typeof v !== 'number') return false;
+  return TEST_FLAG_VALUES.has(String(v).trim().toLowerCase());
+}
+
 // Cairo date for visit_planned's today / tomorrow (DST-safe: date arithmetic
 // on the Cairo calendar day, not on +24 h).
 function plannedDayDate(norm, now = new Date()) {
@@ -668,11 +678,11 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   // write-back, not even the dedup memory. Only GET /health counts it (by
   // type, phone present or not — never the phone). ManyChat sends
   // "test":"{gate_test}", empty for every real customer.
-  // "false", "0", false, 0 and '' are NOT test (review r2).
-  const testFlag = req.body.test;
-  const isTest = testFlag === true
-    || (typeof testFlag === 'number' && testFlag !== 0 && Number.isFinite(testFlag))
-    || (typeof testFlag === 'string' && !['', 'false', '0'].includes(testFlag.trim().toLowerCase()));
+  // An ALLOWLIST (C1.7 hardening, 2026-11-22): only ask / known / true / 1 /
+  // yes / test (trimmed, any case) or boolean true is test mode; "", "false",
+  // "0", "no", random text, an unresolved field and anything else is a NORMAL
+  // event — a stray value can never silently drop a real customer's event.
+  const isTest = isTestFlag(req.body.test);
   if (isTest) {
     counters.countTestEvent(event_type, !!normPhone);
     return res.status(200).json({ success: true, test: true, ...answerKeys(db, user_id) });
@@ -1922,6 +1932,9 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   const otherVisits   = journey.visits.filter(v => v.branch && v.branch !== visitBranch);
   const otherPurchase = journey.purchases.find(p => p.branch && p.branch !== visitBranch) || null;
 
+  // O6 «شاف إيه»: what he looked at, the day he said he'd come, his ad.
+  const viewed = visitIntent.viewedFor(db, [lead.user_id]).get(lead.user_id) || null;
+
   return res.json({
     ok:                   true,
     user_id:              lead.user_id,
@@ -1937,6 +1950,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       other_visits:   otherVisits,      // [{ branch, sales_rep, visited_at }]
       other_purchase: otherPurchase,    // { branch, rep, price, ... } | null
     },
+    viewed,               // { items[≤5], visit_planned{value, planned_day, when, said_at}|null, campaign_source }
   });
 });
 
@@ -2233,6 +2247,8 @@ app.get('/api/reception/today-visits', requireAuth, authorizeRoles('reception', 
   }
 
   const isoZ = (s) => { const d = sqlUtcToDate(s); return d && !isNaN(d) ? d.toISOString().slice(0, 19) + 'Z' : null; };
+  // O6 «شاف إيه» for each arrival.
+  const viewedByUser = visitIntent.viewedFor(db, rows.map(r => r.user_id));
 
   const visits = rows.map(r => {
     const setThisVisit = repSetThisVisit(r.lv_sales_rep, r.sales_rep_set_at, r.checked_in_at);
@@ -2259,10 +2275,39 @@ app.get('/api/reception/today-visits', requireAuth, authorizeRoles('reception', 
       previous_sales_rep: setThisVisit ? null : (r.lv_sales_rep || null),
       sales_today:        salesToday,
       sold_today:         salesToday.length > 0,
+      viewed:             viewedByUser.get(r.user_id) || null,
     };
   });
 
   return res.json({ branch, day, count: visits.length, visits });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/reception/expected-visits — «جايين النهارده» (O6): customers whose
+// LATEST visit_planned says today or tomorrow (Cairo day, events.planned_day)
+// for THIS branch (the event's branch, else preferred_branch) and who haven't
+// checked in since they said it. Each row: name, the phones reception already
+// sees in «زيارة اليوم», planned_when ('today' | 'tomorrow'), the «شاف» data.
+// Reception's action on a row is the same confirm as the desk
+// (POST /api/visits/confirm with user_id).
+//   reception / faisal + nasr_city managers → locked to own branch.
+//   admin → ?branch=<id> required.
+// Read-only: no CAPI, no ManyChat, no writes.
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/reception/expected-visits', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const branch = actsAsReception(req)
+    ? (req.user.branch || null)
+    : ((typeof req.query.branch === 'string' && req.query.branch.trim()) || null);
+  if (!branch) return res.status(400).json({ error: 'branch_required' });
+
+  const { day, tomorrow, rows } = visitIntent.expectedVisits(getDb(), branch);
+  return res.json({
+    branch, day, tomorrow,
+    count:    rows.length,
+    today_n:  rows.filter(r => r.planned_when === 'today').length,
+    leads:    rows,
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3158,8 +3203,26 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
     LIMIT ?
   `).all(branch, branch, branch, branch, limit);
 
+  // O4: «جاي النهارده / بكره» from the latest visit_planned (this branch's or no branch).
+  addPlannedBadges(db, customers, () => branch);
+
   return res.json({ branch, customers, total, limit });
 });
+
+// O4 — puts planned_when ('today' | 'tomorrow' | null) and planned_day on each
+// row (in place) from the customer's LATEST visit_planned: only when he hasn't
+// come since and the plan's branch is the row's branch (branchOf(row)) or unknown.
+function addPlannedBadges(db, rows, branchOf) {
+  if (!rows || !rows.length) return rows;
+  const plans = visitIntent.latestPlans(db, rows.map(r => r.user_id));
+  for (const r of rows) {
+    const p = plans.get(r.user_id);
+    const when = visitIntent.plannedBadge(p, branchOf(r));
+    r.planned_when = when;
+    r.planned_day  = when ? p.planned_day : null;
+  }
+  return rows;
+}
 
 // Records a completed follow-up in the append-only log (history survives
 // reassignment). Only called when a follow-up is actually marked done.
@@ -3635,7 +3698,11 @@ app.post('/api/branch/customers/bulk-assign', requireAuth, authorizeRoles('branc
 // GET /api/branch/sla-alerts — "الإدارة بالاستثناء": computed on demand (no
 // cron, no schema) so the manager sees ONLY what needs intervention:
 //   hot_untouched — hot/high-score customers assigned >48h with ZERO effort
-//                   (no follow-up, no attempt, no WhatsApp sent)
+//                   (no follow-up, no attempt, no WhatsApp sent); FIRST, any
+//                   customer whose latest visit_planned says today/tomorrow
+//                   here, with the same zero effort for sla_hours_planned
+//                   (setting, default 4) since the later of the assignment and
+//                   his plan (O4). Each row: sla_hours, planned_when.
 //   idle_reps     — reps holding pending customers with no recorded activity
 //                   in the last 24h
 //   visits_today  — reception-confirmed arrivals today (0 on a workday usually
@@ -3666,6 +3733,48 @@ app.get('/api/branch/sla-alerts', requireAuth, authorizeRoles('branch_manager', 
     ORDER BY lp.total_score DESC
     LIMIT 25
   `).all(branch);
+  for (const r of hotUntouched) { r.sla_hours = 48; r.planned_when = null; }
+
+  // O4 — a shorter SLA (setting sla_hours_planned, default 4) for a customer
+  // whose latest visit_planned says today / tomorrow at this branch: the same
+  // «zero effort» rule, any score, and the clock starts at the later of the
+  // assignment and the moment he said it. Listed first; a lead is listed once.
+  const slaPlanned = visitIntent.slaHoursPlanned(getSetting('sla_hours_planned'));
+  const today = visitIntent.cairoDayOf(), tomorrow = visitIntent.nextDay(today);
+  const plannedCand = db.prepare(`
+    SELECT f.user_id, lp.first_name, TRIM(f.assigned_sales) AS rep,
+      COALESCE(lp.total_score, 0) AS total_score,
+      COALESCE(lp.lead_class, 'cold') AS lead_class,
+      f.assigned_at
+    FROM branch_customer_followups f
+    JOIN lead_profiles lp ON lp.user_id = f.user_id
+    WHERE f.branch = ?
+      AND f.assigned_sales IS NOT NULL AND TRIM(f.assigned_sales) != ''
+      AND COALESCE(f.followed_up, 0) = 0
+      AND COALESCE(f.attempt_count, 0) = 0
+      AND COALESCE(f.sent, 0) = 0
+      AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND COALESCE(lp.is_duplicate, 0) = 0
+      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = f.user_id
+                    AND e.event_type = 'visit_planned' AND e.planned_day IN (?, ?))
+  `).all(branch, today, tomorrow);
+  const plans = visitIntent.latestPlans(db, plannedCand.map(r => r.user_id));
+  const nowMs = Date.now();
+  const plannedLate = [];
+  for (const r of plannedCand) {
+    const p = plans.get(r.user_id);
+    const when = visitIntent.plannedBadge(p, branch);
+    if (!when) continue;
+    const from = Math.max(sqlUtcToDate(r.assigned_at)?.getTime() || 0, sqlUtcToDate(p.said_at)?.getTime() || 0);
+    if (!from) continue;
+    const hours = (nowMs - from) / 3600000;
+    if (hours < slaPlanned) continue;
+    plannedLate.push({ ...r, hours_waiting: Math.floor(hours), sla_hours: slaPlanned, planned_when: when });
+  }
+  plannedLate.sort((a, b) => (a.planned_when === b.planned_when ? b.hours_waiting - a.hours_waiting
+                                                                 : a.planned_when === 'today' ? -1 : 1));
+  const plannedIds = new Set(plannedLate.map(r => r.user_id));
+  const hotList = [...plannedLate, ...hotUntouched.filter(r => !plannedIds.has(r.user_id))];
 
   // Idle reps — pending work but no recorded action in 24h. Timestamps are a
   // mix of ISO-T and SQLite formats, so compare in JS (robust to both).
@@ -3703,7 +3812,8 @@ app.get('/api/branch/sla-alerts', requireAuth, authorizeRoles('branch_manager', 
     WHERE branch = ? AND date(visited_at) = date('now')
   `).get(branch).n;
 
-  return res.json({ branch, hot_untouched: hotUntouched, idle_reps: idleReps, visits_today: visitsToday });
+  return res.json({ branch, hot_untouched: hotList, idle_reps: idleReps, visits_today: visitsToday,
+                    sla_hours_planned: slaPlanned });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3906,6 +4016,8 @@ app.get('/api/branch/leads', requireAuth, authorizeRoles('branch_manager', 'admi
     branch, branch, branch, branch, branch, branch,
     ...(search ? [search.like, search.phoneLike, search.phoneLike] : []),
   ]);
+
+  addPlannedBadges(db, rows, () => branch);   // O4 badges
 
   return res.json({ branch, count: rows.length, customers: rows });
 });
@@ -4223,6 +4335,7 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
       lp.last_product,
       lp.last_input_text,
       f.assigned_at,
+      f.branch,
       f.sent, f.sent_at,
       COALESCE(f.attempt_count, 0) AS attempt_count,
       f.last_attempt_at,
@@ -4243,10 +4356,17 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
            OR datetime(replace(replace(f.snoozed_until,'T',' '),'Z','')) <= datetime('now'))
   `).all(me, me);
 
+  // O4: «جاي النهارده / بكره» (the plan's branch = the follow-up's branch, or unknown).
+  addPlannedBadges(db, rows, (r) => r.branch);
+
   const now = Date.now();
   const scored = rows.map((r) => {
     const reasons = [];
     let priority  = r.total_score;
+
+    // He said he comes today / tomorrow — call him before he walks in.
+    if (r.planned_when === 'today')    { priority += 60; reasons.push('قال جاي النهارده 🏬'); }
+    if (r.planned_when === 'tomorrow') { priority += 40; reasons.push('قال جاي بكره 🏬'); }
 
     // Recency — reuse the same tiers as the dashboard priority engine.
     const rec = computeRecencyBonus(r.last_activity);
@@ -8038,7 +8158,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // Version marker — bumped on every meaningful release so the admin
 // (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-11-22-phone-safe-intake';
+const BUILD_VERSION = '2026-11-22-o6-o4';
 // How many old rows still hold 'all_branches' (never rewritten — review r2)
 // and how many profiles the one-time cleanup backed up. Counts only, cached
 // 5 minutes (Railway pings /health constantly).
