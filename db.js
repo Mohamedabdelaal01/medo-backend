@@ -398,6 +398,77 @@ function initializeDatabase(dbPath = DB_PATH) {
     }
   }
 
+  // ── «قسم الأسعار» (2026-11-22): a sale's lines from the prices system ─────
+  // The manual catalogue above (product_categories / products / purchase_items)
+  // stays, read-only, so old contracts keep their products. New sales record
+  // the prices system's models / pieces (services/grandCatalog.js):
+  //   purchase_lines     — what was sold (ids + titles + qty). Staff may see it.
+  //   purchase_estimates — today's LIST-price estimate («تقريبي»), ADMIN ONLY.
+  //                        A table of its own, so no `SELECT * FROM purchases`
+  //                        anywhere can ever carry it to a non-admin.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS purchase_lines (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      purchase_id  INTEGER NOT NULL,
+      line_index   INTEGER NOT NULL,
+      kind         TEXT NOT NULL,          -- 'set' | 'piece'
+      model_id     TEXT,                   -- gid://shopify/Product/… (the room / set)
+      variant_id   TEXT,                   -- gid://shopify/ProductVariant/… (a piece; null for a set by model)
+      with_json    TEXT,                   -- a set's changed pieces: ["gid://shopify/ProductVariant/…"]
+      with_titles_json TEXT,
+      qty          INTEGER NOT NULL DEFAULT 1,
+      title        TEXT,
+      model_title  TEXT,
+      created_at   DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_purchase_lines_purchase ON purchase_lines(purchase_id, line_index);
+    CREATE INDEX IF NOT EXISTS idx_purchase_lines_model    ON purchase_lines(model_id);
+
+    CREATE TABLE IF NOT EXISTS purchase_estimates (
+      purchase_id          INTEGER PRIMARY KEY,
+      list_total_estimate  INTEGER,        -- whole EGP at that day's LIST prices; NULL = could not be priced
+      estimate_complete    INTEGER NOT NULL DEFAULT 0,
+      catalog_version      TEXT,
+      source               TEXT,           -- 'quote' | 'catalog_cache' | 'none'
+      lines_json           TEXT,           -- [{ index, unit_price, line_total, warnings[] }]
+      warnings_json        TEXT,
+      computed_at          DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- The last good catalogue from the prices system (one row, id = 1), so a
+    -- CRM restart while grand-system is down still shows prices and takes
+    -- sales (services/grandCatalog.js configureStore). SERVER-SIDE ONLY: not
+    -- on the sqlGuard allowlist, in no CSV / export, read by nothing but
+    -- grandCatalog (its body holds his sales notes and hidden models).
+    CREATE TABLE IF NOT EXISTS grand_catalog_cache (
+      id          INTEGER PRIMARY KEY CHECK (id = 1),
+      body_json   TEXT NOT NULL,
+      etag        TEXT,
+      scope       TEXT NOT NULL,           -- 'public' | 'staff'
+      version     TEXT,
+      fetched_at  INTEGER NOT NULL,        -- ms since epoch (the 200)
+      checked_at  INTEGER NOT NULL,        -- ms since epoch (the last 200 / 304)
+      saved_at    DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  // Added after the first prices-section build (review 2026-11-22):
+  //   purchase_lines.category / category_ar — the catalogue's category code +
+  //     Arabic name at sale time (the analytics' best sellers per category);
+  //   purchase_estimates.lines_version — which write of the lines the estimate
+  //     priced (MAX(purchase_lines.id) then): an older in-flight estimate never
+  //     overwrites a newer one.
+  for (const [table, col, type] of [
+    ['purchase_lines', 'category', 'TEXT'],
+    ['purchase_lines', 'category_ar', 'TEXT'],
+    ['purchase_estimates', 'lines_version', 'INTEGER'],
+    // r2: which secret fetched a saved staff copy (a 16-hex hash, never the
+    // secret) — a boot shows it as staff only when it is the current one's.
+    ['grand_catalog_cache', 'secret_fp', 'TEXT'],
+  ]) {
+    const have = db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col);
+    if (!have) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+  }
+
   // ── Intelligence layer — additive tables ─────────────────────────────────
   // messages_sent: every ManyChat flow we trigger is recorded here for audit
   // and to drive the weekly send counter. Joined back to lead_profiles by user_id.
@@ -512,6 +583,29 @@ function initializeDatabase(dbPath = DB_PATH) {
       UNIQUE(user_id, branch, visit_day)
     );
     CREATE INDEX IF NOT EXISTS idx_visit_checkins_branch_day ON visit_checkins(branch, visit_day);
+  `);
+
+  // visit_outcomes (phase 2, 2026-11-22) — «مشي من غير شراء + السبب»: reception
+  // records why a customer who came today left without buying, so the reasons
+  // can be counted. One row per check-in (a second answer replaces the first;
+  // reception can take it back the same day).
+  //   reason — 'price' | 'model_missing' | 'comparing' | 'will_return' | 'other'
+  //   note   — optional free words (≤ 300 chars)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS visit_outcomes (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      checkin_id  INTEGER NOT NULL UNIQUE,
+      user_id     TEXT NOT NULL,
+      branch      TEXT NOT NULL,
+      visit_day   TEXT NOT NULL,
+      reason      TEXT NOT NULL,
+      note        TEXT,
+      recorded_by TEXT,
+      created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+      updated_at  DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_visit_outcomes_branch_day ON visit_outcomes(branch, visit_day);
+    CREATE INDEX IF NOT EXISTS idx_visit_outcomes_user ON visit_outcomes(user_id);
   `);
 
   // branch_customer_followups: live follow-up state per (branch, user_id).

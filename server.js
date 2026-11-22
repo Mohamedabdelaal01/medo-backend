@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-22-phase1-declutter';
+const BUILD_VERSION = '2026-11-22-overhaul-p2-p4-r2';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -35,6 +35,7 @@ const counters             = require('./services/healthCounters');
 const { guardedSendFlow, SKIP_MESSAGES_AR } = require('./services/windowGuard');
 const { createPhoneMasker } = require('./services/phoneMask');
 const visitIntent           = require('./services/visitIntent');
+const grandCatalog          = require('./services/grandCatalog');
 const { requireAuth, requireRole, authorizeRoles, signSessionToken,
         rotateJwtSecretOnce, jwtRotated, ROTATED_FLAG } = require('./middleware/auth');
 
@@ -329,6 +330,42 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+
+// ── «تقريبي» is the admin's only (owner, 2026-11-22) ─────────────────────────
+// A sale's estimate (today's LIST prices of what was recorded) is shown to the
+// admin ONLY. The routes that build it ask for role === 'admin' themselves; this
+// is the backstop for every route, present and future: for anyone but an admin
+// (or with no session) any key below is removed from a JSON answer, at any
+// depth, before it leaves. Keys only the estimate uses — never a key staff need
+// (price = the paid amount staff typed stays).
+const ADMIN_ONLY_KEYS = new Set([
+  'estimate', 'estimates', 'list_total_estimate', 'estimate_complete', 'estimate_total', 'estimate_count',
+  'estimate_incomplete', 'estimate_source', 'estimate_lines', 'value_total', 'sales_value',
+]);
+function stripAdminOnly(v, depth = 0) {
+  if (v == null || typeof v !== 'object' || depth > 12) return v;
+  if (Array.isArray(v)) {
+    let out = null;
+    for (let i = 0; i < v.length; i++) {
+      const s = stripAdminOnly(v[i], depth + 1);
+      if (s !== v[i]) { out = out || v.slice(); out[i] = s; }
+    }
+    return out || v;
+  }
+  if (Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) return v;
+  let out = null;
+  for (const k of Object.keys(v)) {
+    if (ADMIN_ONLY_KEYS.has(k)) { out = out || { ...v }; delete out[k]; continue; }
+    const s = stripAdminOnly(v[k], depth + 1);
+    if (s !== v[k]) { out = out || { ...v }; out[k] = s; }
+  }
+  return out || v;
+}
+app.use((req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = (body) => json(req.user && req.user.role === 'admin' ? body : stripAdminOnly(body));
+  next();
+});
 
 // Request logger — skip health checks (Railway pings them constantly) and
 // stay quiet in production to avoid log bloat. Set LOG_REQUESTS=1 to force on.
@@ -1533,7 +1570,10 @@ app.delete('/api/leads/:user_id', requireAuth, requireRole('admin'), (req, res) 
     db.prepare(`DELETE FROM lead_phones     WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM lead_visits     WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM visit_checkins  WHERE user_id = ?`).run(user_id);
+    db.prepare(`DELETE FROM visit_outcomes  WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM tasks           WHERE lead_id = ?`).run(user_id);
+    // a sale's rows first (lines / estimates have no foreign key), then the sales
+    deletePurchaseRows(db, `SELECT id FROM purchases WHERE user_id = ?`, user_id);
     db.prepare(`DELETE FROM purchases       WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM messages_sent   WHERE user_id = ?`).run(user_id);
     db.prepare(`DELETE FROM follow_up_state WHERE user_id = ?`).run(user_id);
@@ -1842,12 +1882,25 @@ function todayCheckin(db, userId, branch) {
   ).get(userId, branch, cairoDay()) || null;
 }
 
+// Phase 2 r2: a sale recorded today for a customer who checked in today at
+// the branch takes back today's «مشي من غير شراء» answer there (he bought —
+// the reason no longer stands). Call it INSIDE the sale's transaction.
+function clearLeftOnSale(db, userId, branch) {
+  if (!userId || !branch) return 0;
+  const ci = todayCheckin(db, userId, branch);
+  return ci ? db.prepare(`DELETE FROM visit_outcomes WHERE checkin_id = ?`).run(ci.id).changes : 0;
+}
+
 // Phase 0 r4: is the customer on one of THIS branch's reception lists — the
 // «طلبوا عنوان الفرع» list (GET /api/reception/leads: a branch_selected for the
 // branch + a phone) or «جايين النهارده» (GET /api/reception/expected-visits)?
 // A reception manager confirms by id only a customer those lists show him.
+// r2 (2026-11-22): also «زيارة اليوم» — a customer already checked in TODAY at
+// the branch (GET /api/reception/today lists him), so a repeat confirm by id
+// answers 200 already_checked_in, not 404.
 function onReceptionLists(db, userId, branch) {
   if (!branch) return false;
+  if (todayCheckin(db, userId, branch)) return true;
   const listed = db.prepare(`
     SELECT 1 FROM events e JOIN lead_profiles lp ON lp.user_id = e.user_id
     WHERE e.user_id = ? AND e.event_type = 'branch_selected' AND (e.event_value = ? OR e.branch = ?)
@@ -1993,7 +2046,7 @@ function linkVisitSales(db, { userId, branch, salesRep, operator }) {
 // the legacy rep dashboard's reception tab) keeps it.
 app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
-  const { phone, visit_code, branch, user_id } = req.body || {};
+  const { phone, visit_code, branch, user_id, sales_rep } = req.body || {};
   const db = getDb();
   const role = req.user?.role;
   // Phase 0 r4 — who may look a customer up how:
@@ -2034,13 +2087,29 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
       FROM lead_profiles WHERE user_id = ?
     `).get(String(user_id).trim());
     if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+    // Phase 2 r2: the desk's «هو ده؟» card came from a phone lookup and sends
+    // the number WITH the picked profile (a number can carry several). The id
+    // counts as found by phone only when that profile carries the number
+    // (lead_phones, or the legacy profile phone) — the customer standing there
+    // gave it, so no list check. A number the profile doesn't carry → 404 like
+    // an unknown id (ids can't be probed with any number).
+    if (given(phone)) {
+      const np = normalizePhone(phone);
+      if (!np || np.length < 10) return res.status(400).json({ error: 'invalid_phone' });
+      const carries = db.prepare(`
+        SELECT 1 FROM lead_phones WHERE user_id = ? AND phone = ?
+        UNION ALL SELECT 1 FROM lead_profiles WHERE user_id = ? AND phone = ?
+        LIMIT 1`).get(lead.user_id, np, lead.user_id, np);
+      if (!carries) return res.status(404).json({ error: 'lead_not_found' });
+      foundByPhone = true;
+    }
   } else if (given(phone)) {
     const np = normalizePhone(phone);
     if (!np) return res.status(400).json({ error: 'invalid_phone' });
     // Match against EVERY phone the customer ever gave (lead_phones), not just
     // the latest one on the profile — so an older number still works.
     lead = db.prepare(`
-      SELECT lp.user_id, lp.first_name, lp.campaign_source, lp.lead_class,
+      SELECT lp.user_id, lp.first_name, lp.last_name, lp.gender, lp.campaign_source, lp.lead_class,
              lp.visit_confirmed, lp.preferred_branch
       FROM lead_phones ph
       JOIN lead_profiles lp ON lp.user_id = ph.user_id
@@ -2081,9 +2150,68 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
     return res.status(404).json({ error: 'lead_not_found' });
   }
 
+  // Phase 2 («وصل — سجّل الزيارة»): reception may name the salesperson he
+  // stands with in the same request. Checked BEFORE anything is written: a
+  // name that isn't an active salesperson of the visit's branch refuses the
+  // whole confirm (no visit, no Meta event, no ManyChat message).
+  const visitBranch = pickedBranch || intakeBranch(lead.preferred_branch) || null;
+  const wantsRep = given(sales_rep);
+  let repRow = null;
+  if (wantsRep) {
+    if (typeof sales_rep !== 'string') return res.status(400).json({ error: 'السيلز ده مش من سيلز الفرع (أو متوقف) — اختار من القايمة', code: 'rep_not_in_branch' });
+    if (!visitBranch) return res.status(400).json({ error: 'branch_required', message: 'اختار الفرع اللي إنت فيه الأول' });
+    repRow = findBranchSalesRep(db, sales_rep, visitBranch);
+    if (!repRow) {
+      return res.status(400).json({ error: 'السيلز ده مش من سيلز الفرع (أو متوقف) — اختار من القايمة', code: 'rep_not_in_branch' });
+    }
+  }
+
+  // Phase 2 r2: already checked in TODAY at this branch → the visit was
+  // recorded (and Meta + the thank-you message were sent) by the first
+  // confirm. A second one writes and sends nothing — no lead_profiles touch,
+  // no FindLocation, no ManyChat flow; a named salesperson is linked like
+  // POST /api/visits/set-sales (same Steps A–C + audit row).
+  const already = visitBranch ? todayCheckin(db, lead.user_id, visitBranch) : null;
+  if (already) {
+    let relinked = null;
+    if (repRow) {
+      relinked = db.transaction(() => linkVisitSales(db, {
+        userId: lead.user_id, branch: visitBranch, salesRep: repRow.name, operator: req.user?.name,
+      }))();
+    }
+    const lvNow = db.prepare(`SELECT sales_rep, sales_rep_set_at FROM lead_visits WHERE user_id = ? AND branch = ?`)
+      .get(lead.user_id, visitBranch);
+    const repNow = lvNow && repSetThisVisit(lvNow.sales_rep, lvNow.sales_rep_set_at, already.checked_in_at)
+      ? lvNow.sales_rep : null;
+    const at = sqlUtcToDate(already.checked_in_at);
+    console.log(`🏪 VISIT ALREADY CONFIRMED TODAY: ${lead.user_id} → ${visitBranch}${repRow ? ` (salesperson ${repRow.name})` : ''}`);
+    return res.json({
+      ok:                 true,
+      already_checked_in: true,
+      user_id:            lead.user_id,
+      first_name:         lead.first_name || 'غير معروف',
+      campaign_source:    lead.campaign_source || null,
+      branch:             visitBranch,
+      lead_class:         lead.lead_class || null,
+      checked_in_at:      at && !isNaN(at) ? at.toISOString().slice(0, 19) + 'Z' : null,
+      sales_rep:          repRow ? repRow.name : null,       // the one THIS request linked
+      current_sales_rep:  repNow,                            // this visit's salesperson now
+      pre_visit_rep:      relinked?.preVisitRep || null,
+      was_lost_and_returned: false,
+      prior_activity:     { multi_branch: false, other_visits: [], other_purchase: null },
+      viewed:             visitIntent.viewedFor(db, [lead.user_id]).get(lead.user_id) || null,
+    });
+  }
+
+  // Every write of the confirm — and the salesperson link when one was named —
+  // in ONE transaction: either the visit is recorded with its salesperson, or
+  // nothing is.
+  let wasLostAndReturned = false;
+  let linked = null;
+  const newClass = lead.lead_class === 'purchased' ? 'purchased' : 'visited';
+  db.transaction(() => {
   // Global "has visited at least one branch" flag — for scoring/funnel.
   // (Idempotent — won't downgrade a purchased lead.)
-  const newClass = lead.lead_class === 'purchased' ? 'purchased' : 'visited';
   db.prepare(`
     UPDATE lead_profiles SET
       lead_class      = ?,
@@ -2098,8 +2226,7 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
   // visiting حلوان later must not erase an earlier فيصل visit (one row each).
   // The lead's last intent goes through intakeBranch (C1, review r2) so a
   // polluted preferred_branch ('all_branches') never lands in lead_visits /
-  // visit_checkins.
-  const visitBranch = pickedBranch || intakeBranch(lead.preferred_branch) || null;
+  // visit_checkins. (visitBranch is computed above, before the rep check.)
   if (visitBranch) {
     db.prepare(`
       INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)
@@ -2114,7 +2241,7 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
   const revisitRow = db.prepare(
     `SELECT revisit_status FROM lead_profiles WHERE user_id = ?`
   ).get(lead.user_id);
-  const wasLostAndReturned = revisitRow?.revisit_status === 'lost';
+  wasLostAndReturned = revisitRow?.revisit_status === 'lost';
   if (wasLostAndReturned) {
     db.prepare(`
       UPDATE lead_profiles SET
@@ -2124,6 +2251,13 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
       WHERE user_id = ?
     `).run(lead.user_id);
   }
+
+  // The salesperson he stands with (the same Steps A–C + audit row as
+  // POST /api/visits/set-sales), after today's check-in exists.
+  if (repRow) {
+    linked = linkVisitSales(db, { userId: lead.user_id, branch: visitBranch, salesRep: repRow.name, operator: req.user?.name });
+  }
+  })();
 
   console.log(`🏪 VISIT CONFIRMED: ${lead.first_name || lead.user_id} → ${visitBranch || 'unknown branch'} (${lead.campaign_source || 'no campaign'})`);
 
@@ -2199,8 +2333,11 @@ app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin'
     campaign_source:      lead.campaign_source || null,
     branch:               visitBranch || null,
     lead_class:           newClass,
-    pre_visit_rep:        preVisitRow?.assigned_sales || null,
+    // When a salesperson was named: the pre-visit rep the link recorded (the
+    // follow-up row now names the showroom salesperson).
+    pre_visit_rep:        repRow ? (linked?.preVisitRep || null) : (preVisitRow?.assigned_sales || null),
     last_showroom_rep:    lastShowroomRow?.sales_rep || null,
+    sales_rep:            repRow ? repRow.name : null,
     was_lost_and_returned: wasLostAndReturned,
     prior_activity: {
       multi_branch:   otherVisits.length > 0 || !!otherPurchase,
@@ -2357,6 +2494,11 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
 app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
   const { first_name, phone, interest, source, branch: bodyBranch } = req.body || {};
+  // Phase 2 r2 — «مش هو؟ سجّله عميل جديد»: the number is known but the person
+  // at the desk is someone else (a family phone). new_person:true always makes
+  // a NEW profile with its own walk-in id that SHARES the number (added to
+  // lead_phones; the other profiles keep it, nothing of theirs is touched).
+  const newPerson = req.body?.new_person === true;
 
   const branch = actsAsReception(req) ? (req.user.branch || null) : (bodyBranch || null);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
@@ -2376,13 +2518,16 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
 
   const db = getDb();
 
-  // Re-use an existing lead if this phone is already known — avoid duplicates.
-  let lead = db.prepare(`
+  // Re-use an existing lead if this phone is already known — avoid duplicates
+  // (not for «مش هو؟»: new_person is a different person on the same number).
+  const known = db.prepare(`
     SELECT lp.user_id FROM lead_phones ph
     JOIN lead_profiles lp ON lp.user_id = ph.user_id
     WHERE ph.phone = ? ORDER BY lp.last_activity DESC LIMIT 1
   `).get(np)
     || db.prepare(`SELECT user_id FROM lead_profiles WHERE phone = ? LIMIT 1`).get(np);
+  const lead = newPerson ? null : known;
+  const phoneKnownBefore = !!known;
 
   const existed = !!lead;
   const userId  = existed ? lead.user_id : `walkin_${crypto.randomUUID()}`;
@@ -2390,10 +2535,12 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   let phoneIsNew = false;
   const tx = db.transaction(() => {
     if (existed) {
-      // Known customer walking in again — refresh + mark this visit.
+      // Known customer walking in again — refresh + mark this visit. His name
+      // is filled only when the profile has none: a typed name never renames
+      // an existing customer (phase 2 r2 — that was another person's name).
       db.prepare(`
         UPDATE lead_profiles SET
-          first_name      = COALESCE(NULLIF(?,''), first_name),
+          first_name      = COALESCE(NULLIF(first_name,''), NULLIF(?,'')),
           last_category   = COALESCE(?, last_category),
           campaign_source = COALESCE(campaign_source, ?),
           lead_class      = CASE WHEN lead_class = 'purchased' THEN 'purchased' ELSE 'visited' END,
@@ -2437,7 +2584,9 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   // when this phone is NEW (mirrors the ManyChat path so a known customer
   // re-visiting never double-counts). reception always picks a branch → we also
   // get `ct` for free. Fire-and-forget — never blocks or fails the response.
-  if (phoneIsNew) {
+  // A new person on an already-known number is not a new Lead for Meta (the
+  // match key is the phone; it was counted with the first profile).
+  if (phoneIsNew && !(newPerson && phoneKnownBefore)) {
     sendMetaEvent('Lead',
       { phone: np, firstName: name, branch, externalId: userId },
       leadEventId(userId, np));
@@ -2466,6 +2615,7 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
     lead_class:      'visited',
     walk_in:         true,
     existed,
+    new_person:      newPerson,
   });
 });
 
@@ -2521,6 +2671,13 @@ app.get('/api/reception/today-visits', requireAuth, authorizeRoles('reception', 
   const isoZ = (s) => { const d = sqlUtcToDate(s); return d && !isNaN(d) ? d.toISOString().slice(0, 19) + 'Z' : null; };
   // O6 «شاف إيه» for each arrival.
   const viewedByUser = visitIntent.viewedFor(db, rows.map(r => r.user_id));
+  // Phase 2 «مشي من غير شراء»: today's answer per customer at this branch.
+  const leftByUser = new Map(db.prepare(`
+    SELECT user_id, reason, note, recorded_by, updated_at FROM visit_outcomes WHERE branch = ? AND visit_day = ?
+  `).all(branch, day).map(o => [o.user_id, {
+    reason: o.reason, reason_label: LEFT_REASONS[o.reason] || o.reason, note: o.note || null,
+    by: o.recorded_by || null, at: isoZ(o.updated_at),
+  }]));
 
   const visits = rows.map(r => {
     const setThisVisit = repSetThisVisit(r.lv_sales_rep, r.sales_rep_set_at, r.checked_in_at);
@@ -2548,10 +2705,168 @@ app.get('/api/reception/today-visits', requireAuth, authorizeRoles('reception', 
       sales_today:        salesToday,
       sold_today:         salesToday.length > 0,
       viewed:             viewedByUser.get(r.user_id) || null,
+      // { reason, reason_label, note, by, at } | null — never beside a sale today
+      left:               salesToday.length ? null : (leftByUser.get(r.user_id) || null),
     };
   });
 
   return res.json({ branch, day, count: visits.length, visits });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 2 (2026-11-22) — reception's «هو ده؟» card and «مشي من غير شراء».
+// ════════════════════════════════════════════════════════════════════════════
+
+// The reasons a customer left without buying (the same list the sales
+// «مش هيشتري» outcome will use in phase 3).
+const LEFT_REASONS = {
+  price:         'السعر',
+  model_missing: 'الموديل مش موجود',
+  comparing:     'بيقارن',
+  will_return:   'هيرجع',
+  other:         'سبب تاني',
+};
+
+// GET /api/reception/lookup?phone= — WHO is this number, before anything is
+// written: the «هو ده؟» card. Read-only (no visit, no Meta, no ManyChat).
+//   reception / faisal + nasr_city managers → their own branch;
+//   admin → ?branch=<id> (optional; without it nothing branch-specific is said).
+// → 200 { phone_known: true, branch, candidates: [ {user_id, first_name,
+//          lead_class, campaign_source, viewed, planned_when, pre_visit_rep,
+//          last_showroom_rep, checked_in_today: {at, sales_rep}|null,
+//          sold_today} ] }   newest first, at most 3
+// → 404 { error: 'phone_not_found' }  (the desk opens the new-customer form)
+// → 400 { error: 'invalid_phone' }
+app.get('/api/reception/lookup', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  if (denyNonReceptionManager(req, res)) return;
+  const db = getDb();
+  let branch = null;
+  if (actsAsReception(req)) branch = req.user.branch || null;
+  else if (req.user?.role === 'admin') {
+    const raw = typeof req.query.branch === 'string' ? req.query.branch.trim() : '';
+    if (raw) {
+      branch = intakeBranch(raw, { db });
+      if (!branch) return res.status(400).json({ error: 'invalid_branch', message: 'الفرع ده مش من فروع السيستم — اختار من القايمة' });
+    }
+  } else {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const np = normalizePhone(typeof req.query.phone === 'string' ? req.query.phone : '');
+  if (!np || np.length < 10) return res.status(400).json({ error: 'invalid_phone' });
+
+  // Every profile that ever gave this number (lead_phones) or carries it on the
+  // profile (legacy), newest activity first — the same match as the confirm.
+  const rows = db.prepare(`
+    SELECT lp.user_id, lp.first_name, lp.lead_class, lp.campaign_source, lp.last_activity
+    FROM lead_profiles lp
+    WHERE lp.user_id IN (SELECT user_id FROM lead_phones WHERE phone = ?) OR lp.phone = ?
+    ORDER BY datetime(lp.last_activity) DESC, lp.user_id
+    LIMIT 3
+  `).all(np, np);
+  if (!rows.length) return res.status(404).json({ error: 'phone_not_found' });
+
+  const ids = rows.map(r => r.user_id);
+  const viewed = visitIntent.viewedFor(db, ids);
+  const day = cairoDay();
+  const [start, end] = cairoDayBoundsSql(day);
+  const candidates = rows.map((r) => {
+    const v = viewed.get(r.user_id) || null;
+    const when = v && v.visit_planned ? v.visit_planned.when : null;
+    let preVisitRep = null, lastShowroomRep = null, checkedIn = null, soldToday = false;
+    if (branch) {
+      preVisitRep = db.prepare(`SELECT assigned_sales FROM branch_customer_followups WHERE user_id = ? AND branch = ?`)
+        .get(r.user_id, branch)?.assigned_sales || null;
+      const lv = db.prepare(`SELECT sales_rep, sales_rep_set_at FROM lead_visits WHERE user_id = ? AND branch = ?`).get(r.user_id, branch);
+      const ci = todayCheckin(db, r.user_id, branch);
+      if (ci) {
+        const thisVisit = lv && repSetThisVisit(lv.sales_rep, lv.sales_rep_set_at, ci.checked_in_at);
+        const at = sqlUtcToDate(ci.checked_in_at);
+        checkedIn = {
+          at: at && !isNaN(at) ? at.toISOString().slice(0, 19) + 'Z' : null,
+          sales_rep: thisVisit ? lv.sales_rep : null,
+        };
+        lastShowroomRep = thisVisit ? null : (lv?.sales_rep || null);
+      } else {
+        lastShowroomRep = lv?.sales_rep || null;
+      }
+      soldToday = !!db.prepare(`SELECT 1 FROM purchases WHERE user_id = ? AND branch = ?
+                                AND datetime(created_at) >= ? AND datetime(created_at) < ? LIMIT 1`)
+        .get(r.user_id, branch, start, end);
+    }
+    return {
+      user_id:           r.user_id,
+      first_name:        r.first_name || null,
+      lead_class:        r.lead_class || null,
+      campaign_source:   r.campaign_source || null,
+      viewed:            v,
+      planned_when:      when === 'today' || when === 'tomorrow' ? when : null,
+      pre_visit_rep:     preVisitRep,
+      last_showroom_rep: lastShowroomRep,
+      checked_in_today:  checkedIn,
+      sold_today:        soldToday,
+    };
+  });
+  return res.json({ phone_known: true, branch, candidates });
+});
+
+// POST /api/visits/:userId/left — «مشي من غير شراء + السبب» for a customer
+// checked in TODAY (Cairo day) at the branch. Body: { reason, note?, branch? }
+//   reason ∈ LEFT_REASONS; note ≤ 300 chars (asked for when reason = 'other').
+//   reception / faisal + nasr_city managers → own branch; admin → body.branch.
+// A customer with a sale recorded today at the branch can't be marked «مشي»
+// (409 sold_today). A second answer replaces the first.
+// DELETE /api/visits/:userId/left — takes today's answer back (a wrong tap).
+function leftBranch(req, res) {
+  if (denyNonReceptionManager(req, res)) return null;
+  const db = getDb();
+  if (actsAsReception(req)) {
+    if (!req.user.branch) { res.status(400).json({ error: 'branch_required' }); return null; }
+    return req.user.branch;
+  }
+  if (req.user?.role !== 'admin') { res.status(403).json({ error: 'forbidden' }); return null; }
+  const raw = req.body?.branch ?? req.query?.branch;
+  const b = typeof raw === 'string' && raw.trim() ? intakeBranch(raw, { db }) : null;
+  if (!b) { res.status(400).json({ error: 'branch_required', message: 'اختار الفرع الأول' }); return null; }
+  return b;
+}
+app.post('/api/visits/:userId/left', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  const branch = leftBranch(req, res);
+  if (!branch) return;
+  const db = getDb();
+  const userId = String(req.params.userId || '');
+  const { reason } = req.body || {};
+  let note = req.body?.note;
+  if (typeof reason !== 'string' || !Object.prototype.hasOwnProperty.call(LEFT_REASONS, reason)) {
+    return res.status(400).json({ error: 'اختار السبب من القايمة', code: 'invalid_reason' });
+  }
+  if (note != null && typeof note !== 'string') return res.status(400).json({ error: 'الملاحظة لازم تكون كلام', code: 'invalid_note' });
+  note = note ? note.replace(/\s+/g, ' ').trim().slice(0, 300) : null;
+  if (reason === 'other' && !note) return res.status(400).json({ error: 'اكتب السبب في كلمتين', code: 'note_required' });
+  const checkin = todayCheckin(db, userId, branch);
+  if (!checkin) {
+    return res.status(409).json({ error: 'العميل ده مش مسجّل إنه وصل الفرع النهارده', code: 'not_checked_in_today' });
+  }
+  const [start, end] = cairoDayBoundsSql(checkin.visit_day);
+  const sold = db.prepare(`SELECT 1 FROM purchases WHERE user_id = ? AND branch = ?
+                           AND datetime(created_at) >= ? AND datetime(created_at) < ? LIMIT 1`).get(userId, branch, start, end);
+  if (sold) return res.status(409).json({ error: 'العميل ده اتسجّلتله بيعة النهارده', code: 'sold_today' });
+  db.prepare(`
+    INSERT INTO visit_outcomes (checkin_id, user_id, branch, visit_day, reason, note, recorded_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(checkin_id) DO UPDATE SET reason = excluded.reason, note = excluded.note,
+      recorded_by = excluded.recorded_by, updated_at = datetime('now')
+  `).run(checkin.id, userId, branch, checkin.visit_day, reason, note, req.user?.name || null);
+  console.log(`🚪 LEFT WITHOUT BUYING: ${userId} @ ${branch} (${reason})`);
+  return res.json({ ok: true, user_id: userId, branch, reason, reason_label: LEFT_REASONS[reason], note });
+});
+app.delete('/api/visits/:userId/left', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+  const branch = leftBranch(req, res);
+  if (!branch) return;
+  const db = getDb();
+  const userId = String(req.params.userId || '');
+  const checkin = todayCheckin(db, userId, branch);
+  const info = checkin ? db.prepare(`DELETE FROM visit_outcomes WHERE checkin_id = ?`).run(checkin.id) : { changes: 0 };
+  return res.json({ ok: true, removed: info.changes > 0 });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2602,7 +2917,8 @@ app.get('/api/reception/expected-visits', requireAuth, authorizeRoles('reception
 // second one hits the duplicate-contract guard (409).
 // Errors: { error: <Arabic>, code }
 // ════════════════════════════════════════════════════════════════════════════
-app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
+app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), async (req, res) => {
+ try {
   if (denyNonReceptionManager(req, res)) return;
   const body = req.body || {};
   const fail = (status, code, error, extra = {}) => res.status(status).json({ error, code, ...extra });
@@ -2642,7 +2958,12 @@ app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin
 
   const products = validateProductIds(db, body.product_ids);
   if (products.code) return fail(400, products.code, products.error);
-  if (!products.ids.length) {
+  // 2026-11-22: the prices system's models / pieces (items) — the only await:
+  // everything after it up to the commit stays synchronous (double click → 409).
+  const fromCatalog = await linesFromBody(body.items);
+  if (fromCatalog.code) return fail(400, fromCatalog.code, fromCatalog.error);
+  const lines = fromCatalog.lines;
+  if (!products.ids.length && !lines.length) {
     return fail(400, 'products_required', 'اختار المنتج اللي اتباع للعميل قبل ما تسجّل البيعة');
   }
 
@@ -2655,11 +2976,12 @@ app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin
   const price = priceParsed.value;
   const notes = (typeof body.notes === 'string' && body.notes.trim()) ? body.notes.trim().slice(0, 1000) : null;
 
-  const dup = findDuplicatePurchase(db, { userId, contractNumber, rep, productIds: products.ids });
+  const dup = findDuplicatePurchase(db, { userId, contractNumber, rep, productIds: products.ids, lines });
   if (dup) return fail(409, dup.code, dup.error, { purchase_id: dup.purchase_id });
 
   // Legacy product_id text = the first product's name (old reports read it).
-  const legacyLabel = db.prepare(`SELECT name FROM products WHERE id = ?`).get(products.ids[0])?.name || null;
+  const legacyLabel = (lines[0] ? lines[0].title : null)
+    || (products.ids.length ? db.prepare(`SELECT name FROM products WHERE id = ?`).get(products.ids[0])?.name : null) || null;
 
   let linkedVisit = false;
   let purchaseId;
@@ -2673,10 +2995,12 @@ app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin
     }
     // (b) the sale + its items + lead_class
     purchaseId = insertPurchaseRows(db, {
-      userId, legacyLabel, price, branch, notes, rep, contractNumber, productIds: products.ids,
+      userId, legacyLabel, price, branch, notes, rep, contractNumber, productIds: products.ids, lines,
       enteredBy: req.user.name, enteredById: req.user.id ?? null, enteredByRole: req.user.role,
       enteredVia: 'reception',
     });
+    // (b2) he bought: today's «مشي» answer at this branch goes
+    clearLeftOnSale(db, userId, branch);
     // (c) display-only ledger row (not in REVERTABLE_AUDIT_TABLES)
     auditLog(db, req.user.name, 'reception_sale', userId, {
       table: 'purchases', where: { id: purchaseId }, row: null,
@@ -2695,6 +3019,10 @@ app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin
     ok: true, purchase_id: purchaseId, lead_class: 'purchased',
     rep, branch, contract_number: contractNumber, linked_visit: linkedVisit,
   });
+ } catch (err) {
+  console.error('[reception/sales] failed:', err && err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'حصلت مشكلة — جرّب تاني', code: 'internal' });
+ }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4438,7 +4766,7 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
 
     // Recency — reuse the same tiers as the dashboard priority engine.
     const rec = computeRecencyBonus(r.last_activity);
-    if (rec > 0) { priority += rec; reasons.push(rec >= 20 ? 'نشط دلوقتي 🔥' : 'نشط النهاردة'); }
+    if (rec > 0) { priority += rec; reasons.push(rec >= 20 ? 'نشط دلوقتي' : 'نشط النهاردة'); }
 
     // Resurfaced snooze — its date passed, it's DUE now.
     if (r.snoozed_until) { priority += 35; reasons.push('معاد المتابعة اللي أجّلته'); }
@@ -4871,7 +5199,7 @@ function validateProductIds(db, raw) {
 //   trimmed) is the same sale. Without one: only an identical resubmit (same rep
 //   + same product set) within 60 s. A different contract / product set is a
 //   real second sale and goes through (multi-contract customers).
-function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds }) {
+function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds, lines = [] }) {
   if (contractNumber) {
     const row = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND LOWER(TRIM(contract_number)) = LOWER(?)
                             ORDER BY id DESC LIMIT 1`).get(userId, contractNumber);
@@ -4881,13 +5209,148 @@ function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds }) 
     return null;
   }
   const want = [...productIds].sort((a, b) => a - b).join(',');
+  const wantLines = linesSignature(lines);
   const recent = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND rep IS ? AND COALESCE(TRIM(contract_number),'') = ''
                              AND datetime(created_at) >= datetime('now','-60 seconds')`).all(userId, rep);
   for (const r of recent) {
     const have = db.prepare(`SELECT product_id FROM purchase_items WHERE purchase_id = ? ORDER BY product_id`).all(r.id)
                    .map(x => x.product_id).join(',');
-    if (have === want) return { code: 'duplicate_recent', purchase_id: r.id, error: 'البيعة دي اتسجلت من ثواني — حدّث الصفحة' };
+    const haveLines = linesSignature(readPurchaseLines(db, [r.id]).get(r.id) || []);
+    if (have === want && haveLines === wantLines) return { code: 'duplicate_recent', purchase_id: r.id, error: 'البيعة دي اتسجلت من ثواني — حدّث الصفحة' };
   }
+  return null;
+}
+
+// ── A sale's lines from the prices system (2026-11-22, «قسم الأسعار») ────────
+// items → purchase_lines (ids + titles, visible to staff); the estimate →
+// purchase_estimates (admin only, services/grandCatalog.js estimate()).
+function linesSignature(lines) {
+  return (lines || []).map(l => [l.kind, l.model_id || '', l.variant_id || '', [...(l.with || [])].sort().join('+'), l.qty].join('|'))
+    .sort().join(',');
+}
+function writePurchaseLines(db, purchaseId, lines) {
+  db.prepare(`DELETE FROM purchase_lines WHERE purchase_id = ?`).run(purchaseId);
+  const ins = db.prepare(`INSERT INTO purchase_lines (purchase_id, line_index, kind, model_id, variant_id, with_json, with_titles_json,
+                            qty, title, model_title, category, category_ar) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+  lines.forEach((l, i) => ins.run(purchaseId, i, l.kind, l.model_id || null, l.variant_id || null,
+    l.with && l.with.length ? JSON.stringify(l.with) : null,
+    l.with_titles && l.with_titles.length ? JSON.stringify(l.with_titles) : null,
+    l.qty, l.title || null, l.model_title || null, l.category || null, l.category_ar || null));
+}
+// Which write of a sale's lines is current: every writePurchaseLines deletes
+// and re-inserts, and AUTOINCREMENT never reuses an id, so MAX(id) only grows.
+// 0 = no lines.
+function purchaseLinesVersion(db, purchaseId) {
+  const r = db.prepare(`SELECT MAX(id) AS v FROM purchase_lines WHERE purchase_id = ?`).get(purchaseId);
+  return (r && r.v) || 0;
+}
+const parseJsonArr = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
+// purchase ids → Map(id → [{ kind, model_id, variant_id, with[], with_titles[], qty, title, model_title }])
+function readPurchaseLines(db, ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const rows = db.prepare(`SELECT purchase_id, kind, model_id, variant_id, with_json, with_titles_json, qty, title, model_title
+                             FROM purchase_lines WHERE purchase_id IN (${chunk.map(() => '?').join(',')})
+                             ORDER BY purchase_id, line_index`).all(...chunk);
+    for (const r of rows) {
+      if (!out.has(r.purchase_id)) out.set(r.purchase_id, []);
+      out.get(r.purchase_id).push({
+        kind: r.kind, model_id: r.model_id, variant_id: r.variant_id, with: parseJsonArr(r.with_json),
+        with_titles: parseJsonArr(r.with_titles_json), qty: r.qty, title: r.title, model_title: r.model_title,
+      });
+    }
+  }
+  return out;
+}
+// ADMIN ONLY — purchase ids → Map(id → { total, complete, version, source, computed_at, lines[] }).
+// Call it only on a branch that already checked role === 'admin'.
+function readPurchaseEstimates(db, ids) {
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const rows = db.prepare(`SELECT * FROM purchase_estimates WHERE purchase_id IN (${chunk.map(() => '?').join(',')})`).all(...chunk);
+    for (const r of rows) {
+      out.set(r.purchase_id, {
+        total: r.list_total_estimate, complete: r.estimate_complete === 1, version: r.catalog_version, source: r.source,
+        computed_at: r.computed_at, lines: parseJsonArr(r.lines_json), warnings: parseJsonArr(r.warnings_json),
+      });
+    }
+  }
+  return out;
+}
+// → true when stored. An estimate of an older write of the lines is never
+// stored over a newer one (lines_version; review 2026-11-22: a contract edited
+// while the first estimate was still waiting on the quote).
+function storePurchaseEstimate(db, purchaseId, est, linesVersion) {
+  const info = db.prepare(`INSERT INTO purchase_estimates (purchase_id, list_total_estimate, estimate_complete, catalog_version, source,
+                lines_json, warnings_json, lines_version, computed_at) VALUES (?,?,?,?,?,?,?,?,datetime('now'))
+              ON CONFLICT(purchase_id) DO UPDATE SET list_total_estimate = excluded.list_total_estimate,
+                estimate_complete = excluded.estimate_complete, catalog_version = excluded.catalog_version,
+                source = excluded.source, lines_json = excluded.lines_json, warnings_json = excluded.warnings_json,
+                lines_version = excluded.lines_version, computed_at = excluded.computed_at
+              WHERE COALESCE(excluded.lines_version, 0) >= COALESCE(purchase_estimates.lines_version, 0)`)
+    .run(purchaseId, est.total == null ? null : Math.round(est.total), est.complete ? 1 : 0, est.version || null,
+         est.source || 'none', JSON.stringify(est.lines || []), JSON.stringify(est.warnings || []), linesVersion || 0);
+  return info.changes > 0;
+}
+// After the commit: today's LIST-price estimate of a sale's lines, stored on it.
+// → the estimate ({ total, complete, … }) or null (a sale with no lines: the old
+// manual catalogue). Never throws. A sale deleted meanwhile stores nothing; a
+// sale whose lines were written again meanwhile (a contract edit) stores
+// nothing either — the newer write's own estimate is the one kept.
+const estimatesInFlight = new Set();   // purchase ids being estimated now (the backfill skips them)
+async function estimatePurchase(db, purchaseId) {
+  estimatesInFlight.add(purchaseId);
+  try {
+    // the lines and their version read together (one synchronous step)
+    const version = purchaseLinesVersion(db, purchaseId);
+    const lines = readPurchaseLines(db, [purchaseId]).get(purchaseId) || [];
+    if (!lines.length) return null;
+    const est = await grandCatalog.estimate(lines);
+    if (!db.prepare(`SELECT 1 FROM purchases WHERE id = ?`).get(purchaseId)) return null;
+    if (purchaseLinesVersion(db, purchaseId) !== version || !storePurchaseEstimate(db, purchaseId, est, version)) {
+      console.log(`[estimate] purchase ${purchaseId}: its lines changed meanwhile — this older estimate is not stored`);
+      return est;
+    }
+    console.log(`[estimate] purchase ${purchaseId}: ${est.source}${est.complete ? '' : ' (not complete)'}`);
+    return est;
+  } catch (e) {
+    console.error(`[estimate] purchase ${purchaseId} failed: ${e && e.message}`);
+    return null;
+  } finally {
+    estimatesInFlight.delete(purchaseId);
+  }
+}
+// Every row hanging off the sales that `idsSql` selects (purchase_lines,
+// purchase_estimates, purchase_items) — run it INSIDE the caller's transaction,
+// before the purchases rows go. purchase_lines / purchase_estimates carry no
+// foreign key (nothing cascades to them); purchase_items' ON DELETE CASCADE
+// needs PRAGMA foreign_keys, so it is deleted explicitly too (r2, 2026-11-22).
+function deletePurchaseRows(db, idsSql, ...params) {
+  for (const t of ['purchase_lines', 'purchase_estimates', 'purchase_items']) {
+    db.prepare(`DELETE FROM ${t} WHERE purchase_id IN (${idsSql})`).run(...params);
+  }
+}
+// The body's items → { lines } | { code, error } (validated against the cached
+// catalogue). No items → { lines: [] }. Never waits on the prices system while
+// there is a copy (getCatalogNow: an old copy is refreshed in the background).
+async function linesFromBody(items) {
+  if (items == null || (Array.isArray(items) && items.length === 0)) return { lines: [] };
+  if (!Array.isArray(items)) return { code: 'bad_item', error: 'فيه منتج مش مفهوم — اختاره تاني من القايمة' };
+  const v = await grandCatalog.getCatalogNow();
+  return grandCatalog.normalizeItems(items, v.catalog);
+}
+// Meta Purchase value (owner Q2, 2026-11-22): the paid amount staff typed when
+// there is one, else the estimate; EGP; only when > 0. Setting
+// capi_purchase_value = 'off' sends the event with no value (rollback).
+function purchaseValueFor(paid, est) {
+  if (getSetting('capi_purchase_value', 'on') === 'off') return null;
+  const p = Number(paid);
+  if (Number.isFinite(p) && p > 0) return Math.round(p);
+  const e = est && Number(est.total);
+  if (Number.isFinite(e) && e > 0) return Math.round(e);
   return null;
 }
 // The sale row + its catalog items + lead_class 'purchased'. Call it INSIDE a
@@ -4901,6 +5364,7 @@ function insertPurchaseRows(db, p) {
          p.enteredBy, p.enteredById, p.enteredByRole, p.enteredVia);
   const ins = db.prepare(`INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)`);
   for (const pid of p.productIds) ins.run(r.lastInsertRowid, pid);
+  if (p.lines && p.lines.length) writePurchaseLines(db, Number(r.lastInsertRowid), p.lines);
   // Mark lead as purchased (terminal state — won't be overridden by scoring)
   db.prepare(`UPDATE lead_profiles SET lead_class = 'purchased',
       purchased_at = CASE WHEN purchased_at IS NULL THEN datetime('now') ELSE purchased_at END,
@@ -4914,19 +5378,56 @@ function insertPurchaseRows(db, p) {
 //      ad data). Fire-and-forget — never blocks the response. No value sent.
 //   2) the admin war-room notification (reception's sale says who entered it)
 //   3) the ManyChat purchase flow (Event-Triggered Flow: Purchase Made)
-function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contractNumber, viaReception, creditedByOther = false }) {
-  if (!isDemoContext()) {
-    const capiLead = db.prepare(`
+// Meta's Purchase for one sale: the same event_id (purchase_<id>) on every
+// send, so Meta dedups a resend. opts.eventTime (UNIX s) for a backfilled sale.
+function capiLeadOf(db, userId) {
+  return db.prepare(`
       SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                                  WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
              lp.first_name, lp.last_name, lp.gender, lp.preferred_branch
       FROM lead_profiles lp WHERE lp.user_id = ?
     `).get(userId);
-    sendMetaEvent('Purchase',
-      { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
-        gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: userId },
-      `purchase_${purchaseId}`);
-  }
+}
+function sendPurchaseEvent(capiLead, { userId, purchaseId, value, eventTime }) {
+  sendMetaEvent('Purchase',
+    { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
+      gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: userId },
+    `purchase_${purchaseId}`,
+    value ? { value, currency: 'EGP' } : undefined,
+    eventTime ? { eventTime } : {});
+}
+// How long Meta's Purchase waits for the estimate when no paid price was typed
+// (r2, 2026-11-22: a slow quote or a restart must not lose the event).
+const PURCHASE_ESTIMATE_WAIT_MS = 3000;
+function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contractNumber, viaReception, creditedByOther = false }) {
+  // Meta's Purchase (the response has already gone). A typed paid price is the
+  // value: sent at once, the estimate is stored beside it. Otherwise it waits
+  // at most PURCHASE_ESTIMATE_WAIT_MS for the estimate and goes with whatever
+  // value is known then (or none). One send per sale here; the backfill
+  // (backfillPurchaseEstimates) re-sends with the same event_id only for a sale
+  // whose estimate never got stored (a restart mid-estimate) — Meta dedups.
+  const demo = isDemoContext();
+  const capiLead = demo ? null : capiLeadOf(db, userId);
+  const paidValue = purchaseValueFor(price, null);
+  const paidTyped = Number.isFinite(Number(price)) && Number(price) > 0;
+  let sent = false;
+  const sendOnce = (value) => {
+    if (sent || demo) return;
+    sent = true;
+    try { sendPurchaseEvent(capiLead, { userId, purchaseId, value }); }
+    catch (err) { console.error('[meta-capi] Purchase failed:', err && err.message); }
+  };
+  if (paidTyped) sendOnce(paidValue);
+  const timer = paidTyped ? null : setTimeout(() => sendOnce(null), PURCHASE_ESTIMATE_WAIT_MS);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  estimatePurchase(db, purchaseId).then((est) => {
+    if (timer) clearTimeout(timer);
+    sendOnce(purchaseValueFor(price, est));
+  }).catch(err => {
+    if (timer) clearTimeout(timer);
+    sendOnce(null);
+    console.error('[meta-capi] Purchase after estimate failed:', err && err.message);
+  });
 
   // Every purchase → macro alert for the admin war-room.
   createNotification(db, 'admin', 'new_purchase',
@@ -4945,6 +5446,52 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
   } else {
     console.warn('[Event-Trigger] ⚠️ Purchase recorded but manychat_purchase_flow is empty — no message sent. Set it in Settings → API.');
   }
+}
+
+// ── The estimate backfill (r2, 2026-11-22) ─────────────────────────────────
+// A sale with lines but no stored estimate (the CRM restarted while its
+// estimate was waiting on the quote, or the estimate failed) is estimated at
+// boot and every 10 minutes. When that first estimate lands, Meta's Purchase
+// is sent again with the same event_id (purchase_<id>, so Meta dedups one it
+// already has) and the sale's own time — only for sales younger than
+// PURCHASE_RESEND_WINDOW_H (Meta dedups by event_id within 48 h; older sales
+// get the estimate only, no Meta event). Live DB only; never a demo sale.
+const PURCHASE_BACKFILL_MS = 10 * 60 * 1000;
+const PURCHASE_RESEND_WINDOW_H = 48;
+const PURCHASE_BACKFILL_BATCH = 200;
+let purchaseBackfillRunning = false;
+async function backfillPurchaseEstimates(db) {
+  if (purchaseBackfillRunning) return { skipped: true };
+  purchaseBackfillRunning = true;
+  const out = { estimated: 0, resent: 0, failed: 0 };
+  try {
+    const rows = db.prepare(`
+      SELECT p.id, p.user_id, p.price, CAST(strftime('%s', p.created_at) AS INTEGER) AS ts,
+             (datetime(p.created_at) >= datetime('now', '-${PURCHASE_RESEND_WINDOW_H} hours')) AS in_window
+      FROM purchases p
+      WHERE EXISTS (SELECT 1 FROM purchase_lines pl WHERE pl.purchase_id = p.id)
+        AND NOT EXISTS (SELECT 1 FROM purchase_estimates e WHERE e.purchase_id = p.id)
+      ORDER BY p.id LIMIT ${PURCHASE_BACKFILL_BATCH}`).all();
+    for (const r of rows) {
+      if (estimatesInFlight.has(r.id)) continue;           // its own afterPurchase is on it
+      const est = await estimatePurchase(db, r.id);
+      const stored = !!db.prepare(`SELECT 1 FROM purchase_estimates WHERE purchase_id = ?`).get(r.id);
+      if (!stored) { out.failed++; continue; }
+      out.estimated++;
+      if (r.in_window === 1) {
+        // a paid price was sent at once at sale time: the resend carries the same value
+        sendPurchaseEvent(capiLeadOf(db, r.user_id), { userId: r.user_id, purchaseId: r.id,
+          value: purchaseValueFor(r.price, est), eventTime: Number(r.ts) || undefined });
+        out.resent++;
+      }
+    }
+    if (rows.length) console.log(`[estimate-backfill] ${out.estimated} estimated, ${out.resent} Purchase re-sent (same event_id), ${out.failed} still waiting`);
+  } catch (e) {
+    console.error('[estimate-backfill] failed:', e && e.message);
+  } finally {
+    purchaseBackfillRunning = false;
+  }
+  return out;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4967,8 +5514,9 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
 // The sale, its items and lead_class are written in ONE transaction.
 // Returns: { ok, purchase_id, lead_class, rep }
 // ════════════════════════════════════════════════════════════════════════════
-app.post('/api/purchases', requireAuth, (req, res) => {
-  const { user_id, product_id, product_ids, price, branch, notes, contract_number, sales_rep } = req.body || {};
+app.post('/api/purchases', requireAuth, async (req, res) => {
+ try {
+  const { user_id, product_id, product_ids, branch, notes, contract_number, sales_rep, items } = req.body || {};
   const role = req.user?.role;
   if (role === 'reception') {
     return res.status(403).json({ error: 'الاستقبال بيسجّل البيع من قايمة العملاء زيارة اليوم', code: 'reception_use_today_list' });
@@ -5008,9 +5556,22 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   if (checked.code) return res.status(400).json({ error: checked.error, code: checked.code });
   const productIds = checked.ids;
 
+  // 2026-11-22: the prices system's models / pieces (items) — checked against
+  // the cached catalogue BEFORE anything is written. The only await in this
+  // route: everything after it up to the commit is synchronous, so a double
+  // click is still serialized by the duplicate guard.
+  const fromCatalog = await linesFromBody(items);
+  if (fromCatalog.code) return res.status(400).json({ error: fromCatalog.error, code: fromCatalog.code });
+  const lines = fromCatalog.lines;
+
+  // The paid amount staff typed (optional, never required): whole EGP.
+  const priceParsed = parseEgpPrice(req.body?.price);
+  if (priceParsed.error) return res.status(400).json({ error: 'اكتب المبلغ أرقام بس (مثلاً 38500)', code: 'bad_price' });
+  const price = priceParsed.value;
+
   // Legacy product_id text field is kept for backward compat; for new flows
   // we store the first selected product's name there so old reports still work.
-  let legacyProductLabel = product_id || null;
+  let legacyProductLabel = product_id || (lines[0] ? lines[0].title : null) || null;
   if (!legacyProductLabel && productIds.length) {
     const firstProduct = db.prepare(`SELECT name FROM products WHERE id = ?`).get(productIds[0]);
     if (firstProduct) legacyProductLabel = firstProduct.name;
@@ -5018,7 +5579,7 @@ app.post('/api/purchases', requireAuth, (req, res) => {
 
   // A sale must record WHAT was sold — otherwise best-selling analytics are
   // blind. Require at least one product (catalog selection preferred).
-  if (!productIds.length && !legacyProductLabel) {
+  if (!productIds.length && !lines.length && !legacyProductLabel) {
     return res.status(400).json({ error: 'اختار المنتج اللي اشتراه العميل قبل ما تسجّل البيعة' });
   }
 
@@ -5080,15 +5641,20 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   const contractNumber = normalizeContractNumber(contract_number);
 
   // Double entry (the same contract, or a double click) → 409, nothing written.
-  const dup = findDuplicatePurchase(db, { userId: user_id, contractNumber, rep, productIds });
+  const dup = findDuplicatePurchase(db, { userId: user_id, contractNumber, rep, productIds, lines });
   if (dup) return res.status(409).json({ error: dup.error, code: dup.code, purchase_id: dup.purchase_id });
 
-  const purchaseId = db.transaction(() => insertPurchaseRows(db, {
-    userId: user_id, legacyLabel: legacyProductLabel, price: price || null, branch: branchVal,
-    notes: notes || null, rep, contractNumber, productIds,
-    enteredBy: req.user?.name || null, enteredById: req.user?.id ?? null,
-    enteredByRole: req.user?.role || null, enteredVia: 'staff',
-  }))();
+  const purchaseId = db.transaction(() => {
+    const id = insertPurchaseRows(db, {
+      userId: user_id, legacyLabel: legacyProductLabel, price, branch: branchVal,
+      notes: notes || null, rep, contractNumber, productIds, lines,
+      enteredBy: req.user?.name || null, enteredById: req.user?.id ?? null,
+      enteredByRole: req.user?.role || null, enteredVia: 'staff',
+    });
+    // Phase 2 r2: he bought — today's «مشي» answer at the sale's branch goes.
+    clearLeftOnSale(db, user_id, branchVal);
+    return id;
+  })();
 
   console.log(`💰 PURCHASE: user:${user_id} product:${product_id || '?'} price:${price || '?'} rep:${rep || '?'}` +
     (creditedByOther ? ` (entered by ${req.user?.name})` : ''));
@@ -5098,6 +5664,10 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   });
 
   return res.json({ ok: true, purchase_id: purchaseId, lead_class: 'purchased', rep });
+ } catch (err) {
+  console.error('[purchases] failed:', err && err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'حصلت مشكلة — جرّب تاني' });
+ }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5729,6 +6299,14 @@ app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
       grouped[it.purchase_id].push({ id: it.id, name: it.name, category_name: it.category_name });
     }
     for (const p of purchases) p.items = grouped[p.id] || [];
+    // 2026-11-22: the prices system's lines; the estimate for the admin only.
+    const pids = purchases.map(p => p.id);
+    const linesBy = readPurchaseLines(db, pids);
+    const estBy = req.user?.role === 'admin' ? readPurchaseEstimates(db, pids) : null;
+    for (const p of purchases) {
+      p.lines = linesBy.get(p.id) || [];
+      if (estBy) p.estimate = estBy.get(p.id) || null;
+    }
   }
 
   return res.json({ purchases });
@@ -5828,6 +6406,14 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   } else {
     for (const c of contracts) c.products = [];
   }
+  // 2026-11-22: the prices system's lines (everyone in scope) and — ADMIN ONLY —
+  // the estimate («تقريبي»: today's list prices when the sale was recorded).
+  const linesBy = readPurchaseLines(db, ids);
+  const estBy = role === 'admin' ? readPurchaseEstimates(db, ids) : null;
+  for (const c of contracts) {
+    c.lines = linesBy.get(c.id) || [];
+    if (estBy) c.estimate = estBy.get(c.id) || null;
+  }
 
   // Header summary for the SAME filter set — counted WITHOUT the 500-row LIMIT,
   // so a busy month still reports the true number instead of a flat "500".
@@ -5853,11 +6439,25 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     ORDER BY month DESC
   `).all(...roleParams);
 
+  // ADMIN ONLY: the same filter set's estimate summary (no LIMIT).
+  let estimateSummary = {};
+  if (role === 'admin') {
+    const e = db.prepare(`
+      SELECT COUNT(e.purchase_id) AS n, COALESCE(SUM(e.list_total_estimate), 0) AS total,
+             SUM(CASE WHEN e.purchase_id IS NOT NULL AND (e.estimate_complete = 0 OR e.list_total_estimate IS NULL) THEN 1 ELSE 0 END) AS incomplete,
+             COALESCE(SUM(CASE WHEN p.price > 0 THEN p.price ELSE COALESCE(e.list_total_estimate, 0) END), 0) AS value
+      FROM purchases p LEFT JOIN purchase_estimates e ON e.purchase_id = p.id
+      WHERE ${where}
+    `).get(...params);
+    estimateSummary = { estimate_total: e.total, estimate_count: e.n, estimate_incomplete: e.incomplete || 0, value_total: e.value };
+  }
+
   return res.json({
     contracts,                       // unchanged shape — old callers keep working
     month,                           // the applied month, or null when unfiltered
     count: totals.count,
     total: totals.total,
+    ...estimateSummary,
     // count/total describe the whole filter set while `contracts` stops at
     // LIST_LIMIT — تقول للواجهة إن القائمة اتقصّت عشان ما تناقضش العدّاد فوقها.
     limit: LIST_LIMIT,
@@ -5866,7 +6466,8 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   });
 });
 
-app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
+app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), async (req, res) => {
+ try {
   const db  = getDb();
   const row = db.prepare(`SELECT id, user_id, branch, contract_number, rep FROM purchases WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'contract_not_found' });
@@ -5874,7 +6475,7 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const { price, contract_number, product_ids, rep: repIn } = req.body || {};
+  const { price, contract_number, product_ids, rep: repIn, items } = req.body || {};
   const newNumber = (contract_number && String(contract_number).trim()) || null;
 
   // Optional: the salesperson the sale counts for (a sale entered for the wrong
@@ -5894,13 +6495,25 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
   // Validate the products edit (when provided) BEFORE writing anything. A
   // contract must keep at least one product (product selection is mandatory).
   let validIds = null;
-  if (Array.isArray(product_ids)) {
+  if (Array.isArray(product_ids) && !Array.isArray(items)) {
     const wanted = product_ids.map(v => parseInt(v, 10)).filter(n => Number.isFinite(n) && n > 0);
     validIds = wanted.filter(id => db.prepare(`SELECT 1 FROM products WHERE id = ?`).get(id));
     if (!validIds.length) {
       return res.status(400).json({ error: 'لازم تختار منتج واحد على الأقل' });
     }
   }
+  // 2026-11-22: the prices system's lines replace the contract's lines (the old
+  // manual-catalogue products stay as they were: read-only history). The
+  // estimate is recomputed after the commit.
+  let newLines = null;
+  if (Array.isArray(items)) {
+    const fromCatalog = await linesFromBody(items);
+    if (fromCatalog.code) return res.status(400).json({ error: fromCatalog.error, code: fromCatalog.code });
+    if (!fromCatalog.lines.length) return res.status(400).json({ error: 'لازم تختار منتج واحد على الأقل', code: 'products_required' });
+    newLines = fromCatalog.lines;
+  }
+  // a row deleted while the catalogue was read
+  if (!db.prepare(`SELECT 1 FROM purchases WHERE id = ?`).get(row.id)) return res.status(404).json({ error: 'contract_not_found' });
 
   db.transaction(() => {
     db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
@@ -5916,6 +6529,10 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
       // Keep the legacy single product_id in sync (first item) for older views.
       db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(validIds[0], row.id);
     }
+    if (newLines) {
+      writePurchaseLines(db, row.id, newLines);
+      db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(newLines[0].title || null, row.id);
+    }
     if (newRep) {
       db.prepare(`UPDATE purchases SET rep = ? WHERE id = ?`).run(newRep, row.id);
       // display-only ledger row (not in REVERTABLE_AUDIT_TABLES)
@@ -5930,7 +6547,13 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
     `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]` +
     (newRep ? ` — البيعة بقت باسم [${newRep}] بدل [${row.rep || '—'}]` : ''));
 
+  if (newLines) estimatePurchase(db, row.id).catch(() => {});
+
   return res.json({ ok: true, rep: newRep || row.rep || null });
+ } catch (err) {
+  console.error('[contracts] update failed:', err && err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'حصلت مشكلة — جرّب تاني' });
+ }
 });
 
 app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
@@ -5943,6 +6566,7 @@ app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_ma
 
   let reverted = false;
   const tx = db.transaction(() => {
+    deletePurchaseRows(db, `SELECT ?`, row.id);
     db.prepare(`DELETE FROM purchases WHERE id = ?`).run(row.id);
     // Smart reversion — if this was the customer's last purchase, send them
     // back into the post-visit follow-up queue.
@@ -6250,47 +6874,78 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
   `).all(fromDate, toDate, ...branchParam, ...campaignParam);
 
   // ── SALES analytics — best-selling products. Mirrors the "most viewed"
-  // analysis above but sourced from ACTUAL purchases (purchase_items → products
-  // → categories), not view events. "units" = number of line items sold, which
-  // is the clean, unambiguous "best-seller" metric. We deliberately do NOT split
-  // a contract's price across its products (one contract can bundle several
-  // products under a single total), so we rank by units, not by revenue.
-  const salesArgs = [fromDate, toDate, ...branchParam, ...campaignParam];
-  const salesFrom = `
-    FROM purchase_items pi
-    JOIN purchases pur     ON pur.id = pi.purchase_id
-    JOIN lead_profiles lp  ON lp.user_id = pur.user_id
-    JOIN products p        ON p.id = pi.product_id
-    LEFT JOIN product_categories pc ON pc.id = p.category_id
-    WHERE date(pur.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
-  `;
-  // Best-selling overall (all categories)
+  // analysis above but sourced from ACTUAL purchases, not view events:
+  //   • the prices system's lines (purchase_lines, since 2026-11-22): a room /
+  //     set by its model, a single piece by its variant; the category is the
+  //     catalogue's, written on the line at sale time (category_ar);
+  //   • the old manual catalogue (purchase_items → products → categories): one
+  //     unit per row, as before.
+  // "units" = SUM(qty) (a purchase_items row is 1), the clean, unambiguous
+  // "best-seller" metric. We deliberately do NOT split a contract's price
+  // across its products (one contract can bundle several products under a
+  // single total), so we rank by units, not by revenue. The admin-only
+  // estimate (purchase_estimates) is never read here.
+  const salesArgs = [fromDate, toDate, ...branchParam, ...campaignParam, fromDate, toDate, ...branchParam, ...campaignParam];
+  const soldCte = `
+    WITH sold AS (
+      SELECT 'item:' || pi.product_id                 AS k,
+             p.name                                    AS product,
+             COALESCE(NULLIF(TRIM(pc.name), ''), 'بدون فئة') AS category,
+             1                                         AS qty,
+             pur.user_id                               AS buyer,
+             0                                         AS rid
+      FROM purchase_items pi
+      JOIN purchases pur     ON pur.id = pi.purchase_id
+      JOIN lead_profiles lp  ON lp.user_id = pur.user_id
+      JOIN products p        ON p.id = pi.product_id
+      LEFT JOIN product_categories pc ON pc.id = p.category_id
+      WHERE date(pur.created_at) BETWEEN ? AND ?
+        ${branchClause} ${campaignClause}
+      UNION ALL
+      SELECT CASE WHEN pl.kind = 'set' AND pl.variant_id IS NULL THEN 'model:' || pl.model_id
+                  WHEN pl.kind = 'set' THEN 'set:' || pl.variant_id
+                  ELSE 'piece:' || pl.variant_id END,
+             COALESCE(NULLIF(pl.title, ''), pl.model_title, '—'),
+             COALESCE(NULLIF(TRIM(pl.category_ar), ''), 'بدون فئة'),
+             pl.qty,
+             pur.user_id,
+             pl.id
+      FROM purchase_lines pl
+      JOIN purchases pur     ON pur.id = pl.purchase_id
+      JOIN lead_profiles lp  ON lp.user_id = pur.user_id
+      WHERE date(pur.created_at) BETWEEN ? AND ?
+        ${branchClause} ${campaignClause}
+    )`;
+  // Best-selling overall (all categories). The product's name and category
+  // come from its newest line (MAX(rid): SQLite takes the bare columns from it).
   const topSelling = db.prepare(`
-    SELECT p.name AS product, COALESCE(pc.name, 'بدون فئة') AS category,
-           COUNT(*) AS units, COUNT(DISTINCT pur.user_id) AS buyers
-    ${salesFrom}
-    GROUP BY pi.product_id
+    ${soldCte}
+    SELECT product, category, units, buyers FROM (
+      SELECT k, product, category, MAX(rid) AS newest, SUM(qty) AS units, COUNT(DISTINCT buyer) AS buyers
+      FROM sold GROUP BY k
+    )
     ORDER BY units DESC, buyers DESC
     LIMIT 10
   `).all(...salesArgs);
   // Sales rolled up per category
   const salesByCategory = db.prepare(`
-    SELECT COALESCE(pc.name, 'بدون فئة') AS category,
-           COUNT(*) AS units,
-           COUNT(DISTINCT pi.product_id) AS products_sold,
-           COUNT(DISTINCT pur.user_id)   AS buyers
-    ${salesFrom}
-    GROUP BY COALESCE(pc.name, 'بدون فئة')
+    ${soldCte}
+    SELECT category,
+           SUM(qty)          AS units,
+           COUNT(DISTINCT k) AS products_sold,
+           COUNT(DISTINCT buyer) AS buyers
+    FROM sold
+    GROUP BY category
     ORDER BY units DESC
   `).all(...salesArgs);
   // Best-selling products inside each category (nested, like productsByCategory)
   const sellingByCategoryRows = db.prepare(`
-    SELECT COALESCE(pc.name, 'بدون فئة') AS category, p.name AS product,
-           COUNT(*) AS units, COUNT(DISTINCT pur.user_id) AS buyers
-    ${salesFrom}
-    GROUP BY COALESCE(pc.name, 'بدون فئة'), pi.product_id
-    ORDER BY category, units DESC
+    ${soldCte}
+    SELECT category, product, units, buyers FROM (
+      SELECT category, k, product, MAX(rid) AS newest, SUM(qty) AS units, COUNT(DISTINCT buyer) AS buyers
+      FROM sold GROUP BY category, k
+    )
+    ORDER BY category, units DESC, buyers DESC
   `).all(...salesArgs);
   const sellingByCategory = {};
   for (const r of sellingByCategoryRows) {
@@ -6703,6 +7358,7 @@ function renameRepReferences(db, oldName, newName) {
   // but it should still name the account as it is called now.
   db.prepare(`UPDATE purchases SET entered_by = ? WHERE entered_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE visit_checkins SET recorded_by = ? WHERE recorded_by = ?`).run(newName, oldName);
+  db.prepare(`UPDATE visit_outcomes SET recorded_by = ? WHERE recorded_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE followup_log SET sales = ? WHERE sales = ?`).run(newName, oldName);
   db.prepare(`UPDATE revisit_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE sales_targets SET scope_name = ? WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(newName, oldName);
@@ -6880,7 +7536,9 @@ app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin')
       if (!stillHasVisit) clearVisit.run(uid);
     }
 
-    // 3. Delete the rep's purchases entirely.
+    // 3. Delete the rep's purchases entirely — their lines, estimates and items
+    //    with them (r2: lines / estimates have no foreign key to cascade).
+    deletePurchaseRows(db, `SELECT id FROM purchases WHERE rep = ?`, name);
     db.prepare(`DELETE FROM purchases WHERE rep = ?`).run(name);
 
     // 4. Reset follow-ups they owned.
@@ -7291,21 +7949,28 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
   const db   = getDb();
   const blm  = branchLabelMap(db);
   const rows = db.prepare(`
-    SELECT p.contract_number, p.created_at, p.branch, p.rep,
+    SELECT p.contract_number, p.created_at, p.branch, p.rep, p.price,
       lp.first_name,
       COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
-                          WHERE ph.user_id = p.user_id ORDER BY ph.id LIMIT 1)) AS phone
+                          WHERE ph.user_id = p.user_id ORDER BY ph.id LIMIT 1)) AS phone,
+      (SELECT GROUP_CONCAT(COALESCE(pl.title, '') || CASE WHEN pl.qty > 1 THEN ' ×' || pl.qty ELSE '' END, ' + ')
+         FROM purchase_lines pl WHERE pl.purchase_id = p.id) AS lines_text,
+      e.list_total_estimate, e.estimate_complete
     FROM purchases p
     LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
+    LEFT JOIN purchase_estimates e ON e.purchase_id = p.id
     ORDER BY p.created_at DESC
     LIMIT 50000
   `).all();
+  // admin only (this route): the estimate column says «تقريبي» in its header
   const out = rows.map((r) => [
     r.contract_number || '', r.first_name || '', r.phone || '',
     blm[r.branch] || r.branch || '', r.rep || '', r.created_at || '',
+    r.lines_text || '', r.price > 0 ? r.price : '',
+    r.list_total_estimate != null ? `${r.list_total_estimate}${r.estimate_complete ? '' : ' (ناقص)'}` : '',
   ]);
   return sendCsv(res, 'contracts-export.csv',
-    ['رقم التعاقد', 'العميل', 'التليفون', 'الفرع', 'السيلز', 'تاريخ التعاقد'], out);
+    ['رقم التعاقد', 'العميل', 'التليفون', 'الفرع', 'السيلز', 'تاريخ التعاقد', 'المنتجات', 'المدفوع', 'تقريبي (أسعار القايمة يوم البيعة)'], out);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -7754,6 +8419,127 @@ function liveSettingSet(key) {
     return !!(row && row.value && String(row.value).trim());
   } catch (_) { return null; }
 }
+// ════════════════════════════════════════════════════════════════════════════
+// «قسم الأسعار» (owner, 2026-11-22): «مش عايزه يظهرله غير الاسعار بس في الجنب
+// مع الملاحظات … قسم في سيستم ال crm اسمه قسم الاسعار فيه اسعار المنتجات
+// بالملاحظات بتاعتها … السيلز يقدر يطبع الكتالوج لو اتحدث الاسعار».
+//   GET /api/prices        — every logged-in role: the models by category with
+//                            the set price, the pieces and their prices, photo,
+//                            «على الموقع», his sales note (staff scope only),
+//                            and «اطبع الكتالوج» (the nightly catalogue PDF).
+//   GET /api/prices/picker — the same models WITHOUT any price or note: the
+//                            contract form's picker (staff see no total).
+// From services/grandCatalog.js (cached 60 s, ETag, last good copy when the
+// prices system is down). Read-only. 503 only when there never was a copy.
+// ════════════════════════════════════════════════════════════════════════════
+const PRICES_DOWN = { error: 'catalog_unavailable', message: 'الأسعار مش متاحة دلوقتي — جرّب كمان شوية' };
+app.get('/api/prices', requireAuth, async (req, res) => {
+  try {
+    const [v, pdf] = await Promise.all([grandCatalog.getCatalog(), grandCatalog.catalogueStatus()]);
+    if (!v.catalog) return res.status(503).json(PRICES_DOWN);
+    const body = grandCatalog.pricesView(v);
+    body.catalogue = { url: pdf.url, status: pdf.status, checked_at: pdf.checked_at };
+    // the admin is told why notes are missing (env names only, never a value)
+    if (req.user?.role === 'admin' && !body.notes_available) {
+      body.setup = v.staff_configured
+        ? { notes: 'refused', message: 'سيستم الأسعار رفض المفتاح — اتأكد إن CRM_CATALOG_SECRET هو هو في المشروعين على Railway' }
+        : { notes: 'missing_secret', message: 'الملاحظات محتاجة CRM_CATALOG_SECRET في Railway (نفس القيمة في سيستم الأسعار وسيستم العملاء)' };
+    }
+    res.set('Cache-Control', 'private, no-store');
+    return res.json(body);
+  } catch (err) {
+    console.error('[prices] failed:', err && err.message);
+    return res.status(503).json(PRICES_DOWN);
+  }
+});
+app.get('/api/prices/picker', requireAuth, async (_req, res) => {
+  try {
+    const v = await grandCatalog.getCatalog();
+    if (!v.catalog) return res.status(503).json(PRICES_DOWN);
+    res.set('Cache-Control', 'private, no-store');
+    return res.json(grandCatalog.pricesView(v, { picker: true }));
+  } catch (err) {
+    console.error('[prices/picker] failed:', err && err.message);
+    return res.status(503).json(PRICES_DOWN);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/sales-value?period=week|month|last|all — ADMIN ONLY.
+//     (or ?from=YYYY-MM-DD&to=YYYY-MM-DD)
+// «اشترى بكام تقريبياً» per branch, per salesperson, per ad/campaign, for the
+// sales recorded in the range. Days and months are CAIRO days (Intl
+// Africa/Cairo, review 2026-11-22): a sale at 00:30 Cairo on the 1st counts in
+// that month, not the last one. period is worked out here, on Cairo's today
+// (week = the last 7 Cairo days with today; month = this Cairo month to today;
+// last = last Cairo month); from/to are Cairo days too. Per group: contracts,
+// paid_total (what staff typed), estimate_total (today's list prices when
+// recorded — «تقريبي»), value_total (paid when typed, else the estimate), how
+// many have no estimate or an incomplete one.
+// ════════════════════════════════════════════════════════════════════════════
+function cairoPeriod(key, now = new Date()) {
+  const today = cairoDay(now);
+  const [y, m] = today.split('-').map(Number);
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  if (key === 'week') {
+    const [ty, tm, td] = today.split('-').map(Number);
+    return { from: ymd(new Date(Date.UTC(ty, tm - 1, td - 6))), to: today };
+  }
+  if (key === 'month') return { from: ymd(new Date(Date.UTC(y, m - 1, 1))), to: today };
+  if (key === 'last') return { from: ymd(new Date(Date.UTC(y, m - 2, 1))), to: ymd(new Date(Date.UTC(y, m - 1, 0))) };
+  if (key === 'all') return { from: null, to: null };
+  return null;
+}
+// [from, to] Cairo days → ` AND datetime(col) >= ? AND datetime(col) < ?` (UTC bounds).
+function cairoRangeClause(column, from, to) {
+  const parts = [];
+  const params = [];
+  if (from) { parts.push(`datetime(${column}) >= ?`); params.push(cairoDayBoundsSql(from)[0]); }
+  if (to)   { parts.push(`datetime(${column}) < ?`);  params.push(cairoDayBoundsSql(to)[1]); }
+  return { clause: parts.length ? ' AND ' + parts.join(' AND ') : '', params };
+}
+app.get('/api/admin/sales-value', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const day = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T00:00:00Z'))
+    && new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v ? v : null);
+  let from = null;
+  let to = null;
+  if (req.query.period != null && req.query.period !== '') {
+    const p = cairoPeriod(String(req.query.period));
+    if (!p) return res.status(400).json({ error: 'الفترة لازم تكون week أو month أو last أو all' });
+    ({ from, to } = p);
+  } else {
+    from = day(req.query.from);
+    to   = day(req.query.to);
+    if ((req.query.from && !from) || (req.query.to && !to)) return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  const dr = cairoRangeClause('p.created_at', from, to);
+  const agg = (groupSql, keySql) => db.prepare(`
+    SELECT ${keySql}
+           COUNT(*) AS contracts,
+           COALESCE(SUM(CASE WHEN p.price > 0 THEN p.price ELSE 0 END), 0) AS paid_total,
+           SUM(CASE WHEN p.price > 0 THEN 1 ELSE 0 END) AS paid_count,
+           COALESCE(SUM(e.list_total_estimate), 0) AS estimate_total,
+           SUM(CASE WHEN e.list_total_estimate IS NOT NULL THEN 1 ELSE 0 END) AS estimate_count,
+           SUM(CASE WHEN e.purchase_id IS NOT NULL AND (e.estimate_complete = 0 OR e.list_total_estimate IS NULL) THEN 1 ELSE 0 END) AS estimate_incomplete,
+           COALESCE(SUM(CASE WHEN p.price > 0 THEN p.price ELSE COALESCE(e.list_total_estimate, 0) END), 0) AS value_total,
+           SUM(CASE WHEN NOT (p.price > 0) AND e.list_total_estimate IS NULL THEN 1 ELSE 0 END) AS no_value
+    FROM purchases p
+    LEFT JOIN purchase_estimates e ON e.purchase_id = p.id
+    LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
+    WHERE 1=1 ${dr.clause}
+    ${groupSql}
+  `);
+  const totals    = agg('', '').get(...dr.params);
+  const byBranch  = agg('GROUP BY p.branch ORDER BY value_total DESC', `p.branch AS branch,`).all(...dr.params);
+  const byRep     = agg('GROUP BY p.rep, p.branch ORDER BY value_total DESC', `p.rep AS rep, p.branch AS branch,`).all(...dr.params);
+  const byCampaign = agg('GROUP BY lp.campaign_source ORDER BY value_total DESC', `lp.campaign_source AS campaign_source,`).all(...dr.params);
+  return res.json({
+    from, to, timezone: CAIRO_TZ, currency: 'EGP', approximate: true,
+    totals, by_branch: byBranch, by_rep: byRep, by_campaign: byCampaign,
+  });
+});
+
 app.get('/health', (req, res) => {
   const c = counters.snapshot();
   const b = backup.snapshot();
@@ -7781,6 +8567,7 @@ app.get('/health', (req, res) => {
     last_backup_at: b.last_backup_at,
     backup_count:   b.count,
     backup_last_error: b.last_error,
+    grand_catalog:  grandCatalog.snapshot(),
   });
 });
 
@@ -7790,7 +8577,12 @@ app.get('/health', (req, res) => {
 // the catalog when recording a purchase). Write endpoints are restricted to
 // admin and branch_manager.
 // ════════════════════════════════════════════════════════════════════════════
-const canEditCatalog = authorizeRoles('admin', 'branch_manager');
+// 2026-11-22 («قسم الأسعار»): products come from the prices system now. This
+// manual table stays READ-ONLY until the new contract form has shipped (old
+// contracts keep their products); its writes answer 410 for everyone.
+const canEditCatalog = (_req, res) => res.status(410).json({
+  error: 'المنتجات بقت من «الأسعار» (سيستم الأسعار) — الجدول القديم للقراءة بس', code: 'catalog_read_only',
+});
 
 // ─── Categories ─────────────────────────────────────────────────────────────
 app.get('/api/products/categories', requireAuth, (_req, res) => {
@@ -8383,6 +9175,27 @@ console.log(`🔐 JWT_SECRET from env: ${process.env.JWT_SECRET ? 'yes' : 'NO �
 try { if (removeDemoDbAtBoot()) console.log('🗑️  Old demo sandbox DB deleted at boot (the sandbox is removed, 2026-11-22)'); }
 catch (e) { console.error('[demo] boot removal failed:', e.message); }
 backup.startSchedule({ getLiveDb, dbPath: DB_PATH });
+// «قسم الأسعار»: the last good catalogue survives a restart (one row on the
+// LIVE DB, grand_catalog_cache — server-side only; services/grandCatalog.js).
+try {
+  const cdb = getLiveDb();
+  grandCatalog.configureStore({
+    load: () => cdb.prepare(`SELECT body_json, etag, scope, version, fetched_at, checked_at, secret_fp FROM grand_catalog_cache WHERE id = 1`).get() || null,
+    save: (c) => cdb.prepare(`INSERT INTO grand_catalog_cache (id, body_json, etag, scope, version, fetched_at, checked_at, secret_fp, saved_at)
+                              VALUES (1, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                              ON CONFLICT(id) DO UPDATE SET body_json = excluded.body_json, etag = excluded.etag, scope = excluded.scope,
+                                version = excluded.version, fetched_at = excluded.fetched_at, checked_at = excluded.checked_at,
+                                secret_fp = excluded.secret_fp, saved_at = excluded.saved_at`)
+      .run(c.body_json, c.etag || null, c.scope, c.version || null, c.fetched_at, c.checked_at, c.secret_fp || null),
+    touch: (checkedAt) => cdb.prepare(`UPDATE grand_catalog_cache SET checked_at = ? WHERE id = 1`).run(checkedAt),
+  });
+} catch (e) { console.error('[grand-catalog] restart copy not configured:', e && e.message); }
+// The estimate backfill: at boot (after the restart copy is loaded) and every 10 min, on the LIVE DB.
+{
+  const runBackfill = () => { try { backfillPurchaseEstimates(getLiveDb()).catch(() => {}); } catch (e) { console.error('[estimate-backfill] not run:', e && e.message); } };
+  setTimeout(runBackfill, 2000).unref();
+  setInterval(runBackfill, PURCHASE_BACKFILL_MS).unref();
+}
 
 app.listen(PORT, () => {
   console.log('');

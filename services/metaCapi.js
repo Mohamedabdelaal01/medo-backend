@@ -122,8 +122,14 @@ function normalizeGender(raw) {
  * @param {object} [opts]      event-level overrides. opts.actionSource forces the
  *                             action_source for THIS event (e.g. 'physical_store'
  *                             for an in-store visit) — defaults to the env value
- *                             then 'website'.
+ *                             then 'website'. opts.eventTime (UNIX seconds): the
+ *                             event's own time (a backfilled sale), within 7 days.
  */
+function eventTimeOf(t) {
+  const now = Math.floor(Date.now() / 1000);
+  const n = Number(t);
+  return Number.isInteger(n) && n <= now && n > now - 7 * 24 * 3600 ? n : now;
+}
 function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = undefined, opts = {}) {
   try {
     if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) return; // not configured — skip
@@ -183,7 +189,9 @@ function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = u
             ...(custom || {}),
           },
           event_name: eventName,
-          event_time: Math.floor(Date.now() / 1000),   // UNIX seconds
+          // UNIX seconds; opts.eventTime (a backfilled sale's own time) when it is
+          // in the past 7 days (Meta refuses older), else now
+          event_time: eventTimeOf(opts.eventTime),
           ...(eventId ? { event_id: String(eventId) } : {}),
           user_data,                                   // Advanced Matching — unchanged (incl. hashed external_id)
         },

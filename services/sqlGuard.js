@@ -15,8 +15,10 @@
 //      read, filtered on or sorted by.
 //
 // Not allowed, ever: settings (API keys, webhook / jwt secret), the audit log
-// (system_audit_log), the one-time migration backup, sqlite_* tables, and any
-// table added later until it is put on this list on purpose.
+// (system_audit_log), the one-time migration backup, sqlite_* tables, the
+// prices system's saved catalogue (grand_catalog_cache: his sales notes and
+// hidden models — services/grandCatalog.js only), and any table added later
+// until it is put on this list on purpose.
 
 const ALLOWED_TABLES = new Set([
   'lead_profiles', 'lead_phones', 'events', 'lead_visits', 'visit_checkins',
