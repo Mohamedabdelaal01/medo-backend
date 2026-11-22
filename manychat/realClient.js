@@ -154,19 +154,11 @@ const realClient = {
       flow_ns: flow_id
     });
   },
-  async sendMessage({ user_id, text }) {
-    // Basic text message for fallback
-    return apiCall('/sending/sendContent', {
-      subscriber_id: user_id,
-      data: {
-        version: "v2",
-        content: {
-          messages: [{ type: "text", text: text }]
-        }
-      },
-      message_tag: "ACCOUNT_UPDATE"
-    });
-  },
+  // sendMessage (free text with message_tag ACCOUNT_UPDATE) was removed on
+  // 2026-11-22: Meta retired that tag (ManyChat 2026-02-09; the Send API
+  // answers error 100 since 2026-04-27) and nothing called it. Messages go out
+  // as ManyChat flows only (sendFlow, inside the 24 h window). Do not add a
+  // free-text sender back with a message tag.
   async setCustomField({ user_id, field, value }) {
     return apiCall('/subscriber/setCustomFieldByName', {
       subscriber_id: user_id,

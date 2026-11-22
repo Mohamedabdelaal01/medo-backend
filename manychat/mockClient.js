@@ -21,10 +21,6 @@ const mockClient = {
     log('sendFlow', { user_id, flow_id });
     return { ok: true, mocked: true };
   },
-  async sendMessage({ user_id, text }) {
-    log('sendMessage', { user_id, text });
-    return { ok: true, mocked: true };
-  },
   async setCustomField({ user_id, field, value }) {
     log('setCustomField', { user_id, field, value });
     return { ok: true, mocked: true };

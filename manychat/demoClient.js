@@ -17,7 +17,6 @@ const demoClient = {
       ig_last_interaction: null, error: null, skipped: 'demo' };
   },
   async sendFlow()       { return skipped('sendFlow'); },
-  async sendMessage()    { return skipped('sendMessage'); },
   async setCustomField() { return skipped('setCustomField'); },
   async addTag()         { return skipped('addTag'); },
   async removeTag()      { return skipped('removeTag'); },

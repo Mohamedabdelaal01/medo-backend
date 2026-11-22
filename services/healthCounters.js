@@ -39,7 +39,7 @@ const state = {
 };
 const USAGE_KEYS = new Set([
   'rep_dashboard', 'ai_pages', 'ai_brief', 'ai_sql', 'mcp', 'mcp_tool',
-  'analytics_campaigns', 'analytics_advanced', 'catalog_read', 'catalog_write',
+  'analytics_campaigns', 'analytics_advanced', 'ad_funnel', 'catalog_read', 'catalog_write',
 ]);
 
 function countTestEvent(type, phonePresent) {

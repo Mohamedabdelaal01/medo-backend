@@ -86,6 +86,19 @@ function initializeDatabase(dbPath = DB_PATH) {
   } catch (e) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
+  // ── 2026-11-22 «أرقام حقيقية» — who wrote the event ────────────────────
+  // NULL = the chat (ManyChat → POST /api/events). 'walkin' = the reception's
+  // walk-in route (POST /api/reception/walkin) — the ONE branch_selected it
+  // writes for a NEW walk-in profile, so the lists find him. Funnels and
+  // demand counts leave 'walkin' rows out (they are not a chat step). Older
+  // walk-in rows (before this column) are never rewritten; they are told
+  // apart by raw_payload IS NULL — see WALKIN_EVENT in server.js.
+  try {
+    db.exec(`ALTER TABLE events ADD COLUMN source TEXT`);
+    console.log('✅ Migration: source column added to events table');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
   // O6 «جايين النهارده» looks visit_planned up by its day (partial: only the
   // few rows that carry one).
   db.exec(`CREATE INDEX IF NOT EXISTS idx_events_planned_day ON events(planned_day) WHERE planned_day IS NOT NULL`);
@@ -517,6 +530,14 @@ function initializeDatabase(dbPath = DB_PATH) {
     CREATE INDEX IF NOT EXISTS idx_lead_phones_phone ON lead_phones(phone);
     CREATE INDEX IF NOT EXISTS idx_lead_phones_user  ON lead_phones(user_id);
   `);
+  // lead_phones.source (2026-11-22 «أرقام حقيقية» r2): who wrote the row —
+  // 'chat' (the chat intake, storeChatPhone), 'walkin' (the reception's walk-in
+  // route), 'staff' (a number a manager typed on the customer's card). Only
+  // 'chat' is «ساب رقم» in the funnels. Older rows stay NULL (never rewritten);
+  // services/honestNumbers.js tells them apart by the 5-minute walk-in rule.
+  if (!db.prepare(`PRAGMA table_info(lead_phones)`).all().some(c => c.name === 'source')) {
+    db.exec(`ALTER TABLE lead_phones ADD COLUMN source TEXT`);
+  }
 
   // lead_visits: one row per branch the customer actually visited. Visiting
   // فيصل then later picking حلوان must NOT erase the فيصل visit.

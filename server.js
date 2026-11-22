@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-22-overhaul-p2-p4-r2';
+const BUILD_VERSION = '2026-11-22-honest-numbers-r2';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -25,7 +25,6 @@ const sqlGuard = require('./services/sqlGuard');
 const secrets  = require('./services/secrets');
 const { processScore, getScoringConfig, computeDecayedScore, classifyLead, DEFAULT_SCORE_MAP, ONCE_PER_USER_EVENTS } = require('./scoring');
 const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./services/scheduler');
-const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
 const { sendMetaEvent, leadEventId } = require('./services/metaCapi');
@@ -216,6 +215,9 @@ function sqlUtcToDate(s) {
 }
 // 'HH:MM' (24h) of `d` in Cairo.
 function cairoHHMM(d) { const p = cairoParts(d); return `${p.hour}:${p.minute}`; }
+// «أرقام حقيقية» (2026-11-22): what every analytics step counts — Cairo days,
+// people not events, walk-ins never a chat step (services/honestNumbers.js).
+const honest = require('./services/honestNumbers')({ cairoDay, cairoDayBoundsSql, sqlUtcToDate, normalizeBranch });
 
 // ── Auto-assignment ───────────────────────────────────────────────────────────
 // Assigns an unassigned lead to the SALES user of the lead's OWN branch
@@ -388,6 +390,7 @@ const USAGE_ROUTES = [
   ['mcp',                 (m, p) => p.startsWith('/api/mcp/')],
   ['analytics_campaigns', (m, p) => p === '/api/analytics'],
   ['analytics_advanced',  (m, p) => p === '/api/analytics/advanced'],
+  ['ad_funnel',           (m, p) => p === '/api/admin/ad-funnel'],
   ['catalog_read',        (m, p) => m === 'GET' && (p === '/api/products' || p.startsWith('/api/products/'))],
   ['catalog_write',       (m, p) => m !== 'GET' && (p === '/api/products' || p.startsWith('/api/products/'))],
 ];
@@ -635,7 +638,7 @@ function answerKeys(db, userId) {
 // (C1.6, «one Lead per person»). Logged as a count, never the phone.
 function storeChatPhone(db, { userId, phone, capi }) {
   if (!phone) return { stored: false, lead: false };
-  const ins = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, phone);
+  const ins = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone, source) VALUES (?, ?, 'chat')`).run(userId, phone);
   if (ins.changes === 0) return { stored: false, lead: false };
   const elsewhere = db.prepare(`SELECT 1 FROM lead_phones WHERE phone = ? AND user_id <> ? LIMIT 1`).get(phone, userId)
     || db.prepare(`SELECT 1 FROM lead_profiles WHERE phone = ? AND user_id <> ? LIMIT 1`).get(phone, userId);
@@ -2560,17 +2563,25 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
       `).run(userId, name, np, branch, interestVal, sourceVal);
     }
 
-    const phoneIns = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+    const phoneIns = db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone, source) VALUES (?, ?, 'walkin')`).run(userId, np);
     phoneIsNew = phoneIns.changes > 0;
 
-    // A branch_selected event makes the walk-in show up everywhere online
-    // leads do (reception list, branch-manager customers, funnels).
-    db.prepare(`
-      INSERT INTO events
-        (event_id, user_id, first_name, event_type, event_value,
-         score_delta, current_score, branch, category)
-      VALUES (?, ?, ?, 'branch_selected', ?, 30, 30, ?, ?)
-    `).run(crypto.randomUUID(), userId, name, branch, branch, interestVal);
+    // A NEW walk-in profile gets one branch_selected so it shows up where
+    // online leads do (reception list, branch-manager customers). It is
+    // marked source = 'walkin': funnels and demand counts leave it out — he
+    // never chose a branch in a chat. A KNOWN customer (found by phone) gets
+    // NO event (2026-11-22 «أرقام حقيقية»): that was a made-up chat step and
+    // +30 points on a real chat lead. His visit is the check-in below, the
+    // same as a reception confirm (which never wrote an event either), and
+    // leadTiedToBranch already ties him to the branch through it.
+    if (!existed) {
+      db.prepare(`
+        INSERT INTO events
+          (event_id, user_id, first_name, event_type, event_value,
+           score_delta, current_score, branch, category, source)
+        VALUES (?, ?, ?, 'branch_selected', ?, 30, 30, ?, ?, 'walkin')
+      `).run(crypto.randomUUID(), userId, name, branch, branch, interestVal);
+    }
 
     // Record the actual showroom visit.
     db.prepare(`INSERT OR IGNORE INTO lead_visits (user_id, branch) VALUES (?, ?)`)
@@ -3096,37 +3107,28 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/sales/analytics — admin: per-salesperson + per-branch sales.
-// Filters: ?sales= &branch= &from= &to=  (dates apply to visited_at)
+// Filters: ?sales= &branch= &from= &to=  (CAIRO days)
+// 2026-11-22 «أرقام حقيقية» (r2): every number from the range — the rules are
+// honest.salesByRep (services/honestNumbers.js):
+//   served      — people with a visit (check-in) in the range at the branch,
+//                 credited to the salesperson lead_visits names for them there
+//                 (a customer who first came before the range and came back in
+//                 it is served in it);
+//   bought      — of those people, the ones who bought from him there in it;
+//   total_sales — what was paid on HIS contracts in the range at the branch
+//                 (once per contract — no join fan-out);
+//   contracts   — his contracts in the range at the branch, even when that
+//                 customer's first visit was before the range.
+//   follow-ups  — the follow-ups DONE in the range (followed_up_at, Cairo days).
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
   const { sales, branch, from, to } = req.query;
-  const where = [`v.sales_rep IS NOT NULL`];
-  const params = [];
-  if (sales)  { where.push(`v.sales_rep = ?`);              params.push(sales); }
-  if (branch) { where.push(`v.branch = ?`);                 params.push(branch); }
-  if (from)   { where.push(`date(v.visited_at) >= ?`);      params.push(from); }
-  if (to)     { where.push(`date(v.visited_at) <= ?`);      params.push(to); }
-  const clause = where.join(' AND ');
-
-  const bySales = db.prepare(`
-    SELECT
-      v.sales_rep AS sales_rep,
-      v.branch    AS branch,
-      COUNT(DISTINCT v.user_id) AS served,
-      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
-      COALESCE(SUM(DISTINCT_PRICE.amount),0) AS total_sales,
-      (SELECT COUNT(*) FROM purchases pu WHERE pu.rep = v.sales_rep AND pu.branch = v.branch) AS contracts
-    FROM lead_visits v
-    LEFT JOIN purchases p
-      ON p.user_id = v.user_id AND p.rep = v.sales_rep
-    LEFT JOIN (
-      SELECT user_id, rep, SUM(price) AS amount FROM purchases GROUP BY user_id, rep
-    ) DISTINCT_PRICE ON DISTINCT_PRICE.user_id = v.user_id AND DISTINCT_PRICE.rep = v.sales_rep
-    WHERE ${clause}
-    GROUP BY v.sales_rep, v.branch
-    ORDER BY total_sales DESC
-  `).all(...params);
+  if ((from && !honest.isDay(from)) || (to && !honest.isDay(to))) {
+    return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  const { bySales, byBranch } = honest.salesByRep(db, { from: from || null, to: to || null,
+    sales: sales || null, branch: branch || null });
 
   const enriched = bySales.map(r => ({
     ...r,
@@ -3135,12 +3137,14 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     followed_up: 0, fu_visited: 0, fu_not_visited: 0,
   }));
 
-  // Follow-up stats per (assigned_sales, branch). Reuses the sales/branch
-  // filters (date filters apply to visits, not the follow-up timeline).
+  // Follow-up stats per (assigned_sales, branch): the follow-ups done in the
+  // range (followed_up_at, Cairo days) — the page's dates apply to them too.
   const fuWhere  = [`f.assigned_sales IS NOT NULL`, `f.followed_up = 1`];
   const fuParams = [];
   if (sales)  { fuWhere.push(`f.assigned_sales = ?`); fuParams.push(sales); }
   if (branch) { fuWhere.push(`f.branch = ?`);         fuParams.push(branch); }
+  const fr = honest.rangeSql('f.followed_up_at', from || null, to || null);
+  if (fr.clause) { fuWhere.push(fr.clause.replace(/^ AND /, '')); fuParams.push(...fr.params); }
   const fuStats = db.prepare(`
     SELECT f.assigned_sales AS sales_rep, f.branch AS branch,
       COUNT(*) AS followed_up,
@@ -3152,13 +3156,13 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     GROUP BY f.assigned_sales, f.branch
   `).all(...fuParams);
 
-  const keyOf = (rep, br) => `${rep}|${br}`;
+  const keyOf = (rep, br) => `${rep}|${honest.normBranch(br)}`;
   const idx = new Map(enriched.map(r => [keyOf(r.sales_rep, r.branch), r]));
   for (const s of fuStats) {
     const k = keyOf(s.sales_rep, s.branch);
     const row = idx.get(k) || {
-      sales_rep: s.sales_rep, branch: s.branch, served: 0, bought: 0,
-      not_bought: 0, close_rate: 0, total_sales: 0,
+      sales_rep: s.sales_rep, branch: honest.normBranch(s.branch), served: 0, bought: 0,
+      not_bought: 0, close_rate: 0, total_sales: 0, contracts: 0,
       followed_up: 0, fu_visited: 0, fu_not_visited: 0,
     };
     row.followed_up    = s.followed_up;
@@ -3166,17 +3170,6 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     row.fu_not_visited = s.followed_up - s.fu_visited;
     if (!idx.has(k)) { idx.set(k, row); enriched.push(row); }
   }
-
-  const byBranch = db.prepare(`
-    SELECT v.branch AS branch,
-      COUNT(DISTINCT v.user_id) AS served,
-      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought
-    FROM lead_visits v
-    LEFT JOIN purchases p ON p.user_id = v.user_id
-    WHERE ${clause}
-    GROUP BY v.branch
-    ORDER BY bought DESC
-  `).all(...params);
 
   return res.json({ bySales: enriched, byBranch });
 });
@@ -3337,31 +3330,6 @@ app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, r
   });
 });
 
-app.get('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (_req, res) => {
-  const db = getDb();
-  const rows = db.prepare(`SELECT key, value FROM settings WHERE key IN
-    ('forecast_with_phone_weight','forecast_without_phone_weight')`).all();
-  const m = Object.fromEntries(rows.map(r => [r.key, parseFloat(r.value)]));
-  return res.json({
-    with_phone:    Number.isFinite(m.forecast_with_phone_weight)    ? m.forecast_with_phone_weight    : 80,
-    without_phone: Number.isFinite(m.forecast_without_phone_weight) ? m.forecast_without_phone_weight : 35,
-  });
-});
-
-app.put('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (req, res) => {
-  const { with_phone, without_phone } = req.body || {};
-  const w = parseFloat(with_phone), wo = parseFloat(without_phone);
-  if (!Number.isFinite(w)  || w  < 0 || w  > 100) return res.status(400).json({ error: 'invalid_with_phone_weight' });
-  if (!Number.isFinite(wo) || wo < 0 || wo > 100) return res.status(400).json({ error: 'invalid_without_phone_weight' });
-  const db = getDb();
-  const upsert = db.prepare(`
-    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-  `);
-  upsert.run('forecast_with_phone_weight',    String(w));
-  upsert.run('forecast_without_phone_weight', String(wo));
-  return res.json({ ok: true, weights: { with_phone: w, without_phone: wo } });
-});
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3378,10 +3346,11 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
 
   const db = getDb();
 
-  // Customers who requested this branch (branch_selected) — even if not visited
+  // Customers who requested this branch in the CHAT (branch_selected) — even if
+  // not visited. The walk-in route's event is not a request (2026-11-22).
   const requested = db.prepare(`
-    SELECT COUNT(DISTINCT user_id) AS n FROM events
-    WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
+    SELECT COUNT(DISTINCT e.user_id) AS n FROM events e
+    WHERE e.event_type = 'branch_selected' AND (e.event_value = ? OR e.branch = ?) AND ${honest.CHAT_EVENT('e')}
   `).get(branch, branch).n;
 
   // Customers who actually visited this branch (one row per user/branch).
@@ -3391,24 +3360,32 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     WHERE branch = ? AND ${NOT_DUPLICATE('lead_visits.user_id')}
   `).get(branch).n;
 
-  // Per-salesperson performance in this branch (same logic as admin analytics)
+  // Per-salesperson performance in this branch.
+  // 2026-11-22 «أرقام حقيقية» (r2): contracts and total_sales are the SAME set
+  // of contracts — his contracts written at this branch, the paid amount once
+  // per contract (no join fan-out, no sale of his at another branch, none of
+  // another rep's customer missing). A rep with contracts here but nobody
+  // served here (yet) still has his row.
+  //   served      — people who visited the branch with this salesperson;
+  //   bought      — of them, the ones who bought from him.
   const bySales = db.prepare(`
-    SELECT
-      v.sales_rep AS sales_rep,
-      COUNT(DISTINCT v.user_id) AS served,
-      COUNT(DISTINCT CASE WHEN p.user_id IS NOT NULL THEN v.user_id END) AS bought,
-      COALESCE(SUM(DP.amount),0) AS total_sales,
-      (SELECT COUNT(*) FROM purchases pu WHERE pu.rep = v.sales_rep AND pu.branch = v.branch) AS contracts
-    FROM lead_visits v
-    LEFT JOIN purchases p ON p.user_id = v.user_id AND p.rep = v.sales_rep
-    LEFT JOIN (
-      SELECT user_id, rep, SUM(price) AS amount FROM purchases GROUP BY user_id, rep
-    ) DP ON DP.user_id = v.user_id AND DP.rep = v.sales_rep
-    WHERE v.branch = ? AND v.sales_rep IS NOT NULL
-      AND ${NOT_DUPLICATE('v.user_id')}
-    GROUP BY v.sales_rep
+    WITH served AS (
+      SELECT DISTINCT v.sales_rep, v.user_id FROM lead_visits v
+      WHERE v.branch = ? AND v.sales_rep IS NOT NULL AND ${NOT_DUPLICATE('v.user_id')}
+    ),
+    reps AS (
+      SELECT sales_rep AS rep FROM served
+      UNION SELECT pu.rep FROM purchases pu WHERE pu.branch = ? AND pu.rep IS NOT NULL AND TRIM(pu.rep) <> ''
+    )
+    SELECT r.rep AS sales_rep,
+      (SELECT COUNT(*) FROM served s WHERE s.sales_rep = r.rep) AS served,
+      (SELECT COUNT(*) FROM served s WHERE s.sales_rep = r.rep
+         AND EXISTS (SELECT 1 FROM purchases pu WHERE pu.user_id = s.user_id AND pu.rep = r.rep)) AS bought,
+      (SELECT COALESCE(SUM(pu.price), 0) FROM purchases pu WHERE pu.rep = r.rep AND pu.branch = ?) AS total_sales,
+      (SELECT COUNT(*) FROM purchases pu WHERE pu.rep = r.rep AND pu.branch = ?) AS contracts
+    FROM reps r
     ORDER BY total_sales DESC
-  `).all(branch).map(r => ({
+  `).all(branch, branch, branch, branch).map(r => ({
     ...r,
     not_bought: r.served - r.bought,
     close_rate: r.served ? Math.round((r.bought / r.served) * 100) : 0,
@@ -3752,14 +3729,8 @@ function pctAchieved(actual, target) {
   return target > 0 ? Math.round(((actual || 0) / target) * 100) : 0;
 }
 
-// Builds a SQL date-range clause for a column. Returns { clause, params }.
-function dateRangeClause(column, startDate, endDate) {
-  const parts = [];
-  const params = [];
-  if (startDate) { parts.push(`date(${column}) >= ?`); params.push(startDate); }
-  if (endDate)   { parts.push(`date(${column}) <= ?`); params.push(endDate); }
-  return { clause: parts.length ? ' AND ' + parts.join(' AND ') : '', params };
-}
+// (dateRangeClause — a UTC `date(col)` range — was removed 2026-11-22: every
+// date filter is a Cairo-day range now, honest.rangeSql / cairoRangeClause.)
 
 // ════════════════════════════════════════════════════════════════════════════
 // PATCH /api/branch/customers/:userId/assign — manager hands a customer to a
@@ -4300,7 +4271,8 @@ app.patch('/api/branch/customers/:userId/contact', requireAuth, authorizeRoles('
     params.push(userId);
     db.prepare(`UPDATE lead_profiles SET ${updates.join(', ')} WHERE user_id = ?`).run(...params);
     // Keep the new number in lead_phones too so confirm-by-phone still matches.
-    if (np) db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone) VALUES (?, ?)`).run(userId, np);
+    // source 'staff': a number a manager typed is never «ساب رقم» in the chat.
+    if (np) db.prepare(`INSERT OR IGNORE INTO lead_phones (user_id, phone, source) VALUES (?, ?, 'staff')`).run(userId, np);
   })();
 
   return res.json({ ok: true, first_name: name || null, phone: np || null });
@@ -6152,43 +6124,52 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
     : db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') ORDER BY branch, name`).all();
 
   const days = Math.min(60, Math.max(1, parseInt(req.query.days, 10) || 14));
-  const since = `-${days} days`;
+  // CAIRO days (2026-11-22 «أرقام حقيقية» r2): the window is the last `days`
+  // Cairo days, today included, and every row lands on its Cairo day — a
+  // follow-up at 00:30 Cairo is on that day, never the UTC day before. The
+  // rows are read with their timestamps and bucketed here (honest.dayOf).
+  const today = cairoDay();
+  const fromDay = honest.addDays(today, -(days - 1));
+  const since = cairoDayBoundsSql(fromDay)[0];
+  const perDay = (rows, extra) => {
+    const m = new Map();
+    for (const r of rows) {
+      const day = honest.dayOf(r.at);
+      if (!day || day < fromDay || day > today) continue;
+      const k = `${r.rep}\u0000${day}`;
+      if (!m.has(k)) m.set(k, { rep: r.rep, day, n: 0, contacted: 0 });
+      const o = m.get(k); o.n += 1; if (extra) o.contacted += extra(r) ? 1 : 0;
+    }
+    return [...m.values()];
+  };
 
   // 1) Completed PRE-visit follow-ups per rep/day (append-only followup_log).
-  const preRows = db.prepare(`
-    SELECT TRIM(sales) AS rep, date(followed_up_at) AS day, COUNT(*) AS n
-    FROM followup_log
-    WHERE followed_up_at >= datetime('now', ?)
-    GROUP BY rep, day
-  `).all(since);
+  const preRows = perDay(db.prepare(`
+    SELECT TRIM(sales) AS rep, followed_up_at AS at FROM followup_log
+    WHERE datetime(followed_up_at) >= ?
+  `).all(since));
 
   // 2) Completed POST-visit follow-ups per rep/day (append-only revisit_followups).
-  const postRows = db.prepare(`
-    SELECT TRIM(followed_up_by) AS rep, date(created_at) AS day, COUNT(*) AS n
-    FROM revisit_followups
-    WHERE created_at >= datetime('now', ?)
-    GROUP BY rep, day
-  `).all(since);
+  const postRows = perDay(db.prepare(`
+    SELECT TRIM(followed_up_by) AS rep, created_at AS at FROM revisit_followups
+    WHERE datetime(created_at) >= ?
+  `).all(since));
 
   // 3) WhatsApp outreach sends per rep/day. sent_at holds the LATEST send per
   //    customer, so this counts customers whose latest send fell on that day.
-  const sentRows = db.prepare(`
-    SELECT TRIM(assigned_sales) AS rep, date(sent_at) AS day, COUNT(*) AS n
-    FROM branch_customer_followups
-    WHERE sent = 1 AND sent_at IS NOT NULL AND sent_at >= datetime('now', ?)
-    GROUP BY rep, day
-  `).all(since);
+  const sentRows = perDay(db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, sent_at AS at FROM branch_customer_followups
+    WHERE sent = 1 AND sent_at IS NOT NULL AND datetime(sent_at) >= ?
+  `).all(since));
 
   // 4) Unanswered call attempts per rep/day. Only the LAST attempt's timestamp
   //    is stored per customer, so this counts customers whose latest unanswered
   //    attempt fell on that day — an acceptable approximation of daily effort.
-  const attemptRows = db.prepare(`
-    SELECT TRIM(assigned_sales) AS rep, date(last_attempt_at) AS day, COUNT(*) AS n
-    FROM branch_customer_followups
+  const attemptRows = perDay(db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, last_attempt_at AS at FROM branch_customer_followups
     WHERE COALESCE(attempt_count, 0) > 0 AND last_attempt_at IS NOT NULL
-      AND last_attempt_at >= datetime('now', ?)
-    GROUP BY rep, day
-  `).all(since);
+      AND datetime(last_attempt_at) >= ?
+  `).all(since));
 
   // 5) Pending backlog per rep (assigned, not yet visited, not yet followed up)
   //    — same shape as the monitor's preAgg, but grouped across all reps.
@@ -6205,14 +6186,13 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
   //    customer's CURRENT state (followed up OR WhatsApp'd OR attempted a call
   //    at any point since), NOT their state on the assignment day itself — so
   //    the counter keeps climbing as the rep works through that day's batch.
-  const assignedRows = db.prepare(`
-    SELECT TRIM(assigned_sales) AS rep, date(assigned_at) AS day, COUNT(*) AS n,
-           COALESCE(SUM(CASE WHEN followed_up = 1 OR COALESCE(sent, 0) = 1 OR COALESCE(attempt_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS contacted
+  const assignedRows = perDay(db.prepare(`
+    SELECT TRIM(assigned_sales) AS rep, assigned_at AS at,
+           CASE WHEN followed_up = 1 OR COALESCE(sent, 0) = 1 OR COALESCE(attempt_count, 0) > 0 THEN 1 ELSE 0 END AS c
     FROM branch_customer_followups
     WHERE assigned_sales IS NOT NULL AND TRIM(assigned_sales) != ''
-      AND assigned_at IS NOT NULL AND assigned_at >= datetime('now', ?)
-    GROUP BY rep, day
-  `).all(since);
+      AND assigned_at IS NOT NULL AND datetime(assigned_at) >= ?
+  `).all(since), (r) => r.c === 1);
 
   // Merge, keyed by TRIMMED rep name (codebase convention for name matching).
   const byRep = new Map();
@@ -6269,7 +6249,7 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
     ...rep,
     days: [...dayMap.values()].sort((a, b) => (a.day < b.day ? 1 : -1)),
   }));
-  return res.json({ days, reps: out });
+  return res.json({ days, from: fromDay, to: today, timezone: CAIRO_TZ, reps: out });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6363,7 +6343,10 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     params.push(month);
   }
 
-  const dr = dateRangeClause('p.created_at', startDate, endDate);
+  if ((startDate && !honest.isDay(startDate)) || (endDate && !honest.isDay(endDate))) {
+    return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  const dr = honest.rangeSql('p.created_at', startDate || null, endDate || null);   // Cairo days
   where += dr.clause;
   params.push(...dr.params);
   if (fBranch && role === 'admin') { where += ' AND p.branch = ?'; params.push(fBranch); }
@@ -6595,15 +6578,6 @@ app.delete('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_ma
 // All routes below are NEW. Existing endpoints above are unchanged.
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /api/predictions — Weekly visit forecast (next 7 days).
-app.get('/api/predictions', requireAuth, (req, res) => {
-  try {
-    return res.json(predict());
-  } catch (err) {
-    console.error('[predictions]', err);
-    return res.status(500).json({ error: 'prediction_failed' });
-  }
-});
 
 // POST /api/trigger-message — Fire a ManyChat flow for a specific lead.
 // Body: { user_id, action_type?, force? }
@@ -6700,60 +6674,66 @@ app.get('/api/follow-up-state/:user_id', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/analytics — Date-filtered analytics
-// Query: from (YYYY-MM-DD), to (YYYY-MM-DD), branch, campaign
+// GET /api/analytics — «تحليلات المنتجات»: what customers looked at in the chat
+// and what was sold. Query: from, to (CAIRO days; default the last 30 Cairo
+// days with today), branch, campaign.
+// 2026-11-22 «أرقام حقيقية»:
+//   • days are Cairo days; the walk-in route's events are not chat demand;
+//   • demand (views, category picks, the daily events) carries no branch:
+//     the branch filter applies to the SALES only (the contract's branch) —
+//     meta.branch_applies_to says so and the page prints «كل الفروع»;
+//   • campaign = the customer's campaign_source (where he first came from);
+//   • the lead-class sections (the «ساخن/زار/اشترى» snapshot, the campaign
+//     and ad tables, the branch and platform tables — today's class of people
+//     created in the range, walk-ins shown as a campaign) are gone: the
+//     weekly «من الإعلان للبيعة» (GET /api/admin/ad-funnel) replaces them.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
   const { from, to, branch, campaign } = req.query;
-  const fromDate = from || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
-  const toDate   = to   || new Date().toISOString().split('T')[0];
+  if ((from && !honest.isDay(from)) || (to && !honest.isDay(to))) {
+    return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  const today    = cairoDay();
+  const fromDate = from || honest.addDays(today, -29);
+  const toDate   = to   || today;
 
-  // Build optional filter clauses
-  const branchClause   = branch   ? `AND lp.preferred_branch = ?` : '';
+  // Demand filters: the campaign only (views carry no branch).
   const campaignClause = campaign ? `AND lp.campaign_source = ?`  : '';
-  const branchParam    = branch   ? [branch]   : [];
   const campaignParam  = campaign ? [campaign] : [];
+  const evR = honest.rangeSql('e.created_at', fromDate, toDate);
+  const evWhere = `${honest.CHAT_EVENT('e')}${evR.clause} ${campaignClause}`;
+  const evArgs  = [...evR.params, ...campaignParam];
 
-  // Daily events by type
-  const eventsSeries = db.prepare(`
-    SELECT date(e.created_at) AS day, e.event_type, COUNT(*) AS count
+  // Daily events by type (Cairo day). SQLite has no time zones: the rows are
+  // read in the range and put on their Cairo day here.
+  const evRows = db.prepare(`
+    SELECT e.created_at, e.event_type
     FROM events e
     JOIN lead_profiles lp ON e.user_id = lp.user_id
-    WHERE date(e.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
-    GROUP BY day, e.event_type
-    ORDER BY day
-  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
-
-  // Funnel snapshot for leads created in range
-  const funnel = db.prepare(`
-    SELECT
-      COUNT(DISTINCT lp.user_id)                                                     AS total_leads,
-      SUM(CASE WHEN lp.lead_class = 'hot'                                  THEN 1 ELSE 0 END) AS hot,
-      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted')    THEN 1 ELSE 0 END) AS visited,
-      SUM(CASE WHEN lp.lead_class = 'purchased'                            THEN 1 ELSE 0 END) AS purchased
-    FROM lead_profiles lp
-    WHERE date(lp.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
-  `).get(fromDate, toDate, ...branchParam, ...campaignParam);
+    WHERE ${evWhere}
+  `).all(...evArgs);
+  const seriesMap = new Map();
+  for (const r of evRows) {
+    const day = honest.dayOf(r.created_at);
+    const k = `${day}|${r.event_type}`;
+    seriesMap.set(k, (seriesMap.get(k) || 0) + 1);
+  }
+  const eventsSeries = [...seriesMap].map(([k, count]) => { const [day, event_type] = k.split('|'); return { day, event_type, count }; })
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
 
   // Top products in range — DISTINCT customers (not raw repeated views)
   const topProducts = db.prepare(`
     SELECT e.event_value AS product, COUNT(DISTINCT e.user_id) AS views
     FROM events e
     JOIN lead_profiles lp ON e.user_id = lp.user_id
-    WHERE e.event_type = 'product_details'
-      AND date(e.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
+    WHERE e.event_type = 'product_details' AND ${evWhere}
     GROUP BY e.event_value
     ORDER BY views DESC
     LIMIT 10
-  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+  `).all(...evArgs);
 
   // ── Category demand breakdown ─────────────────────────────────────────
-  // Each category's total interest: product views + category picks + how
-  // many distinct customers and distinct models were involved.
   const categories = db.prepare(`
     SELECT
       e.category                                                       AS category,
@@ -6768,15 +6748,12 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     JOIN lead_profiles lp ON e.user_id = lp.user_id
     WHERE e.category IS NOT NULL AND e.category != ''
       AND e.event_type IN ('product_details','category_request')
-      AND date(e.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
+      AND ${evWhere}
     GROUP BY e.category
     ORDER BY product_views DESC, category_requests DESC
-  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+  `).all(...evArgs);
 
   // ── Top products PER category ─────────────────────────────────────────
-  // Full per-model ranking inside each category (no LIMIT — the UI can
-  // show the top 50 of غرف النوم, top 50 of السفرة … independently).
   const productsByCategoryRows = db.prepare(`
     SELECT
       e.category    AS category,
@@ -6788,11 +6765,10 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     WHERE e.event_type = 'product_details'
       AND e.category IS NOT NULL AND e.category != ''
       AND e.event_value IS NOT NULL
-      AND date(e.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
+      AND ${evWhere}
     GROUP BY e.category, e.event_value
     ORDER BY e.category, views DESC
-  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+  `).all(...evArgs);
 
   // Nest products under their category for the frontend
   const productsByCategory = {};
@@ -6805,73 +6781,10 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     });
   }
 
-  // Campaigns in range
-  const branchOnlyClause   = branch   ? `AND lp.preferred_branch = ?` : '';
-  const campaignOnlyClause = campaign ? `AND lp.campaign_source = ?`  : '';
-  const campaigns = db.prepare(`
-    SELECT
-      lp.campaign_source,
-      COUNT(DISTINCT lp.user_id)                                                                AS leads,
-      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END)    AS visits,
-      SUM(CASE WHEN lp.lead_class = 'purchased'                         THEN 1 ELSE 0 END)     AS purchases
-    FROM lead_profiles lp
-    WHERE lp.campaign_source IS NOT NULL
-      AND date(lp.created_at) BETWEEN ? AND ?
-      ${branchOnlyClause}
-    GROUP BY lp.campaign_source
-    ORDER BY leads DESC
-  `).all(fromDate, toDate, ...branchParam);
-
-  // ── Ad funnel — per campaign+ad, how far did customers get? ───────────
-  // The key question: each ad reached how many customers up to
-  // location_request (the strongest pre-visit buying signal).
-  const adFunnel = db.prepare(`
-    SELECT
-      COALESCE(lp.campaign_source, 'بدون حملة')                              AS campaign_source,
-      COALESCE(lp.ad_id, '—')                                               AS ad_id,
-      COUNT(DISTINCT lp.user_id)                                            AS leads,
-      SUM(CASE WHEN lp.product_view_count > 0 THEN 1 ELSE 0 END)            AS product_viewers,
-      SUM(CASE WHEN lp.location_requested = 1 THEN 1 ELSE 0 END)            AS location_requests,
-      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted')
-               THEN 1 ELSE 0 END)                                          AS visited,
-      SUM(CASE WHEN lp.lead_class = 'purchased' THEN 1 ELSE 0 END)         AS purchased
-    FROM lead_profiles lp
-    WHERE lp.campaign_source IS NOT NULL
-      AND date(lp.created_at) BETWEEN ? AND ?
-      ${branchOnlyClause}
-    GROUP BY lp.campaign_source, lp.ad_id
-    ORDER BY location_requests DESC, leads DESC
-  `).all(fromDate, toDate, ...branchParam);
-
-  // Branch breakdown in range
-  const branches = db.prepare(`
-    SELECT
-      lp.preferred_branch AS branch,
-      COUNT(DISTINCT lp.user_id)                                                             AS leads,
-      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END) AS visits
-    FROM lead_profiles lp
-    WHERE lp.preferred_branch IS NOT NULL
-      AND date(lp.created_at) BETWEEN ? AND ?
-      ${campaignOnlyClause}
-    GROUP BY lp.preferred_branch
-    ORDER BY leads DESC
-  `).all(fromDate, toDate, ...campaignParam);
-
-  // Platform breakdown — Instagram vs Facebook performance side-by-side.
-  // Only counts leads with a known platform (legacy walk-ins are excluded).
-  const platforms = db.prepare(`
-    SELECT
-      lp.platform                                                                            AS platform,
-      COUNT(DISTINCT lp.user_id)                                                             AS leads,
-      SUM(CASE WHEN lp.lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END) AS visits,
-      SUM(CASE WHEN lp.lead_class = 'purchased'                          THEN 1 ELSE 0 END) AS purchases
-    FROM lead_profiles lp
-    WHERE lp.platform IN ('instagram','facebook')
-      AND date(lp.created_at) BETWEEN ? AND ?
-      ${branchClause} ${campaignClause}
-    GROUP BY lp.platform
-    ORDER BY leads DESC
-  `).all(fromDate, toDate, ...branchParam, ...campaignParam);
+  // Sales filters: the contract's own branch + the customer's campaign.
+  const branchClause = branch ? `AND pur.branch = ?` : '';
+  const branchParam  = branch ? [branch] : [];
+  const purR = honest.rangeSql('pur.created_at', fromDate, toDate);
 
   // ── SALES analytics — best-selling products. Mirrors the "most viewed"
   // analysis above but sourced from ACTUAL purchases, not view events:
@@ -6885,7 +6798,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
   // across its products (one contract can bundle several products under a
   // single total), so we rank by units, not by revenue. The admin-only
   // estimate (purchase_estimates) is never read here.
-  const salesArgs = [fromDate, toDate, ...branchParam, ...campaignParam, fromDate, toDate, ...branchParam, ...campaignParam];
+  const salesArgs = [...purR.params, ...branchParam, ...campaignParam, ...purR.params, ...branchParam, ...campaignParam];
   const soldCte = `
     WITH sold AS (
       SELECT 'item:' || pi.product_id                 AS k,
@@ -6899,7 +6812,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
       JOIN lead_profiles lp  ON lp.user_id = pur.user_id
       JOIN products p        ON p.id = pi.product_id
       LEFT JOIN product_categories pc ON pc.id = p.category_id
-      WHERE date(pur.created_at) BETWEEN ? AND ?
+      WHERE 1=1 ${purR.clause}
         ${branchClause} ${campaignClause}
       UNION ALL
       SELECT CASE WHEN pl.kind = 'set' AND pl.variant_id IS NULL THEN 'model:' || pl.model_id
@@ -6913,7 +6826,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
       FROM purchase_lines pl
       JOIN purchases pur     ON pur.id = pl.purchase_id
       JOIN lead_profiles lp  ON lp.user_id = pur.user_id
-      WHERE date(pur.created_at) BETWEEN ? AND ?
+      WHERE 1=1 ${purR.clause}
         ${branchClause} ${campaignClause}
     )`;
   // Best-selling overall (all categories). The product's name and category
@@ -6955,18 +6868,14 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
 
   return res.json({
     eventsSeries,
-    funnel:      funnel || { total_leads: 0, hot: 0, visited: 0, purchased: 0 },
     topProducts,
     categories,
     productsByCategory,
     topSelling,
     salesByCategory,
     sellingByCategory,
-    campaigns,
-    adFunnel,
-    branches,
-    platforms,
-    meta: { from: fromDate, to: toDate, branch: branch || null, campaign: campaign || null },
+    meta: { from: fromDate, to: toDate, timezone: CAIRO_TZ, branch: branch || null, campaign: campaign || null,
+            branch_applies_to: 'sales' },
   });
 });
 
@@ -7718,99 +7627,27 @@ function branchLabelMap(db) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/analytics/advanced — admin-only deep analytics. Four executive KPIs
-// computed from existing tables (no new schema):
-//   1. True rep conversion  = contracts closed ÷ leads assigned (efficiency, not
-//      volume) per rep.
-//   2. Sales velocity        = avg days from lead creation → purchase.
-//   3. Lost-lead analysis    = where COLD leads cluster (last touchpoint / branch).
-//   4. Pipeline value        = HOT/WARM leads × a mock ticket = money left on the table.
+// Removed 2026-11-22 («أرقام حقيقية»): «التحليلات العميقة».
+//   GET /api/analytics/advanced — its four numbers were not true:
+//     «حجم الأموال المعلقة» = hot × a fixed ticket + warm × a fixed ticket (a
+//     made-up «avg ticket», never a sale); «معدل الإغلاق الحقيقي» = all-time
+//     contracts ÷ all-time assignments (two different groups of people, no
+//     date); «سرعة التعاقد» mixed walk-ins who buy on day 0; «الفرص الضائعة»
+//     counted today's «بارد» class, its branch «غير محدد» by construction.
+//     Nothing true was left: the page is gone and its URL opens «من الإعلان
+//     للبيعة». The only money on the analytics screens is real sales (paid, or
+//     the admin-only list estimate marked «تقريبي»).
+//   GET /api/predictions, GET|PUT /api/settings/forecast-weights — a «visit
+//     forecast» from fixed weights (80% with a phone / 35% without), on no
+//     screen. Gone with them.
+// Each answers 410 with an Arabic line (an old tab still open shows a message).
 // ════════════════════════════════════════════════════════════════════════════
-const HOT_TICKET  = 50000;  // mock avg ticket per HOT lead (EGP)
-const WARM_TICKET = 25000;  // mock avg ticket per WARM lead (EGP)
-
-app.get('/api/analytics/advanced', requireAuth, requireRole('admin'), (req, res) => {
-  const db = getDb();
-
-  // ── 1. True rep conversion rate (contracts ÷ assigned) ────────────────────
-  const reps = db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep')`).all();
-  const assignedStmt  = db.prepare(`SELECT COUNT(*) AS n FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(?)`);
-  const contractsStmt = db.prepare(`SELECT COUNT(*) AS n FROM purchases WHERE TRIM(rep) = TRIM(?)`);
-  const repConversion = reps.map((r) => {
-    const assigned  = assignedStmt.get(r.name).n  || 0;
-    const contracts = contractsStmt.get(r.name).n || 0;
-    return {
-      rep: r.name,
-      branch: r.branch || null,
-      assigned,
-      contracts,
-      rate: assigned ? Math.round((contracts / assigned) * 1000) / 10 : 0, // 1-dp %
-    };
-  }).filter((r) => r.assigned > 0 || r.contracts > 0)
-    .sort((a, b) => b.rate - a.rate || b.contracts - a.contracts);
-
-  // ── 2. Sales velocity (lead created → purchase) ───────────────────────────
-  // Guard out rows where the purchase predates lead creation (data drift) so the
-  // average can't go negative.
-  const vel = db.prepare(`
-    SELECT
-      COUNT(*) AS n,
-      AVG(julianday(p.created_at) - julianday(lp.created_at)) AS avg_days,
-      MIN(julianday(p.created_at) - julianday(lp.created_at)) AS min_days,
-      MAX(julianday(p.created_at) - julianday(lp.created_at)) AS max_days
-    FROM purchases p
-    JOIN lead_profiles lp ON lp.user_id = p.user_id
-    WHERE lp.created_at IS NOT NULL AND p.created_at IS NOT NULL
-      AND julianday(p.created_at) >= julianday(lp.created_at)
-  `).get();
-  const bucket = (lo, hi) => db.prepare(`
-    SELECT COUNT(*) AS n
-    FROM purchases p JOIN lead_profiles lp ON lp.user_id = p.user_id
-    WHERE lp.created_at IS NOT NULL AND p.created_at IS NOT NULL
-      AND julianday(p.created_at) >= julianday(lp.created_at)
-      AND (julianday(p.created_at) - julianday(lp.created_at)) >= ?
-      ${hi != null ? 'AND (julianday(p.created_at) - julianday(lp.created_at)) < ?' : ''}
-  `).get(...(hi != null ? [lo, hi] : [lo])).n;
-  const velocity = {
-    avg_days:     vel.n ? Math.round((vel.avg_days || 0) * 10) / 10 : null,
-    sample_size:  vel.n || 0,
-    fastest_days: vel.n ? Math.max(0, Math.round((vel.min_days || 0) * 10) / 10) : null,
-    slowest_days: vel.n ? Math.round((vel.max_days || 0) * 10) / 10 : null,
-    buckets: vel.n ? {
-      same_day:     bucket(0, 1),
-      within_week:  bucket(1, 7),
-      within_month: bucket(7, 30),
-      over_month:   bucket(30, null),
-    } : null,
-  };
-
-  // ── 3. Lost-lead analysis — where COLD leads drop off ─────────────────────
-  const total_cold = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'cold'`).get().n;
-  const groupCold = (col) => db.prepare(`
-    SELECT COALESCE(NULLIF(TRIM(${col}), ''), 'غير محدّد') AS label, COUNT(*) AS count
-    FROM lead_profiles WHERE lead_class = 'cold'
-    GROUP BY label ORDER BY count DESC LIMIT 12
-  `).all();
-  const lostLeads = {
-    total_cold,
-    byCategory: groupCold('last_category'),
-    byBranch:   groupCold('preferred_branch'),
-    byPlatform: groupCold('platform'),
-  };
-
-  // ── 4. Pipeline estimated value — money left on the table ─────────────────
-  const hot  = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'hot'`).get().n;
-  const warm = db.prepare(`SELECT COUNT(*) AS n FROM lead_profiles WHERE lead_class = 'warm'`).get().n;
-  const pipeline = {
-    hot, warm,
-    hot_ticket: HOT_TICKET, warm_ticket: WARM_TICKET,
-    hot_value:  hot * HOT_TICKET,
-    warm_value: warm * WARM_TICKET,
-    total_value: hot * HOT_TICKET + warm * WARM_TICKET,
-  };
-
-  return res.json({ repConversion, velocity, lostLeads, pipeline });
-});
+for (const [m, p] of [
+  ['get', '/api/analytics/advanced'],
+  ['get', '/api/predictions'],
+  ['get', '/api/settings/forecast-weights'],
+  ['put', '/api/settings/forecast-weights'],
+]) app[m](p, requireAuth, removedRoute);
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/admin/search?q= — fast global lead lookup for the Ctrl+K command
@@ -8201,15 +8038,40 @@ app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/admin/kpis — filtered executive KPIs (revenue / visits / closing
-// rate) + target achievement. Filters: startDate, endDate, branch, rep.
+// GET /api/admin/kpis — the admin home's cards and charts. Filters: startDate,
+// endDate (CAIRO days, 'YYYY-MM-DD'; none = all time), branch, rep.
+// 2026-11-22 «أرقام حقيقية» — every number on the screen follows the SAME
+// filter (services/honestNumbers.js):
+//   contracts_count   — contracts recorded in the range at the branch;
+//   total_visits      — people who came to a showroom in the range (check-ins,
+//                       every day they came — a returning customer counts),
+//                       walk-ins included; visit_count = the visits themselves;
+//   closing_rate      — of THOSE visitors, how many bought in the range (the
+//                       same people, so never above 100%);
+//   funnel            — people, not events: the customers whose first chat
+//                       fell in the range and how far they got by today
+//                       (كلّموا → سابوا رقم → اختاروا فرع / قالوا جايين → زاروا
+//                       → اشتروا). Chats and phones carry no branch: with a
+//                       branch filter they stay «كل الفروع» (branch_scoped:false);
+//                       walk-ins are their own line, never a chat step;
+//   branch_demand     — chat customers who asked for each branch in the range
+//                       (walk-in events left out);
+//   branch_visits     — people who came to each branch in the range.
+// rep narrows the contracts and the target only. The class pie («توزيع
+// العملاء»: today's class of people created in the range) is gone: «ساخن» was
+// points, not a step.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
   const { startDate, endDate, branch, rep } = req.query;
+  if ((startDate && !honest.isDay(startDate)) || (endDate && !honest.isDay(endDate))) {
+    return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  const from = startDate || null;
+  const to   = endDate || null;
 
-  // Revenue + buyer count from purchases.
-  const purDate = dateRangeClause('created_at', startDate, endDate);
+  // Contracts + buyers from purchases (Cairo days).
+  const purDate = honest.rangeSql('created_at', from, to);
   let purWhere = '1=1' + purDate.clause;
   const purParams = [...purDate.params];
   if (branch) { purWhere += ' AND branch = ?'; purParams.push(branch); }
@@ -8220,18 +8082,11 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
     FROM purchases WHERE ${purWhere}
   `).get(...purParams);
 
-  // Visit count from lead_visits.
-  const visDate = dateRangeClause('visited_at', startDate, endDate);
-  let visWhere = '1=1' + visDate.clause;
-  const visParams = [...visDate.params];
-  if (branch) { visWhere += ' AND branch = ?';    visParams.push(branch); }
-  if (rep)    { visWhere += ' AND sales_rep = ?'; visParams.push(rep); }
-  const visits = db.prepare(
-    `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
-  ).get(...visParams).n;
+  // Visitors (and buyers among them) — every check-in day, Cairo.
+  const pv = honest.periodVisits(db, { from, to, branch: branch || null });
 
   // Target progress — strictly the CURRENT calendar month: this month's
-  // target vs revenue generated this month (independent of the filter range).
+  // target vs contracts this month (independent of the filter range).
   const curMonth = currentMonth();
   let target = 0;
   if (rep)         target = getTarget(db, 'sales_rep', rep);
@@ -8245,70 +8100,37 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   const monthRev  = monthRevenue(db, { branch, rep, month: curMonth });
   const monthCnts = monthContracts(db, { branch, rep, month: curMonth });
 
-  const revenue = purRow.revenue || 0;
-
-  // ── Filtered chart datasets (so the dashboard charts honour the filters) ──
-  const evDate = dateRangeClause('created_at', startDate, endDate);
-
-  // Branch demand — customers who asked for each branch.
-  let bdWhere = `event_type IN ('branch_selected', 'location_request')
-    AND COALESCE(NULLIF(branch,''), event_value) IS NOT NULL` + evDate.clause;
+  // Branch demand — chat customers who asked for each branch (no walk-in event).
+  const evDate = honest.rangeSql('e.created_at', from, to);
+  let bdWhere = `e.event_type IN ('branch_selected', 'location_request')
+    AND COALESCE(NULLIF(e.branch,''), e.event_value) IS NOT NULL AND ${honest.CHAT_EVENT('e')}` + evDate.clause;
   const bdParams = [...evDate.params];
-  if (branch) { bdWhere += ` AND COALESCE(NULLIF(branch,''), event_value) = ?`; bdParams.push(branch); }
+  if (branch) { bdWhere += ` AND COALESCE(NULLIF(e.branch,''), e.event_value) = ?`; bdParams.push(branch); }
   const branch_demand = db.prepare(`
-    SELECT COALESCE(NULLIF(branch,''), event_value) AS branch, COUNT(DISTINCT user_id) AS requests
-    FROM events WHERE ${bdWhere}
-    GROUP BY COALESCE(NULLIF(branch,''), event_value)
+    SELECT COALESCE(NULLIF(e.branch,''), e.event_value) AS branch, COUNT(DISTINCT e.user_id) AS requests
+    FROM events e WHERE ${bdWhere}
+    GROUP BY COALESCE(NULLIF(e.branch,''), e.event_value)
     ORDER BY requests DESC
   `).all(...bdParams);
 
-  // Branch visits — reception-confirmed arrivals per branch.
-  let bvWhere = 'branch IS NOT NULL' + visDate.clause;
-  const bvParams = [...visDate.params];
-  if (branch) { bvWhere += ' AND branch = ?'; bvParams.push(branch); }
-  const branch_visits = db.prepare(`
-    SELECT branch, COUNT(DISTINCT user_id) AS visits
-    FROM lead_visits WHERE ${bvWhere}
-    GROUP BY branch ORDER BY visits DESC
-  `).all(...bvParams);
-
-  // Funnel stages (date-filtered; branch filter skipped — early stages carry
-  // no branch and would zero-out the funnel).
-  const funnel_stages = db.prepare(`
-    SELECT event_type, COUNT(DISTINCT user_id) AS unique_users
-    FROM events
-    WHERE event_type IN (
-      'entry_catalog', 'entry_offer', 'entry_location',
-      'product_details', 'location_request',
-      'branch_selected', 'map_click', 'contact_request', 'visit_confirmed'
-    )${evDate.clause}
-    GROUP BY event_type ORDER BY unique_users DESC
-  `).all(...evDate.params);
-
-  // Lead distribution by class.
-  const ldDate = dateRangeClause('created_at', startDate, endDate);
-  let ldWhere = '1=1' + ldDate.clause;
-  const ldParams = [...ldDate.params];
-  if (branch) { ldWhere += ' AND preferred_branch = ?'; ldParams.push(branch); }
-  const lead_distribution = db.prepare(`
-    SELECT lead_class, COUNT(*) AS count FROM lead_profiles WHERE ${ldWhere}
-    GROUP BY lead_class
-  `).all(...ldParams);
+  const funnel = honest.homeFunnel(db, { from, to, branch: branch || null });
 
   return res.json({
-    total_revenue:    revenue,                 // kept for backward-compat
+    from, to, branch: branch || null, timezone: CAIRO_TZ,
+    total_revenue:    purRow.revenue || 0,     // kept for backward-compat
     contracts_count:  purRow.contracts || 0,   // headline metric now
-    total_visits:     visits,
-    closing_rate:     visits ? Math.round((purRow.buyers / visits) * 100) : 0,
+    total_visits:     pv.visitors,
+    visit_count:      pv.checkins,
+    bought_of_visitors: pv.bought_of_visitors,
+    closing_rate:     pv.visitors ? Math.round((pv.bought_of_visitors / pv.visitors) * 100) : 0,
     target,                                     // a CONTRACTS target now
     target_month:     curMonth,
     month_revenue:    monthRev,
     month_contracts:  monthCnts,
     percent_achieved: pctAchieved(monthCnts, target),
-    funnel_stages,
-    lead_distribution,
+    funnel,
     branch_demand,
-    branch_visits,
+    branch_visits:    pv.by_branch,
   });
 });
 
@@ -8537,6 +8359,51 @@ app.get('/api/admin/sales-value', requireAuth, requireRole('admin'), (req, res) 
   return res.json({
     from, to, timezone: CAIRO_TZ, currency: 'EGP', approximate: true,
     totals, by_branch: byBranch, by_rep: byRep, by_campaign: byCampaign,
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/admin/ad-funnel?week=YYYY-MM-DD&mode=period|cohort — ADMIN ONLY.
+// «من الإعلان للبيعة» (2026-11-22): one CAIRO week (Saturday → Friday, the one
+// holding `week`; default this week, up to today) per ad source and per
+// branch: كلّموا → سابوا رقم → اختاروا فرع / قالوا جايين → زاروا → اشتروا, the
+// contracts and their value (paid when typed, else the list estimate —
+// «تقريبي»). Each step counts PEOPLE; walk-ins who never chatted are their own
+// row («زيارة مباشرة»), never a campaign. What each step counts, the walk-in
+// marker and the two views are in services/honestNumbers.js:
+//   mode=period (default) — what happened this week, each step by its own day;
+//   mode=cohort           — this week's new chats, and how far they got by today;
+//                           NESTED (r2): a person counts at every step up to the
+//                           furthest he reached, so no step is bigger than the
+//                           one before (`steps_rule: 'reached_or_further'`).
+// `week_sales` is every contract written in the week by its own Cairo day
+// (chat + walk-in), the same in both views — «قيمة البيع في الأسبوع».
+// `previous` is the week before: the SAME days of it while this week is still
+// running (Saturday → the same weekday), else the whole week. Ad spend is not
+// in the CRM yet: there is no cost column here (the page says it comes later).
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/ad-funnel', requireAuth, requireRole('admin'), (req, res) => {
+  const db = getDb();
+  const today = cairoDay();
+  const asked = req.query.week == null || req.query.week === '' ? today : String(req.query.week);
+  if (!honest.isDay(asked)) return res.status(400).json({ error: 'الأسبوع لازم يكون تاريخ YYYY-MM-DD' });
+  const mode = req.query.mode == null || req.query.mode === '' ? 'period' : String(req.query.mode);
+  if (!['period', 'cohort'].includes(mode)) return res.status(400).json({ error: 'mode لازم يكون period أو cohort' });
+  const wk = honest.weekOf(asked);
+  if (wk.from > today) return res.status(400).json({ error: 'الأسبوع ده لسه مجاش' });
+  const running = wk.to >= today;
+  const to = running ? today : wk.to;
+  const prev = { from: honest.addDays(wk.from, -7), to: honest.addDays(to, -7) };
+  const current = honest.weekly(db, { from: wk.from, to, mode });
+  const before  = honest.weekly(db, { from: prev.from, to: prev.to, mode });
+  res.set('Cache-Control', 'private, no-store');
+  return res.json({
+    timezone: CAIRO_TZ, mode, currency: 'EGP',
+    week: { from: wk.from, to: wk.to, counted_to: to, running },
+    previous: { from: prev.from, to: prev.to, same_days: running,
+                chat_totals: before.chat_totals, walkin_totals: before.walkin_totals, week_sales: before.week_sales },
+    ...current,
+    cost: null,      // ad spend is not connected yet
   });
 });
 
