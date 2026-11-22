@@ -226,7 +226,8 @@ function configureStore(store) {
 // The public view of a staff body: hidden models out, no sales notes.
 function publicOf(body) {
   return { ...body, scope: 'public',
-    models: body.models.filter(m => isObj(m) && m.is_public !== false).map(({ sales_note, ...m }) => m) };
+    models: body.models.filter(m => isObj(m) && m.is_public !== false)
+      .map(({ sales_note, ...m }) => ({ ...m, pieces: (m.pieces || []).filter(p => isObj(p) && p.available !== false) })) };
 }
 // Is the copy shown as staff? Only with a secret set, the current secret
 // accepted (staffOk) and not refused since.

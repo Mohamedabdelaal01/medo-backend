@@ -4761,8 +4761,8 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
     let priority  = r.total_score;
 
     // He said he comes today / tomorrow — call him before he walks in.
-    if (r.planned_when === 'today')    { priority += 60; reasons.push('قال جاي النهارده 🏬'); }
-    if (r.planned_when === 'tomorrow') { priority += 40; reasons.push('قال جاي بكره 🏬'); }
+    if (r.planned_when === 'today')    { priority += 60; reasons.push('قال جاي النهارده'); }
+    if (r.planned_when === 'tomorrow') { priority += 40; reasons.push('قال جاي بكره'); }
 
     // Recency — reuse the same tiers as the dashboard priority engine.
     const rec = computeRecencyBonus(r.last_activity);
@@ -4778,7 +4778,7 @@ app.get('/api/sales/queue', requireAuth, authorizeRoles('sales'), (req, res) => 
     }
 
     // A due/overdue task for this customer merges into the queue.
-    if (r.task_due) { priority += 40; reasons.push('عندك مهمة مستحقة معاه 📌'); }
+    if (r.task_due) { priority += 40; reasons.push('عندك مهمة مستحقة معاه'); }
 
     // Stale cold lead — don't let it crowd out fresh ones.
     if (r.assigned_at) {
@@ -5431,7 +5431,7 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
 
   // Every purchase → macro alert for the admin war-room.
   createNotification(db, 'admin', 'new_purchase',
-    `🎉 تم إغلاق تعاقد جديد (عقد: ${contractNumber || '—'}) بقيمة ` +
+    `تم إغلاق تعاقد جديد (عقد: ${contractNumber || '—'}) بقيمة ` +
     `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
     `${rep || '؟'} في فرع ${branch || '—'}` +
     (viaReception ? ` — اتسجّل من الاستقبال بواسطة ${req.user?.name || '؟'}`
