@@ -13,10 +13,24 @@
 
 const { getDb } = require('../db');
 const { createPhoneMasker } = require('./phoneMask');
+const { blockInDemo } = require('./outbound');
 
 const DEFAULT_BASE_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
 const DEFAULT_MODEL    = 'glm-4.7-flash'; // free tier on z.ai
 const TIMEOUT_MS       = 45000; // thinking is enabled by default — verified up to ~17s for a short reply
+
+// zai_base_url may only point at z.ai's or BigModel's (Zhipu's) own API: the
+// prompt (lead names, typed messages — phones masked) and the z.ai key are
+// sent there, so an admin typo or a planted value must not redirect them
+// (phase 0 r2). Matched on the parsed URL's origin: https, that exact host,
+// default port, no user:password.
+const ALLOWED_AI_ORIGINS = ['https://api.z.ai', 'https://open.bigmodel.cn'];
+function isAllowedAiBaseUrl(raw) {
+  let u;
+  try { u = new URL(String(raw || '').trim()); } catch (_) { return false; }
+  if (u.username || u.password) return false;
+  return ALLOWED_AI_ORIGINS.includes(u.origin);
+}
 
 function getAiConfig() {
   let key = null, model = DEFAULT_MODEL, baseUrl = DEFAULT_BASE_URL;
@@ -27,7 +41,10 @@ function getAiConfig() {
     const m = Object.fromEntries(rows.map(r => [r.key, (r.value || '').trim()]));
     key     = m.zai_api_key   || null;
     model   = m.zai_model     || DEFAULT_MODEL;
-    baseUrl = m.zai_base_url  || DEFAULT_BASE_URL;
+    baseUrl = m.zai_base_url && isAllowedAiBaseUrl(m.zai_base_url) ? m.zai_base_url : DEFAULT_BASE_URL;
+    if (m.zai_base_url && baseUrl === DEFAULT_BASE_URL && m.zai_base_url !== DEFAULT_BASE_URL) {
+      console.warn('[ai] zai_base_url is not z.ai / bigmodel.cn — using the default');
+    }
   } catch (_) { /* settings unreadable → treated as unconfigured */ }
   return { key, model, baseUrl, configured: !!key };
 }
@@ -52,6 +69,11 @@ function getAiConfig() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function callAi(messages, opts = {}) {
+  // Phase 0: a demo_ session never reaches the AI provider (its DB is a clone
+  // of production — names and typed messages would leave with the prompt).
+  if (blockInDemo('ai')) {
+    return { ok: false, unconfigured: true, error: 'وضع التدريب: الذكاء الاصطناعي مقفول هنا' };
+  }
   const { key, model, baseUrl, configured } = getAiConfig();
   if (!configured) {
     return { ok: false, unconfigured: true,
@@ -89,6 +111,9 @@ async function callAi(messages, opts = {}) {
           'Authorization': `Bearer ${key}`,
         },
         body: JSON.stringify(body),
+        // Phase 0 r3: never follow a redirect — the key and the prompt go to
+        // the allow-listed host only, not wherever it points us.
+        redirect: 'error',
         signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
       });
       if (!res.ok) {
@@ -132,4 +157,4 @@ function extractJson(text) {
   try { return JSON.parse(cleaned.slice(start, end + 1)); } catch (_) { return null; }
 }
 
-module.exports = { callAi, getAiConfig, extractJson };
+module.exports = { callAi, getAiConfig, extractJson, isAllowedAiBaseUrl, ALLOWED_AI_ORIGINS };

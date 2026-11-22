@@ -2,6 +2,7 @@
 const { getDb } = require('../db');
 const counters = require('../services/healthCounters');
 const { parseWithOffset } = require('./time');
+const { blockInDemo } = require('../services/outbound');
 
 // getInfo must answer well inside the portal's 10 s request timeout, with
 // sendFlow after it (review r2).
@@ -32,6 +33,9 @@ async function apiCall(endpoint, payload) {
   return count(endpoint, await apiPost(endpoint, payload));
 }
 async function apiPost(endpoint, payload) {
+  // Phase 0 backstop: getManyChatClient() already hands a demo session the
+  // demo client; this refuses even if the real client is reached directly.
+  if (blockInDemo('manychat.post')) return { ok: false, data: null, error: 'demo' };
   const apiKey = getApiKey();
   if (!apiKey) {
     console.warn(`[ManyChat] ⚠️ Missing API Key — skipping ${endpoint} (no message sent)`);
@@ -88,6 +92,7 @@ async function apiGet(endpoint, query, timeoutMs = 10000) {
   return count(endpoint, await apiGetRaw(endpoint, query, timeoutMs));
 }
 async function apiGetRaw(endpoint, query, timeoutMs = 10000) {
+  if (blockInDemo('manychat.get')) return { ok: false, data: null, error: 'demo' };
   const apiKey = getApiKey();
   if (!apiKey) {
     console.warn(`[ManyChat] ⚠️ Missing API Key — skipping ${endpoint}`);

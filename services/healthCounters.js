@@ -32,7 +32,15 @@ const state = {
   lead_rule: { skipped_other_profile: 0 },
   branch_repeats: 0,
   rate_limited: {},                      // type → n
+  // Phase 0 — hits since boot on the features the overhaul plan marks
+  // «نتأكد الأول» (check use before removing): key → { n, by_role }, live
+  // sessions only (a demo_ session's hits go to `demo`). Roles only, no names.
+  usage: {},
 };
+const USAGE_KEYS = new Set([
+  'rep_dashboard', 'ai_pages', 'ai_brief', 'ai_sql', 'mcp', 'mcp_tool',
+  'analytics_campaigns', 'analytics_advanced', 'catalog_read', 'catalog_write',
+]);
 
 function countTestEvent(type, phonePresent) {
   const key = KNOWN_EVENT_TYPES.has(type) ? type : 'other';
@@ -63,10 +71,19 @@ function countRateLimited(type) {
   state.rate_limited[key] = (state.rate_limited[key] || 0) + 1;
 }
 
+function countUsage(key, role, demo = false) {
+  if (!USAGE_KEYS.has(key)) return;
+  const row = state.usage[key] || (state.usage[key] = { n: 0, demo: 0, by_role: {} });
+  if (demo) { row.demo++; return; }
+  row.n++;
+  const r = ['admin', 'branch_manager', 'sales', 'rep', 'reception', 'mcp'].includes(role) ? role : 'other';
+  row.by_role[r] = (row.by_role[r] || 0) + 1;
+}
+
 function snapshot() {
   return JSON.parse(JSON.stringify(state));
 }
 
 module.exports = {
-  countTestEvent, countManyChatApi, countWindowSkip, countLeadSkipped, countBranchRepeat, countRateLimited, snapshot,
+  countTestEvent, countManyChatApi, countWindowSkip, countLeadSkipped, countBranchRepeat, countRateLimited, countUsage, snapshot,
 };

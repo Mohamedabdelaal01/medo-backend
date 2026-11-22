@@ -6,10 +6,11 @@
  * db.js and does not touch any frontend code. It opens its OWN connection to
  * the production database.
  *
- * MODE: READ / WRITE — the AI can read AND modify data (bulk fixes on legacy
- * records). Guardrails: execute_write_sql accepts only DML (INSERT/UPDATE/
- * DELETE/REPLACE) and blocks schema-destroying DDL (DROP/ALTER/TRUNCATE).
- * Every write is logged to stderr as an audit trail.
+ * MODE: READ ONLY since phase 0 (2026-11-22). The DB is opened readonly +
+ * PRAGMA query_only; run_select_sql goes through services/sqlGuard.js (a table
+ * allowlist checked on SQLite's compiled program: settings, the audit log,
+ * sqlite_master and users.password_hash are refused); execute_write_sql
+ * answers that it is off and runs nothing (removal: the owner's call).
  *
  * Transport: stdio (for Claude Desktop). NOTE: stdout is reserved for the
  * JSON-RPC protocol — this file only ever logs to stderr.
@@ -19,13 +20,14 @@ const Database = require('better-sqlite3');
 const { z }    = require('zod');
 const { McpServer }            = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const sqlGuard = require('./services/sqlGuard');
 
-// ── DB connection — standard READ / WRITE ────────────────────────────────────
+// ── DB connection — READ ONLY (phase 0) ──────────────────────────────────────
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grand_furniture.db');
 let db;
 try {
-  db = new Database(DB_PATH, { fileMustExist: true });
-  db.pragma('journal_mode = WAL'); // safe alongside the running app server
+  db = new Database(DB_PATH, { fileMustExist: true, readonly: true });
+  db.pragma('query_only = ON');
 } catch (e) {
   console.error(`[mcp] failed to open DB at ${DB_PATH}: ${e.message}`);
   process.exit(1);
@@ -103,7 +105,7 @@ server.registerTool(
   {
     description:
       'قائمة العملاء (id, name, phone, class) — للفلترة بالمندوب المسؤول أو ' +
-      'بتصنيف العميل. استخدمها لتحديد السجلات قبل تعديلها بأداة الكتابة.',
+      'بتصنيف العميل.',
     inputSchema: {
       assigned_rep: z.string().optional().describe('فلترة بالمندوب المسؤول'),
       lead_class:   z.string().optional().describe("تصنيف العميل: cold / warm / hot / visited / purchased"),
@@ -141,51 +143,25 @@ server.registerTool(
   },
   async ({ sql_query }) => {
     try {
-      const q = String(sql_query || '').trim();
-      if (!/^select\b/i.test(q)) {
-        return fail('هذه الأداة للقراءة فقط — يجب أن يبدأ الاستعلام بكلمة SELECT.');
-      }
-      const rows = db.prepare(q).all();
-      return ok({ row_count: rows.length, rows: rows.slice(0, 500) });
+      const r = sqlGuard.runGuardedSelect(db, sql_query, 500);
+      if (r.error) return fail(r.error);
+      return ok(r);
     } catch (e) {
       return fail(e.message);
     }
   }
 );
 
-// Tool D — write SQL (INSERT / UPDATE / DELETE) ───────────────────────────────
+// Tool D — write SQL: OFF (phase 0) ───────────────────────────────────────────
 server.registerTool(
   'execute_write_sql',
   {
-    description:
-      'Use this to perform UPDATE, DELETE, or INSERT operations to fix or ' +
-      'modify data. WARNING: Always double-check the WHERE clause before ' +
-      'executing to avoid mass data corruption.',
+    description: 'مقفولة: الكتابة على قاعدة البيانات من MCP متوقفة (المرحلة 0). اعمل التعديل من السيستم نفسه.',
     inputSchema: {
-      sql_query: z.string().describe('استعلام INSERT أو UPDATE أو DELETE'),
+      sql_query: z.string().describe('غير مستخدم — الأداة مقفولة'),
     },
   },
-  async ({ sql_query }) => {
-    try {
-      const q = String(sql_query || '').trim();
-      // Must be a data-modification statement.
-      if (!/^(insert|update|delete|replace)\b/i.test(q)) {
-        return fail('هذه الأداة لعمليات INSERT / UPDATE / DELETE فقط.');
-      }
-      // Guardrail — block schema-destroying DDL even inside a write tool.
-      if (/\b(drop|alter|truncate|attach|detach|vacuum)\b/i.test(q)) {
-        return fail('أوامر تعديل الهيكل (DROP/ALTER/TRUNCATE...) غير مسموح بها.');
-      }
-      const info = db.prepare(q).run();
-      console.error(`[mcp][WRITE] rows_affected=${info.changes} :: ${q}`);
-      return ok({
-        rows_affected: info.changes,
-        last_insert_rowid: info.lastInsertRowid,
-      });
-    } catch (e) {
-      return fail(e.message);
-    }
-  }
+  async () => fail('أداة الكتابة مقفولة (المرحلة 0 — الحماية). مفيش أي تعديل اتعمل.')
 );
 
 // ── Start ────────────────────────────────────────────────────────────────────
@@ -193,7 +169,7 @@ server.registerTool(
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error('✅ grand-furniture-crm MCP server running (READ/WRITE) — DB:', DB_PATH);
+    console.error('✅ grand-furniture-crm MCP server running (READ ONLY) — DB:', DB_PATH);
   } catch (e) {
     console.error('[mcp] failed to start:', e.message);
     process.exit(1);

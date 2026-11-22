@@ -8,21 +8,35 @@ const cors     = require('cors');
 const crypto   = require('crypto'); // built-in — no install needed
 const fs       = require('fs');
 const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
-const { getDb, getLiveDb, getDemoDb, wipeDemoDb, cloneLiveToDemo, DEMO_DB_PATH } = require('./db');
+const { getDb, getLiveDb,
+        DB_PATH, isDemoContext, getDbContextName, getReadonlyDb, removeDemoDbAtBoot } = require('./db');
+// Version marker — bumped on every meaningful release so the admin (and our
+// deploy checks, GET /health) can confirm production runs the latest code.
+// Declared here (not next to /health) because the boot backup below names its
+// pre-migration copy after it.
+const BUILD_VERSION = '2026-11-22-phase0-security-r4';
+// Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
+// each version) + the day's copy — /data/backups, see services/backup.js.
+const backup = require('./services/backup');
+backup.bootBackup({ dbPath: DB_PATH, version: BUILD_VERSION });
+// Phase 0: no outgoing call from a demo_ session (fetch backstop installed on require).
+const outbound = require('./services/outbound');
+const sqlGuard = require('./services/sqlGuard');
+const secrets  = require('./services/secrets');
 const { processScore, getScoringConfig, computeDecayedScore, classifyLead, DEFAULT_SCORE_MAP, ONCE_PER_USER_EVENTS } = require('./scoring');
 const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./services/scheduler');
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
 const { sendMetaEvent, bulkSyncHistoricalLeads, leadEventId } = require('./services/metaCapi');
-const { callAi, getAiConfig, extractJson } = require('./services/ai');
+const { callAi, getAiConfig, extractJson, isAllowedAiBaseUrl } = require('./services/ai');
 const { getManyChatClient }= require('./manychat/client');
 const counters             = require('./services/healthCounters');
 const { guardedSendFlow, SKIP_MESSAGES_AR } = require('./services/windowGuard');
 const { createPhoneMasker } = require('./services/phoneMask');
 const visitIntent           = require('./services/visitIntent');
-const { requireAuth, requireRole, authorizeRoles, getJwtSecret } = require('./middleware/auth');
+const { requireAuth, requireRole, authorizeRoles, signSessionToken,
+        rotateJwtSecretOnce, jwtRotated, ROTATED_FLAG } = require('./middleware/auth');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -203,23 +217,48 @@ function sqlUtcToDate(s) {
 function cairoHHMM(d) { const p = cairoParts(d); return `${p.hour}:${p.minute}`; }
 
 // ── Auto-assignment ───────────────────────────────────────────────────────────
-// Assigns an unassigned lead to the rep with the FEWEST active leads
-// (active = not purchased/converted). Returns the rep name or null.
+// Assigns an unassigned lead to the SALES user of the lead's OWN branch
+// (lead_profiles.preferred_branch) with the FEWEST active leads (active = not
+// purchased/converted). A lead with no branch is not auto-assigned — the
+// branch manager assigns it. Returns the name or null.
+// Phase 0 (2026-11-22): it used to pick the least-loaded 'sales' OR 'rep'
+// user company-wide, so a salesperson's list filled with other branches'
+// customers. Rollback without a redeploy: settings auto_assign_scope =
+// 'company' (the old pick). settings auto_assign_enabled still turns it off.
 // Safe & best-effort: never throws into the webhook path.
-function autoAssignLead(db, userId, leadName) {
+function autoAssignLead(db, userId, leadName, branchHint = null) {
   try {
-    const pick = db.prepare(`
-      SELECT u.name AS rep,
-        (SELECT COUNT(*) FROM lead_profiles lp
-           WHERE lp.assigned_rep = u.name
-             AND lp.lead_class NOT IN ('purchased','converted')) AS load
-      FROM users u
-      WHERE u.role IN ('sales', 'rep') AND u.active = 1
-      ORDER BY load ASC, u.name ASC
-      LIMIT 1
-    `).get();
+    const scope = getSetting('auto_assign_scope', 'branch');
+    let pick;
+    if (scope === 'company') {
+      pick = db.prepare(`
+        SELECT u.name AS rep,
+          (SELECT COUNT(*) FROM lead_profiles lp
+             WHERE lp.assigned_rep = u.name
+               AND lp.lead_class NOT IN ('purchased','converted')) AS load
+        FROM users u
+        WHERE u.role IN ('sales', 'rep') AND u.active = 1
+        ORDER BY load ASC, u.name ASC
+        LIMIT 1
+      `).get();
+    } else {
+      const row = db.prepare(`SELECT preferred_branch FROM lead_profiles WHERE user_id = ?`).get(userId);
+      const branch = String((row && row.preferred_branch) || branchHint || '').trim();
+      if (!branch || branch.toLowerCase() === 'all_branches') return null;   // no branch → the manager assigns
+      pick = db.prepare(`
+        SELECT u.name AS rep,
+          (SELECT COUNT(*) FROM lead_profiles lp
+             WHERE lp.assigned_rep = u.name
+               AND lp.lead_class NOT IN ('purchased','converted')) AS load
+        FROM users u
+        WHERE u.role = 'sales' AND u.active = 1
+          AND LOWER(TRIM(COALESCE(u.branch, ''))) = LOWER(?)
+        ORDER BY load ASC, u.name ASC
+        LIMIT 1
+      `).get(branch);
+    }
 
-    if (!pick || !pick.rep) return null; // no reps exist yet
+    if (!pick || !pick.rep) return null; // nobody to assign to in that branch
 
     db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
       .run(pick.rep, userId);
@@ -297,6 +336,34 @@ const LOG_REQUESTS = process.env.LOG_REQUESTS === '1' || process.env.NODE_ENV !=
 app.use((req, res, next) => {
   if (LOG_REQUESTS && req.path !== '/health') {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  }
+  next();
+});
+
+// ── Usage counters (phase 0) ─────────────────────────────────────────────────
+// Since boot, counts only (roles, never names or ids), on /health «usage»: the
+// features the overhaul plan wants measured before removing them. Counted when
+// the response finishes, so req.user (set by requireAuth) tells the role and
+// whether it was a demo_ session. The rep dashboard and the AI SQL / MCP tools
+// count themselves (role-scoped inside their routes).
+const USAGE_ROUTES = [
+  ['ai_pages',            (m, p) => p.startsWith('/api/admin/ai/')],
+  ['ai_brief',            (m, p) => /^\/api\/sales\/customers\/[^/]+\/ai-brief$/.test(p)],
+  ['mcp',                 (m, p) => p.startsWith('/api/mcp/')],
+  ['analytics_campaigns', (m, p) => p === '/api/analytics'],
+  ['analytics_advanced',  (m, p) => p === '/api/analytics/advanced'],
+  ['catalog_read',        (m, p) => m === 'GET' && (p === '/api/products' || p.startsWith('/api/products/'))],
+  ['catalog_write',       (m, p) => m !== 'GET' && (p === '/api/products' || p.startsWith('/api/products/'))],
+];
+app.use((req, res, next) => {
+  const hit = USAGE_ROUTES.find(([, test]) => test(req.method, req.path));
+  if (hit) {
+    res.on('finish', () => {
+      // Counted when the route answered (a refused login / role / unknown id is not use).
+      if ([401, 403, 404].includes(res.statusCode)) return;
+      const role = hit[0] === 'mcp' ? 'mcp' : req.user?.role;
+      counters.countUsage(hit[0], role, req.user?.ctx === 'demo');   // the signed claim (phase 0 r2), not the name
+    });
   }
   next();
 });
@@ -470,9 +537,13 @@ app.post('/api/auth/login', (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password required' });
   }
-  // demo_ accounts authenticate against the sandbox DB; everyone else live.
-  const isDemo = typeof email === 'string' && email.trim().toLowerCase().startsWith('demo_');
-  const db   = isDemo ? getDemoDb() : getLiveDb();
+  // Phase 0 r4: the demo sandbox («وضع التدريب») is removed (owner,
+  // 2026-11-22). A demo_ login used to open the sandbox DB; now it is 401 with
+  // a plain message, and nothing ever opens that DB again (db.js).
+  if (typeof email === 'string' && email.trim().toLowerCase().startsWith('demo_')) {
+    return res.status(401).json({ error: 'وضع التدريب اتشال — الحسابات التجريبية مبقتش شغالة. ادخل بحسابك العادي', code: 'demo_removed' });
+  }
+  const db   = getLiveDb();
   const user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(email);
 
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -487,7 +558,9 @@ app.post('/api/auth/login', (req, res) => {
     id: user.id, name: user.name, email: user.email,
     role: user.role, branch: user.branch || null,
   };
-  const token   = jwt.sign(payload, getJwtSecret(), { expiresIn: '7d' });
+  // The signed claims: ctx 'live' (the only DB now) and tv = the row's
+  // token_version — requireAuth compares it on every request (phase 0 r4).
+  const token   = signSessionToken({ ...payload, tv: Number(user.token_version) || 0 }, 'live');
   return res.json({ token, user: payload });
 });
 
@@ -1016,12 +1089,19 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
   const becameQualified =
     ['warm', 'hot'].includes(newLeadClass) &&
     ['cold', '', null, undefined].includes(profile.lead_class);
+  // Phase 0 r2: …and once when a warm/hot lead with no rep FIRST gets a branch
+  // (it qualified before naming one, so the pick above found no branch and
+  // left it for the manager). Same branch-scoped pick, with this branch.
+  const firstBranch =
+    ['warm', 'hot'].includes(newLeadClass) &&
+    !profile.preferred_branch &&
+    !!detectedBranch;
   if (
-    becameQualified &&
+    (becameQualified || firstBranch) &&
     !profile.assigned_rep &&
     getSetting('auto_assign_enabled', 'true') === 'true'
   ) {
-    autoAssignLead(db, user_id, first_name);
+    autoAssignLead(db, user_id, first_name, detectedBranch);
   }
 
   // Alert on transition into visited (new) or legacy converted
@@ -1059,18 +1139,68 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 // Returns all stats needed for the dashboard
 // ════════════════════════════════════════════════════════════════════════════
 // ── Dashboard Cache ────────────────────────────────────────────────────────
-const dashboardCache = {
-  data: null,
-  timestamp: 0,
-  ttl: 15 * 1000 // 15 seconds
-};
+// Phase 0: one entry per DB context × scope («live|admin», «demo|rep», …), so
+// a demo_ session is never served the live numbers or the reverse. Who gets
+// what (read from the portal: only AdminDashboardView and
+// SalesRepDashboardView call it):
+//   admin → everything (company-wide numbers);
+//   rep   → recent_hot_leads only (the one field SalesRepDashboardView reads),
+//           the same top-10 list reps get today;
+//   anyone else → 403 (no portal page of theirs calls it; branch managers
+//           have /api/branch/overview).
+const DASHBOARD_TTL_MS = 15 * 1000;
+const dashboardCache = new Map();           // `${ctx}|${scope}` → { data, timestamp }
+// Ids of the hot leads served to each rep in the last 30 minutes, per context
+// and per REP (phase 0 r4: keyed by the rep's user id — one rep loading the
+// dashboard no longer opens those leads for every other rep). A rep may OPEN
+// those (GET /api/leads/:user_id, read routes) as their page does today; a
+// write (task, sale, sent flow, revisit note) needs the lead to be his
+// (canActOnLead) — the served grant is read-only.
+const repServedLeads = { live: new Map(), demo: new Map() };   // rep id → Map(user_id → last served ms)
+const REP_SERVED_MS = 30 * 60 * 1000;
+function dashboardScope(user) {
+  if (user?.role === 'admin') return 'admin';
+  if (user?.role === 'rep') return 'rep';
+  return null;
+}
+function rememberRepServed(ctx, repId, leads) {
+  if (repId == null) return;
+  const byRep = repServedLeads[ctx]; const now = Date.now();
+  const key = String(repId);
+  if (!byRep.has(key)) byRep.set(key, new Map());
+  const m = byRep.get(key);
+  for (const l of leads || []) if (l && l.user_id) m.set(l.user_id, now);
+  for (const [rid, mm] of byRep) {
+    for (const [id, t] of mm) if (now - t > REP_SERVED_MS) mm.delete(id);
+    if (!mm.size) byRep.delete(rid);
+  }
+}
+function repWasServed(ctx, repId, userId) {
+  if (repId == null) return false;
+  const m = repServedLeads[ctx].get(String(repId));
+  const t = m && m.get(userId);
+  return t != null && Date.now() - t <= REP_SERVED_MS;
+}
 
 app.get('/api/dashboard', requireAuth, (req, res) => {
-  if (dashboardCache.data && (Date.now() - dashboardCache.timestamp < dashboardCache.ttl)) {
-    return res.json(dashboardCache.data);
+  const scope = dashboardScope(req.user);
+  if (!scope) return res.status(403).json({ error: 'Forbidden' });
+  const ctx = getDbContextName();
+  if (scope === 'rep' && ctx === 'live') counters.countUsage('rep_dashboard', req.user.role);
+  const key = `${ctx}|${scope}`;
+  const hit = dashboardCache.get(key);
+  if (hit && (Date.now() - hit.timestamp < DASHBOARD_TTL_MS)) {
+    if (scope === 'rep') rememberRepServed(ctx, req.user.id, hit.data.recent_hot_leads);
+    return res.json(hit.data);
   }
+  const full = computeDashboard(getDb());
+  const data = scope === 'admin' ? full : { recent_hot_leads: full.recent_hot_leads };
+  dashboardCache.set(key, { data, timestamp: Date.now() });
+  if (scope === 'rep') rememberRepServed(ctx, req.user.id, data.recent_hot_leads);
+  return res.json(data);
+});
 
-  const db = getDb();
+function computeDashboard(db) {
 
   // Lead class distribution
   const leadCounts = db.prepare(`
@@ -1288,11 +1418,8 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     product_gap:           productGap,
   };
 
-  dashboardCache.data = responseData;
-  dashboardCache.timestamp = Date.now();
-
-  return res.json(responseData);
-});
+  return responseData;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/leads — List leads with filters
@@ -1472,6 +1599,10 @@ app.post('/api/tasks', requireAuth, (req, res) => {
   const db = getDb();
   const lead = db.prepare(`SELECT first_name FROM lead_profiles WHERE user_id = ?`).get(lead_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  // Phase 0 r3: a task makes the lead «his» (leadIsMine) — only for a lead he
+  // may already open, so a task is never a way in. r4: a rep's dashboard
+  // grant is read-only (canActOnLead).
+  if (!canActOnLead(db, req.user, lead_id)) return res.status(404).json({ error: 'lead_not_found' });
 
   const repName = req.user?.name || 'مندوب';
   const info = db.prepare(`
@@ -1534,12 +1665,103 @@ app.delete('/api/tasks/:id', requireAuth, (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/leads/:user_id — Single lead profile + event history
 // ════════════════════════════════════════════════════════════════════════════
+// ── Who may open one customer's profile (phase 0) ───────────────────────────
+//   admin     → every customer;
+//   reception → as before (the branch trim below still applies);
+//   branch_manager (branch B) → the customer is tied to B: preferred branch,
+//               a branch pick / location ask / event in B, a visit or arrival in
+//               B, a follow-up row or call in B, a purchase in B, or assigned
+//               to a staff member of B;
+//   sales (name N, branch B) → tied to B as above, or his: assigned_rep = N,
+//               the pre-visit follow-up assigned to N, a visit / call / sale /
+//               post-visit follow-up / task / sent flow by N;
+//   rep (name N) → his (as sales, no branch), or one of the hot leads the rep
+//               dashboard served in the last 30 minutes (what that page lists
+//               and opens today);
+//   anyone else → no.
+// Out of scope answers 404 — the same as an unknown id, so ids can't be probed.
+// Phase 0 r3: every tie below that a staff member can write (a task, a sent
+// flow, a follow-up / assignment row, a purchase, a revisit note) is written
+// only by a route that checks canSeeLead (or, for a branch manager's
+// follow-up / assignment, leadOwnBranchTie) first — so a tie is never a way
+// in. A branch manager's follow-up row is stamped with his own name.
+function leadTiedToBranch(db, userId, branch) {
+  if (!branch) return false;
+  return !!db.prepare(`
+    SELECT 1 WHERE
+         EXISTS (SELECT 1 FROM lead_profiles WHERE user_id = @u AND preferred_branch = @b)
+      OR EXISTS (SELECT 1 FROM events WHERE user_id = @u AND (branch = @b
+                   OR (event_type IN ('branch_selected','location_request') AND event_value = @b)))
+      OR EXISTS (SELECT 1 FROM lead_visits WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM visit_checkins WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM branch_customer_followups WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM followup_log WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM purchases WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM lead_profiles lp JOIN users su ON su.name = lp.assigned_rep
+                 WHERE lp.user_id = @u AND su.branch = @b)
+  `).get({ u: userId, b: branch });
+}
+// A lead's OWN tie to branch B (phase 0 r3) — what the customer did, or a
+// visit / sale recorded there; never a tie a staff member writes himself
+// (an assignment, a follow-up row, a task). A branch manager may create a
+// follow-up / assignment only for such a lead (PATCH …/followup, …/assign,
+// bulk-reassign's new ids), so the ties those rows give stay earned.
+function leadOwnBranchTie(db, userId, branch) {
+  if (!branch) return false;
+  return !!db.prepare(`
+    SELECT 1 WHERE
+         EXISTS (SELECT 1 FROM lead_profiles WHERE user_id = @u AND preferred_branch = @b)
+      OR EXISTS (SELECT 1 FROM events WHERE user_id = @u AND event_type = 'branch_selected'
+                   AND (event_value = @b OR branch = @b))
+      OR EXISTS (SELECT 1 FROM lead_visits WHERE user_id = @u AND branch = @b)
+      OR EXISTS (SELECT 1 FROM purchases WHERE user_id = @u AND branch = @b)
+  `).get({ u: userId, b: branch });
+}
+// A customer the branch lists may have a branch_selected event and no profile
+// row yet (GET /api/branch/customers shows those too) — known = either.
+function branchCustomerKnown(db, userId) {
+  return !!db.prepare(`SELECT 1 WHERE EXISTS (SELECT 1 FROM lead_profiles WHERE user_id = @u)
+                                    OR EXISTS (SELECT 1 FROM events WHERE user_id = @u)`).get({ u: userId });
+}
+function leadIsMine(db, userId, name) {
+  if (!name) return false;
+  return !!db.prepare(`
+    SELECT 1 WHERE
+         EXISTS (SELECT 1 FROM lead_profiles WHERE user_id = @u AND assigned_rep = @n)
+      OR EXISTS (SELECT 1 FROM branch_customer_followups WHERE user_id = @u AND TRIM(assigned_sales) = TRIM(@n))
+      OR EXISTS (SELECT 1 FROM lead_visits WHERE user_id = @u AND (TRIM(sales_rep) = TRIM(@n) OR pre_visit_rep = @n))
+      OR EXISTS (SELECT 1 FROM followup_log WHERE user_id = @u AND sales = @n)
+      OR EXISTS (SELECT 1 FROM purchases WHERE user_id = @u AND TRIM(rep) = TRIM(@n))
+      OR EXISTS (SELECT 1 FROM revisit_followups WHERE user_id = @u AND followed_up_by = @n)
+      OR EXISTS (SELECT 1 FROM tasks WHERE lead_id = @u AND rep_name = @n)
+      OR EXISTS (SELECT 1 FROM messages_sent WHERE user_id = @u AND sent_by_rep = @n)
+  `).get({ u: userId, n: name });
+}
+function canSeeLead(db, user, userId) {
+  const role = user?.role;
+  if (role === 'admin' || role === 'reception') return true;
+  if (role === 'branch_manager') return leadTiedToBranch(db, userId, user.branch || null);
+  if (role === 'sales') return leadIsMine(db, userId, user.name) || leadTiedToBranch(db, userId, user.branch || null);
+  if (role === 'rep') return leadIsMine(db, userId, user.name) || repWasServed(getDbContextName(), user.id, userId);
+  return false;
+}
+// What a WRITE that ties the lead to the writer needs (phase 0 r4): the same
+// as canSeeLead, except a rep's 30-minute «served on my dashboard» grant —
+// read-only — doesn't count. A rep's task / sale / sent flow / revisit note
+// is only for a lead that is already his (leadIsMine), so opening the
+// dashboard can never be turned into permanent ownership.
+function canActOnLead(db, user, userId) {
+  if (user?.role === 'rep') return leadIsMine(db, userId, user.name);
+  return canSeeLead(db, user, userId);
+}
+
 app.get('/api/leads/:user_id', requireAuth, (req, res) => {
   const db = getDb();
   const { user_id } = req.params;
 
   const profile = db.prepare(`SELECT * FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!profile) return res.status(404).json({ error: 'Lead not found' });
+  if (!canSeeLead(db, req.user, user_id)) return res.status(404).json({ error: 'Lead not found' });
 
   let history = db.prepare(`
     SELECT event_type, event_value, category, product_id, branch, score_delta, created_at
@@ -1649,6 +1871,22 @@ function todayCheckin(db, userId, branch) {
   return db.prepare(
     `SELECT * FROM visit_checkins WHERE user_id = ? AND branch = ? AND visit_day = ?`
   ).get(userId, branch, cairoDay()) || null;
+}
+
+// Phase 0 r4: is the customer on one of THIS branch's reception lists — the
+// «طلبوا عنوان الفرع» list (GET /api/reception/leads: a branch_selected for the
+// branch + a phone) or «جايين النهارده» (GET /api/reception/expected-visits)?
+// A reception manager confirms by id only a customer those lists show him.
+function onReceptionLists(db, userId, branch) {
+  if (!branch) return false;
+  const listed = db.prepare(`
+    SELECT 1 FROM events e JOIN lead_profiles lp ON lp.user_id = e.user_id
+    WHERE e.user_id = ? AND e.event_type = 'branch_selected' AND (e.event_value = ? OR e.branch = ?)
+      AND EXISTS (SELECT 1 FROM lead_phones ph WHERE ph.user_id = e.user_id)
+    LIMIT 1`).get(userId, branch, branch);
+  if (listed) return true;
+  try { return visitIntent.expectedVisits(db, branch).rows.some(r => r.user_id === userId); }
+  catch (_) { return false; }
 }
 
 // lead_visits keeps ONE row per (customer, branch), so its sales_rep may be the
@@ -1780,26 +2018,54 @@ function linkVisitSales(db, { userId, branch, salesRep, operator }) {
   return { preVisitRep, unchanged: false };
 }
 
-app.post('/api/visits/confirm', requireAuth, (req, res) => {
+// Phase 0 r3: not for 'sales' — a visit row ties the lead to the branch
+// (leadTiedToBranch), so a salesperson confirming one would open any customer
+// for himself; reception's desk (reception, admin, the reception managers and
+// the legacy rep dashboard's reception tab) keeps it.
+app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager', 'rep'), (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
   const { phone, visit_code, branch, user_id } = req.body || {};
   const db = getDb();
+  const role = req.user?.role;
+  // Phase 0 r4 — who may look a customer up how:
+  //   reception, admin                → phone, user_id (their lists), visit_code;
+  //   a reception manager (faisal / nasr_city) → phone; user_id / visit_code
+  //       only for a customer on HIS branch's lists (/api/reception/leads,
+  //       «جايين النهارده»), never any id he types;
+  //   rep (the legacy dashboard's desk) → phone only — the number the customer
+  //       standing there gives. No id lookups: an id is not proof he is here.
+  const desk       = actsAsReception(req);            // reception + the reception managers: locked to own branch
+  const managerDesk = desk && role === 'branch_manager';
+  const phoneOnly  = !desk && role !== 'admin';        // rep (any non-reception role)
+  const given = (v) => v != null && String(v).trim() !== '';
+
   // The receptionist explicitly picks the branch they're at — that is the
   // source of truth for WHICH branch was visited (no guessing from intent).
   // A reception account is LOCKED to its own branch (can't confirm for others).
-  const pickedBranch = actsAsReception(req)
-    ? (req.user.branch || null)
-    : ((typeof branch === 'string' && branch.trim()) ? branch.trim() : null);
+  // Anyone else's typed branch must be a configured one (intakeBranch: the 6
+  // codes, their aliases, an active_branches id) — anything else 400, never
+  // stored as a visit (phase 0 r4).
+  let pickedBranch = null;
+  if (desk) pickedBranch = req.user.branch || null;
+  else if (branch != null && !(typeof branch === 'string' && branch.trim() === '')) {
+    pickedBranch = typeof branch === 'string' ? intakeBranch(branch, { db }) : null;
+    if (!pickedBranch) return res.status(400).json({ error: 'invalid_branch', message: 'الفرع ده مش من فروع السيستم — اختار من القايمة' });
+  }
+
+  if (phoneOnly && (given(user_id) || given(visit_code))) {
+    return res.status(400).json({ error: 'phone_only', message: 'أكّد الزيارة برقم تليفون العميل' });
+  }
 
   let lead = null;
-  if (user_id != null && String(user_id).trim() !== '') {
+  let foundByPhone = false;
+  if (given(user_id)) {
     lead = db.prepare(`
       SELECT user_id, first_name, last_name, gender, campaign_source, lead_class,
              visit_confirmed, preferred_branch
       FROM lead_profiles WHERE user_id = ?
     `).get(String(user_id).trim());
     if (!lead) return res.status(404).json({ error: 'lead_not_found' });
-  } else if (phone != null && String(phone).trim() !== '') {
+  } else if (given(phone)) {
     const np = normalizePhone(phone);
     if (!np) return res.status(400).json({ error: 'invalid_phone' });
     // Match against EVERY phone the customer ever gave (lead_phones), not just
@@ -1822,7 +2088,8 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
       `).get(np);
     }
     if (!lead) return res.status(404).json({ error: 'phone_not_found' });
-  } else if (visit_code != null && String(visit_code).trim() !== '') {
+    foundByPhone = true;
+  } else if (given(visit_code)) {
     lead = db.prepare(`
       SELECT user_id, first_name, last_name, gender, campaign_source, lead_class,
              visit_confirmed, preferred_branch
@@ -1831,6 +2098,18 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     if (!lead) return res.status(404).json({ error: 'visit_code_not_found' });
   } else {
     return res.status(400).json({ error: 'phone_required' });
+  }
+
+  // A reception manager's id lookup: only a customer his branch's lists show
+  // (404 like an unknown id, so ids can't be probed).
+  if (managerDesk && !foundByPhone && !onReceptionLists(db, lead.user_id, pickedBranch)) {
+    return res.status(404).json({ error: 'lead_not_found' });
+  }
+  // May this account see the customer's other branches? Decided BEFORE the
+  // confirm writes this branch's visit (a visit row is itself a tie).
+  const canSee = canSeeLead(db, req.user, lead.user_id);
+  if (!desk && role !== 'admin' && !foundByPhone && !canSee) {
+    return res.status(404).json({ error: 'lead_not_found' });
   }
 
   // Global "has visited at least one branch" flag — for scoring/funnel.
@@ -1887,7 +2166,7 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
   // web dataset doesn't surface, so the event kept vanishing from the views.
   // Fire-and-forget; never blocks the reception response.
   // Skipped for demo sessions so training visits never reach the ad dataset.
-  if (!String(req.user?.name || '').startsWith('demo_')) {
+  if (!isDemoContext()) {
     const visitPhone = db.prepare(`
       SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                                  WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
@@ -1919,16 +2198,25 @@ app.post('/api/visits/confirm', requireAuth, (req, res) => {
     : null;
 
   // The showroom rep who served this customer on their most recent prior visit.
-  const lastShowroomRow = db.prepare(`
-    SELECT sales_rep FROM lead_visits
-    WHERE user_id = ? AND sales_rep IS NOT NULL
-    ORDER BY visited_at DESC LIMIT 1
-  `).get(lead.user_id);
+  // Phase 0 r4: an account that may not open the customer (canSee, decided
+  // before this confirm) gets nothing from another branch — no other visits,
+  // no other purchase or its price, no rep of another branch's visit.
+  const lastShowroomRow = canSee
+    ? db.prepare(`
+        SELECT sales_rep FROM lead_visits
+        WHERE user_id = ? AND sales_rep IS NOT NULL
+        ORDER BY visited_at DESC LIMIT 1
+      `).get(lead.user_id)
+    : (visitBranch ? db.prepare(`
+        SELECT sales_rep FROM lead_visits
+        WHERE user_id = ? AND branch = ? AND sales_rep IS NOT NULL
+        ORDER BY visited_at DESC LIMIT 1
+      `).get(lead.user_id, visitBranch) : null);
 
   // Cross-branch heads-up: did this customer already visit / buy in a DIFFERENT
   // branch? If so reception (and the sales rep) should know they're a comparer —
   // it prevents "you stole my customer" fights and helps them tailor the offer.
-  const journey = customerJourney(db, lead.user_id);
+  const journey = canSee ? customerJourney(db, lead.user_id) : { visits: [], purchases: [] };
   const otherVisits   = journey.visits.filter(v => v.branch && v.branch !== visitBranch);
   const otherPurchase = journey.purchases.find(p => p.branch && p.branch !== visitBranch) || null;
 
@@ -1964,6 +2252,9 @@ app.get('/api/customers/:userId/journey', requireAuth,
   const db = getDb();
   const lead = db.prepare(`SELECT first_name FROM lead_profiles WHERE user_id = ?`).get(req.params.userId);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  // Phase 0 r2: the cross-branch detail (who served / bought where) only for
+  // a lead the account may open at all — the same rule as GET /api/leads/:id.
+  if (!canSeeLead(db, req.user, req.params.userId)) return res.status(404).json({ error: 'lead_not_found' });
   return res.json({ first_name: lead.first_name || null, ...customerJourney(db, req.params.userId) });
 });
 
@@ -2052,6 +2343,18 @@ app.post('/api/visits/set-sales', requireAuth, authorizeRoles('reception', 'admi
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
   const db = getDb();
+
+  // Phase 0 r4: an existing customer only (a link used to create a visit row
+  // for any id typed), and — for a reception manager — one who checked in
+  // TODAY at his branch, as POST /api/reception/sales asks: linking a
+  // salesperson writes a visit + follow-up row, which ties the customer to the
+  // branch (leadTiedToBranch), so it is never a way to open someone else's.
+  if (typeof user_id !== 'string' || !db.prepare(`SELECT 1 FROM lead_profiles WHERE user_id = ?`).get(user_id)) {
+    return res.status(404).json({ error: 'lead_not_found' });
+  }
+  if (req.user?.role === 'branch_manager' && !todayCheckin(db, user_id, branch)) {
+    return res.status(409).json({ error: 'العميل ده مش مسجّل إنه وصل الفرع النهارده — أكّد زيارته الأول', code: 'not_checked_in_today' });
+  }
 
   // Only an active salesperson of THIS branch (the names /api/sales/reps
   // offers) — the stored name is the DB's exact one, never the client's string.
@@ -2176,7 +2479,7 @@ app.post('/api/reception/walkin', requireAuth, authorizeRoles('reception', 'admi
   // Web/CRM dataset's surfaced channel (physical_store filed it in the offline
   // bucket, which kept vanishing). Fires for EVERY walk-in; time-based eventId
   // keeps each visit distinct. Skipped for demo sessions.
-  if (!String(req.user?.name || '').startsWith('demo_')) {
+  if (!isDemoContext()) {
     sendMetaEvent('FindLocation',
       { phone: np, firstName: name, branch, externalId: userId },
       `visit_walkin_${userId}_${Date.now()}`);
@@ -3394,6 +3697,14 @@ app.patch('/api/branch/customers/:userId/assign', requireAuth, authorizeRoles('b
 
   const db  = getDb();
 
+  // Phase 0 r3: an assignment ties the lead to the branch and the rep (they
+  // may open it from then on) — so the lead must exist and, for a branch
+  // manager, already have its OWN tie to his branch (leadOwnBranchTie: never
+  // a follow-up / assignment row). Out of scope = 404, like an unknown id.
+  if (!branchCustomerKnown(db, userId) || (role === 'branch_manager' && !leadOwnBranchTie(db, userId, branch))) {
+    return res.status(404).json({ error: 'lead_not_found' });
+  }
+
   // Guard: the chosen rep must actually be an active sales rep IN this branch.
   // Stops a STALE dropdown (e.g. right after a rep swap, when an open page still
   // lists a rep who has since moved to another branch) from writing a wrong
@@ -3499,20 +3810,11 @@ app.patch('/api/branch/customers/bulk-reassign', requireAuth, authorizeRoles('br
   // that's how a crafted user_id list (bypassing both UIs, which only ever
   // send ids already scoped to the branch's own customer list) could plant a
   // customer who never actually engaged with this branch into a rep's queue.
-  // Require the same real membership signal GET /api/branch/customers uses
-  // (a branch_selected event matching this branch) before allowing that.
+  // Require the lead's OWN tie to this branch (leadOwnBranchTie — a
+  // branch_selected event, a visit / sale there, or its preferred branch; the
+  // same test the single-row /assign and /followup use since phase 0 r3).
   const newIds = userIds.filter(uid => !curByUser.has(uid));
-  const validNewIds = new Set();
-  if (newIds.length) {
-    const newPh = newIds.map(() => '?').join(',');
-    for (const r of db.prepare(`
-      SELECT DISTINCT user_id FROM events
-      WHERE event_type = 'branch_selected' AND (event_value = ? OR branch = ?)
-        AND user_id IN (${newPh})
-    `).all(branch, branch, ...newIds)) {
-      validNewIds.add(r.user_id);
-    }
-  }
+  const validNewIds = new Set(newIds.filter(uid => leadOwnBranchTie(db, uid, branch)));
 
   // Moving to the rep they're already with is a no-op.
   const toMove = userIds.filter(uid => {
@@ -3830,12 +4132,21 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, authorizeRoles(
   const { userId } = req.params;
   const { followed_up, followed_up_by, call_summary } = req.body || {};
   const newVal = followed_up ? 1 : 0;
+  // Phase 0 r3: a branch manager's follow-up is stamped with HIS name (the
+  // portal sends it anyway) — a typed name would give that person the lead
+  // (followup_log in leadIsMine). The admin may still name who called.
   const byName = newVal
-    ? (followed_up_by && String(followed_up_by).trim()) || req.user?.name || null
+    ? (role === 'branch_manager' ? req.user?.name || null
+       : (followed_up_by && String(followed_up_by).trim()) || req.user?.name || null)
     : null;
   const summary = newVal ? (call_summary && String(call_summary).trim()) || null : null;
 
   const db = getDb();
+  // Phase 0 r3: same scope as …/assign — the lead exists and, for a branch
+  // manager, has its own tie to his branch; checked before the row is written.
+  if (!branchCustomerKnown(db, userId) || (role === 'branch_manager' && !leadOwnBranchTie(db, userId, branch))) {
+    return res.status(404).json({ error: 'lead_not_found' });
+  }
   db.prepare(`
     INSERT INTO branch_customer_followups
       (branch, user_id, followed_up, followed_up_at, followed_up_by, call_summary)
@@ -4473,10 +4784,11 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
       SELECT 1 FROM branch_customer_followups WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
       UNION SELECT 1 FROM lead_visits WHERE user_id = ? AND TRIM(sales_rep) = TRIM(?)
     `).get(userId, me, userId, me);
-    if (!owns) return res.status(403).json({ error: 'العميل ده مش مسنود ليك' });
+    // Phase 0 r3: out of scope answers 404 — the same as an unknown id.
+    if (!owns) return res.status(404).json({ error: 'العميل مش موجود' });
   } else if (role === 'branch_manager') {
     if (!req.user.branch || !leadInBranch(db, userId, req.user.branch)) {
-      return res.status(403).json({ error: 'العميل ده مش في فرعك' });
+      return res.status(404).json({ error: 'العميل مش موجود' });
     }
   }
 
@@ -4652,25 +4964,24 @@ const ADMIN_SQL_TOOL = {
   },
 };
 
+// Phase 0: the text check is sqlGuard's (one statement, SELECT/WITH, no write
+// keyword); the run goes through sqlGuard.runGuardedSelect on a READ-ONLY
+// connection with a table allowlist checked on SQLite's compiled program —
+// settings, the audit log, sqlite_master and users.password_hash are refused
+// (the rows go to a third-party model). The `db` argument is kept for the
+// callers' shape; the read-only handle of the same context is used.
 function isSafeSelectSql(query) {
-  let q = String(query || '').trim();
-  q = q.replace(/;\s*$/, '');
-  if (!q || q.includes(';')) return false;
-  if (!/^select\b/i.test(q)) return false;
-  if (/\b(insert|update|delete|drop|alter|create|replace|attach|detach|vacuum|pragma|trigger)\b/i.test(q)) return false;
-  return true;
+  return sqlGuard.isSafeSelectText(query);
 }
 
-function runAdminReadOnlySql(db, query) {
-  if (!isSafeSelectSql(query)) {
-    return { error: 'مرفوض — الأداة دي للقراءة فقط، لازم الاستعلام يبدأ بـ SELECT ويكون جملة واحدة.' };
-  }
-  try {
-    const rows = db.prepare(query).all();
-    return { row_count: rows.length, rows: rows.slice(0, 200) };
-  } catch (e) {
-    return { error: 'خطأ في الاستعلام: ' + e.message };
-  }
+function runAdminReadOnlySql(_db, query) {
+  counters.countUsage('ai_sql', 'admin');
+  let ro;
+  try { ro = getReadonlyDb(); }
+  catch (e) { return { error: 'قاعدة البيانات مش متاحة للقراءة دلوقتي' }; }
+  const r = sqlGuard.runGuardedSelect(ro, query, 200);
+  if (r.error) return { error: r.error };
+  return r;
 }
 
 const ADMIN_CHAT_SYSTEM_PROMPT = `
@@ -4694,7 +5005,7 @@ const ADMIN_CHAT_SYSTEM_PROMPT = `
 - events: كل تفاعل خام للعميل (event_type, event_value, category, created_at) — مصدر الحقيقة الأساسي.
 - users: حسابات السيستم (name, role[admin/branch_manager/sales/rep/reception], branch).
 - sales_targets: المستهدفات الشهرية لكل فرع/سيلز.
-- system_audit_log: سجل العمليات الحساسة (نقل عميل، حذف، إلخ) — مفيد لو سُئلت "مين عمل إيه".
+- ممنوع عليك (الأداة هترفض): جدول settings، وsystem_audit_log، وsqlite_master، وعمود users.password_hash — من users اختار الأعمدة بالاسم (name, role, branch).
 
 نقط مهمة عشان تحليلك يكون صح:
 - فيه فرق جوهري بين "قبل الزيارة" (branch_customer_followups + followup_log) و"بعد الزيارة" (revisit_followups) — متلخبطش بينهم.
@@ -4786,7 +5097,7 @@ app.get('/api/sales/followups/:userId/log', requireAuth, authorizeRoles('sales')
     SELECT 1 FROM branch_customer_followups
     WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
   `).get(userId, me);
-  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+  if (!own || !canSeeLead(db, req.user, userId)) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
   const log = db.prepare(`
     SELECT id, sales, call_summary, followed_up_at
     FROM followup_log WHERE user_id = ?
@@ -4806,7 +5117,7 @@ app.post('/api/sales/followups/:userId/log', requireAuth, authorizeRoles('sales'
     SELECT branch FROM branch_customer_followups
     WHERE user_id = ? AND TRIM(assigned_sales) = TRIM(?)
   `).get(userId, me);
-  if (!own) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
+  if (!own || !canSeeLead(db, req.user, userId)) return res.status(404).json({ error: 'العميل ده مش مسنود ليك' });
 
   // Keep the customer in the followed-up list and surface the latest note on the
   // row, while appending this update to the permanent history.
@@ -4892,6 +5203,10 @@ app.put('/api/branch/sales/:id', requireAuth, (req, res) => {
   }
   const cur = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(req.params.id);
   let { name, email, password, active } = req.body || {};
+  // Phase 0 r2: same rule as PUT /api/users/:id in a sandbox session.
+  if (isDemoContext() && (email || password)) {
+    return res.status(403).json({ error: 'demo_readonly_login', message: 'وضع التدريب: مينفعش تغيّر الإيميل أو الباسورد' });
+  }
   if (name != null) name = String(name).trim();
   const updates = [];
   const params  = [];
@@ -5039,7 +5354,7 @@ function insertPurchaseRows(db, p) {
 //   2) the admin war-room notification (reception's sale says who entered it)
 //   3) the ManyChat purchase flow (Event-Triggered Flow: Purchase Made)
 function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contractNumber, viaReception, creditedByOther = false }) {
-  if (!String(req.user?.name || '').startsWith('demo_')) {
+  if (!isDemoContext()) {
     const capiLead = db.prepare(`
       SELECT COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                                  WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone,
@@ -5105,6 +5420,10 @@ app.post('/api/purchases', requireAuth, (req, res) => {
 
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(user_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  // Phase 0 r3: a sale credited to him makes the lead his (purchases in
+  // leadIsMine / leadTiedToBranch) — only for a lead he may already open.
+  // r4: not through a rep's read-only dashboard grant (canActOnLead).
+  if (!canActOnLead(db, req.user, user_id)) return res.status(404).json({ error: 'lead_not_found' });
 
   // An old tab of a salesperson (buttons cached from before 2026-11-16) must not
   // enter a sale reception already recorded for this customer today.
@@ -5354,6 +5673,7 @@ app.post('/api/revisit/:userId/close', requireAuth, authorizeRoles('admin', 'bra
   const db = getDb();
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  if (!canActOnLead(db, req.user, userId)) return res.status(404).json({ error: 'lead_not_found' });   // phase 0 r2
 
   db.prepare(`
     UPDATE lead_profiles SET
@@ -5374,6 +5694,7 @@ app.post('/api/revisit/:userId/reopen', requireAuth, authorizeRoles('admin', 'br
   const db = getDb();
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  if (!canActOnLead(db, req.user, userId)) return res.status(404).json({ error: 'lead_not_found' });   // phase 0 r2
 
   db.prepare(`
     UPDATE lead_profiles SET
@@ -5397,6 +5718,7 @@ app.post('/api/revisit/:userId/followup', requireAuth, authorizeRoles('admin', '
   const db = getDb();
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(userId);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  if (!canActOnLead(db, req.user, userId)) return res.status(404).json({ error: 'lead_not_found' });   // phase 0 r2
 
   db.prepare(`
     INSERT INTO revisit_followups (user_id, followed_up_by, note)
@@ -5418,6 +5740,8 @@ app.post('/api/revisit/:userId/followup', requireAuth, authorizeRoles('admin', '
 // GET /api/revisit/:userId/followups — full re-visit follow-up history.
 app.get('/api/revisit/:userId/followups', requireAuth, authorizeRoles('admin', 'branch_manager', 'sales', 'rep'), (req, res) => {
   const db = getDb();
+  // Phase 0 r2: another branch's / rep's customer → 404, as GET /api/leads/:id.
+  if (!canSeeLead(db, req.user, req.params.userId)) return res.status(404).json({ error: 'lead_not_found' });
   const followups = db.prepare(`
     SELECT id, followed_up_by, note, created_at
     FROM revisit_followups
@@ -5802,6 +6126,8 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
   const db = getDb();
+  // Same scope as the profile itself (phase 0) — its only caller is LeadDetail.
+  if (!canSeeLead(db, req.user, req.params.user_id)) return res.status(404).json({ error: 'Lead not found' });
   const purchases = db.prepare(`
     SELECT * FROM purchases WHERE user_id = ? ORDER BY created_at DESC
   `).all(req.params.user_id);
@@ -6092,6 +6418,10 @@ app.post('/api/trigger-message', requireAuth, authorizeRoles('admin', 'branch_ma
     const db = getDb();
     const profile = db.prepare(`SELECT * FROM lead_profiles WHERE user_id = ?`).get(user_id);
     if (!profile) return res.status(404).json({ error: 'lead_not_found' });
+    // Phase 0 r3: a sent flow makes the lead «his» (messages_sent in
+    // leadIsMine) — only for a lead he may already open; checked before
+    // anything is sent or recorded. r4: canActOnLead (no read-only grant).
+    if (!canActOnLead(db, req.user, user_id)) return res.status(404).json({ error: 'lead_not_found' });
 
     const role = String(req.user?.role || '').toLowerCase();
     const rep  = req.user?.name || null;
@@ -6151,6 +6481,11 @@ app.post('/api/trigger-message', requireAuth, authorizeRoles('admin', 'branch_ma
 // without a full lead refresh.
 app.get('/api/follow-up-state/:user_id', requireAuth, (req, res) => {
   try {
+    // Phase 0 r3: an unknown or out-of-scope lead → 404, before
+    // getStateRotated writes a follow_up_state row for the id.
+    const db = getDb();
+    const known = db.prepare(`SELECT 1 FROM lead_profiles WHERE user_id = ?`).get(req.params.user_id);
+    if (!known || !canSeeLead(db, req.user, req.params.user_id)) return res.status(404).json({ error: 'lead_not_found' });
     const state = getStateRotated(req.params.user_id);
     return res.json({ state });
   } catch (err) {
@@ -6564,10 +6899,15 @@ app.put('/api/scoring-rules', requireAuth, requireRole('admin'), (req, res) => {
 
 // Settings endpoints — GET /api/settings, PUT /api/settings/:key
 // ════════════════════════════════════════════════════════════════════════════
+// Phase 0: secret rows (API keys, webhook_secret, …) come back MASKED
+// («••••••••» + the last 4 of a long key, '' when unset) and jwt_secret not at
+// all — the value itself never leaves the server. The portal's key fields
+// still show «set / غير مُعَيَّن»; a new key is saved by typing over the mask
+// (PUT below ignores a mask sent back unchanged). services/secrets.js.
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
   const db   = getDb();
   const rows = db.prepare(`SELECT key, value FROM settings`).all();
-  return res.json(Object.fromEntries(rows.map(r => [r.key, r.value])));
+  return res.json(secrets.settingsForClient(rows));
 });
 
 // ── Integration status — drives the dashboard ManyChat banner ────────────────
@@ -6586,7 +6926,10 @@ app.get('/api/integration-status', requireAuth, requireRole('admin'), (req, res)
     manychat: apiKey ? 'live' : 'mock',
     missing_flows,
     webhook: {
-      secret:   process.env.WEBHOOK_SECRET || getSetting('webhook_secret') || '',
+      // The one place a secret is shown, on purpose: the live admin copies it
+      // into ManyChat's External Request header. Never in a demo_ session
+      // (phase 0) — its DB is scrubbed and the env secret is the live one.
+      secret:   isDemoContext() ? '' : (process.env.WEBHOOK_SECRET || getSetting('webhook_secret') || ''),
       enforced: getSetting('webhook_enforce', 'false') === 'true',
       from_env: !!process.env.WEBHOOK_SECRET,
     },
@@ -6599,7 +6942,30 @@ app.put('/api/settings/:key', requireAuth, requireRole('admin'), (req, res) => {
   if (value === undefined || value === null) {
     return res.status(400).json({ error: 'value is required' });
   }
+  // Phase 0: the session signing key is never written through the API.
+  // (r3) nor the flag of its one-time rotation.
+  if (secrets.NEVER_LISTED.has(key) || key === ROTATED_FLAG) return res.status(400).json({ error: 'not_editable' });
   const db = getDb();
+  // A secret field saved without typing a new value sends back the mask GET
+  // gave it — keep the stored key (answer ok, as a save of the same value).
+  // Phase 0 r2: ONLY the exact mask of the stored value counts as unchanged;
+  // any other value holding «•» (a key pasted after the mask, a mask with a
+  // character typed into it) is refused, never stored or silently dropped.
+  if (secrets.isSecretSettingKey(key)) {
+    const v = String(value);
+    if (v.includes('•')) {
+      const stored = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
+      const mask = secrets.maskSecret(stored ? stored.value : '');
+      if (mask && v === mask) return res.json({ ok: true, unchanged: true });
+      return res.status(400).json({ error: 'mask_edited', message: 'امسح النجوم واكتب المفتاح الجديد كامل' });
+    }
+  }
+  // zai_base_url: only z.ai's or BigModel's own API (phase 0 r2) — the AI
+  // prompt (lead names, typed messages) and the z.ai key go to this URL.
+  if (key === 'zai_base_url' && String(value).trim() !== '' && !isAllowedAiBaseUrl(String(value).trim())) {
+    return res.status(400).json({ error: 'base_url_not_allowed',
+      message: 'الرابط لازم يبدأ بـ https://api.z.ai/ أو https://open.bigmodel.cn/ — أو سيبه فاضي للافتراضي' });
+  }
   db.prepare(`
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
@@ -6646,6 +7012,11 @@ app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 
 app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
   let { name, email, role, password, branch, active } = req.body || {};
+  // Phase 0 r2: a sandbox session never changes who can log in (email /
+  // password / role) — the sandbox holds cloned copies of live accounts.
+  if (isDemoContext() && (email || password || role)) {
+    return res.status(403).json({ error: 'demo_readonly_login', message: 'وضع التدريب: مينفعش تغيّر الإيميل أو الباسورد أو الدور' });
+  }
   if (name != null) name = String(name).trim();
   const db      = getDb();
   const updates = [];
@@ -6697,7 +7068,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
 // Scrub every reference to a (departed) sales / call rep. Visits and purchases
 // are real events — they're KEPT but un-attributed (rep column set to NULL),
 // so the departed rep stops appearing in performance analytics.
-function scrubRepReferences(db, name) {
+function scrubRepReferences(db, name, { authored = true } = {}) {
   db.prepare(`UPDATE lead_profiles SET assigned_rep = NULL WHERE assigned_rep = ?`).run(name);
   db.prepare(`UPDATE lead_visits   SET sales_rep = NULL    WHERE sales_rep = ?`).run(name);
   db.prepare(`UPDATE lead_visits   SET pre_visit_rep = NULL WHERE pre_visit_rep = ?`).run(name);
@@ -6708,6 +7079,19 @@ function scrubRepReferences(db, name) {
   db.prepare(`DELETE FROM followup_log      WHERE sales = ?`).run(name);
   db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
   db.prepare(`DELETE FROM sales_targets WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(name);
+  if (authored) scrubAuthoredWork(db, name);
+}
+
+// Phase 0 r4: the name-keyed rows ANY role writes (a task, a sent flow) —
+// both make a lead «his» (leadIsMine). Cleared when any account is deleted
+// (DELETE /api/users/:id, whatever its role), so a new account given the
+// freed name never inherits those customers. A deleted person's open
+// reminders are dropped (tasks.rep_name is NOT NULL); a sent message stays in
+// the history without a name.
+function scrubAuthoredWork(db, name) {
+  if (!name) return;
+  db.prepare(`DELETE FROM tasks WHERE rep_name = ?`).run(name);
+  db.prepare(`UPDATE messages_sent SET sent_by_rep = NULL WHERE sent_by_rep = ?`).run(name);
 }
 
 // Cascade a sales / call-rep RENAME across every table that references the rep
@@ -6731,6 +7115,9 @@ function renameRepReferences(db, oldName, newName) {
   db.prepare(`UPDATE followup_log SET sales = ? WHERE sales = ?`).run(newName, oldName);
   db.prepare(`UPDATE revisit_followups SET followed_up_by = ? WHERE followed_up_by = ?`).run(newName, oldName);
   db.prepare(`UPDATE sales_targets SET scope_name = ? WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(newName, oldName);
+  // Phase 0 r4: his tasks and sent flows go with him (both count in leadIsMine).
+  db.prepare(`UPDATE tasks SET rep_name = ? WHERE rep_name = ?`).run(newName, oldName);
+  db.prepare(`UPDATE messages_sent SET sent_by_rep = ? WHERE sent_by_rep = ?`).run(newName, oldName);
 }
 
 // ── Unique staff names ──────────────────────────────────────────────────────
@@ -6777,6 +7164,9 @@ function staffNameHistoryError(db, name) {
     `SELECT DISTINCT sales          AS n FROM followup_log              WHERE sales IS NOT NULL`,
     `SELECT DISTINCT followed_up_by AS n FROM revisit_followups         WHERE followed_up_by IS NOT NULL`,
     `SELECT DISTINCT scope_name     AS n FROM sales_targets             WHERE scope_type = 'sales_rep' AND scope_name IS NOT NULL`,
+    // phase 0 r4: a task / sent flow also makes a lead his (leadIsMine)
+    `SELECT DISTINCT rep_name       AS n FROM tasks                     WHERE rep_name IS NOT NULL`,
+    `SELECT DISTINCT sent_by_rep    AS n FROM messages_sent             WHERE sent_by_rep IS NOT NULL`,
   ];
   const taken = sources.some(q => db.prepare(q).all().some(r => normalizeStaffName(r.n) === target));
   return taken
@@ -6839,6 +7229,7 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin'), (req, res) => {
     // A departed sales / call rep → scrub their footprint so they vanish
     // from performance analytics.
     if (['sales', 'rep'].includes(row.role)) scrubRepReferences(db, row.name);
+    else scrubAuthoredWork(db, row.name);   // r4: any role's tasks / sent flows
   })();
 
   return res.json({ ok: true });
@@ -6910,6 +7301,7 @@ app.delete('/api/admin/users/sales-rep/:name', requireAuth, requireRole('admin')
     db.prepare(`DELETE FROM followup_log      WHERE sales = ?`).run(name);
     db.prepare(`DELETE FROM revisit_followups WHERE followed_up_by = ?`).run(name);
     db.prepare(`DELETE FROM sales_targets WHERE scope_type = 'sales_rep' AND scope_name = ?`).run(name);
+    scrubAuthoredWork(db, name);   // r4: his tasks / sent flows (leadIsMine) — the name is freed below
 
     // 6. Delete the user.
     db.prepare(`DELETE FROM users WHERE name = ? AND role != 'admin'`).run(name);
@@ -6941,9 +7333,21 @@ app.post('/api/admin/cleanup-orphan-reps', requireAuth, requireRole('admin'), (r
     for (const r of db.prepare(q).all()) if (r.n) referenced.add(r.n);
   }
   const orphans = [...referenced].filter(n => !valid.has(n));
+  // r4: tasks / sent flows can be written by any role — a name there is an
+  // orphan only when NO account (any role) carries it.
+  const anyName = new Set(db.prepare(`SELECT name FROM users`).all().map(r => r.name));
+  const authoredOrphans = new Set();
+  for (const q of [`SELECT DISTINCT rep_name AS n FROM tasks WHERE rep_name IS NOT NULL`,
+                   `SELECT DISTINCT sent_by_rep AS n FROM messages_sent WHERE sent_by_rep IS NOT NULL`]) {
+    for (const r of db.prepare(q).all()) if (r.n && !anyName.has(r.n)) authoredOrphans.add(r.n);
+  }
+  for (const n of authoredOrphans) if (!orphans.includes(n)) orphans.push(n);
 
   db.transaction(() => {
-    for (const n of orphans) scrubRepReferences(db, n);
+    for (const n of orphans) {
+      if (referenced.has(n) && !valid.has(n)) scrubRepReferences(db, n, { authored: !anyName.has(n) });
+      else scrubAuthoredWork(db, n);
+    }
   })();
 
   console.log(`🧹 ORPHAN REP CLEANUP: ${orphans.length} — ${orphans.join(', ') || 'none'}`);
@@ -7258,7 +7662,7 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
 // ════════════════════════════════════════════════════════════════════════════
 app.post('/api/admin/meta/sync-historical', requireAuth, requireRole('admin'), async (req, res) => {
   try {
-    if (String(req.user?.name || '').startsWith('demo_')) {
+    if (isDemoContext()) {
       return res.status(400).json({ error: 'المزامنة مش متاحة من حساب الديمو — دي بيانات تدريب' });
     }
     if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) {
@@ -7441,467 +7845,17 @@ app.post('/api/admin/transfer-rep', requireAuth, requireRole('admin'), (req, res
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// The demo sandbox («وضع التدريب») — REMOVED (owner, 2026-11-22).
+// It cloned production (every customer and phone) into a second DB for four
+// demo_* training logins; the phase 0 reviews kept finding ways across it.
+// Both buttons are gone from the portal; the routes answer 410 «اتشال» so an
+// old portal tab gets a plain answer. Nothing makes, clones or seeds the
+// sandbox any more: demo_ logins are 401, a demo token is refused
+// (middleware/auth.js) and the old file is deleted at boot (db.js).
 // ════════════════════════════════════════════════════════════════════════════
-// seedDemoData — fills the عين شمس demo branch with realistic fake data.
-// Called every time demo accounts are (re)generated — fully idempotent.
-// ════════════════════════════════════════════════════════════════════════════
-function seedDemoData(db) {
-  const BRANCH   = 'عين شمس';
-  const SALES    = 'demo_sales';
-  const MANAGER  = 'demo_manager';
-  const PREFIX   = 'dmol_';            // demo-lead prefix — easy to spot
-  const NOW      = new Date();
-  const ymd = (d) => d.toISOString().slice(0, 10);
-  const iso = (d) => d.toISOString().replace('T', ' ').slice(0, 19);
-  const daysAgo  = (n) => { const d = new Date(NOW); d.setDate(d.getDate() - n); return d; };
-  // Day 15 (midday UTC) of the calendar month N months back — always lands
-  // INSIDE that month whatever day the sandbox is generated on. Used to spread
-  // the demo contracts over several months so the month picker on صفحة
-  // التعاقدات has something real to switch between.
-  const monthsAgo = (n) =>
-    new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth() - n, 15, 12, 0, 0));
-  const month    = NOW.toISOString().slice(0, 7);  // YYYY-MM
-
-  // ── wipe previous demo seed rows (safe for re-runs) ────────────────────
-  // Order matters: purchase_items has FK → purchases, so clear children first.
-  db.prepare(`DELETE FROM purchase_items WHERE purchase_id IN (SELECT id FROM purchases WHERE user_id LIKE '${PREFIX}%')`).run();
-  db.prepare(`DELETE FROM events             WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_profiles      WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_phones        WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM lead_visits        WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM visit_checkins     WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM purchases          WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM branch_customer_followups WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM revisit_followups  WHERE user_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM tasks              WHERE lead_id LIKE '${PREFIX}%'`).run();
-  db.prepare(`DELETE FROM sales_targets WHERE scope_name IN (?, ?) AND scope_type IN ('branch','sales_rep')`).run(BRANCH, SALES);
-
-  // ── 1. Lead profiles ────────────────────────────────────────────────────
-  const leads = [
-    // Cold — just registered, left phone, picked branch
-    { id: `${PREFIX}01`, name: 'محمود سامي',    cls: 'cold',      score: 22, phone: '01001234567', product: 'غرفة نوم كلاسيك',     cat: 'غرف النوم',   src: 'فيسبوك',    views: 2,  sessions: 1 },
-    { id: `${PREFIX}02`, name: 'رنا عبد الله',   cls: 'cold',      score: 18, phone: '01022334455', product: 'كنبة ركنة إل',         cat: 'الانتريهات', src: 'إنستجرام',  views: 1,  sessions: 1 },
-    { id: `${PREFIX}03`, name: 'يوسف طارق',     cls: 'cold',      score: 30, phone: '01112223334', product: 'طقم سفرة 6 كراسي',    cat: 'السفرة',     src: 'تيك توك',   views: 3,  sessions: 2 },
-    // Warm — engaged, viewed multiple products
-    { id: `${PREFIX}04`, name: 'سلمى حسين',     cls: 'warm',      score: 55, phone: '01223344556', product: 'غرفة نوم مودرن',       cat: 'غرف النوم',   src: 'فيسبوك',    views: 6,  sessions: 3 },
-    { id: `${PREFIX}05`, name: 'عمر فاروق',     cls: 'warm',      score: 62, phone: '01334455667', product: 'انتريه 5 مقاعد',       cat: 'الانتريهات', src: 'فيسبوك',    views: 5,  sessions: 4 },
-    { id: `${PREFIX}06`, name: 'دينا مصطفى',   cls: 'warm',      score: 48, phone: '01366778899', product: 'مطبخ أكريليك أبيض',    cat: 'المطابخ',    src: 'إنستجرام',  views: 4,  sessions: 2 },
-    { id: `${PREFIX}07`, name: 'كريم وليد',     cls: 'warm',      score: 70, phone: '01445566778', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 7,  sessions: 4 },
-    // Hot — high intent
-    { id: `${PREFIX}08`, name: 'نور الدين أحمد',cls: 'hot',       score: 88, phone: '01556677889', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 12, sessions: 6 },
-    { id: `${PREFIX}09`, name: 'هبة رضا',       cls: 'hot',       score: 91, phone: '01667788990', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 9,  sessions: 5 },
-    { id: `${PREFIX}10`, name: 'أيمن خالد',     cls: 'hot',       score: 85, phone: '01778899001', product: 'كنبة 4 مقاعد جلد',     cat: 'الانتريهات', src: 'تيك توك',   views: 11, sessions: 7 },
-    // Visited — came to showroom, assigned to demo_sales
-    { id: `${PREFIX}11`, name: 'فاطمة عزيز',    cls: 'visited',   score: 74, phone: '01889900112', product: 'غرفة نوم مودرن',       cat: 'غرف النوم',   src: 'فيسبوك',    views: 8,  sessions: 5 },
-    { id: `${PREFIX}12`, name: 'باسم جمال',     cls: 'visited',   score: 66, phone: '01990011223', product: 'انتريه كلاسيك',        cat: 'الانتريهات', src: 'إنستجرام',  views: 6,  sessions: 3 },
-    { id: `${PREFIX}13`, name: 'شيماء علي',     cls: 'visited',   score: 79, phone: '01101122334', product: 'طقم سفرة زان طبيعي',   cat: 'السفرة',     src: 'فيسبوك',    views: 10, sessions: 6 },
-    { id: `${PREFIX}14`, name: 'مصطفى حسن',    cls: 'visited',   score: 58, phone: '01201234560', product: 'مطبخ خشب بلوط',        cat: 'المطابخ',    src: 'تيك توك',   views: 5,  sessions: 4 },
-    { id: `${PREFIX}15`, name: 'إيمان صالح',    cls: 'visited',   score: 82, phone: '01311234561', product: 'غرفة نوم كلاسيك',      cat: 'غرف النوم',   src: 'فيسبوك',    views: 9,  sessions: 5 },
-    // Purchased — completed sales
-    { id: `${PREFIX}16`, name: 'حسام عبد الغني',cls: 'purchased', score: 95, phone: '01421234562', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 14, sessions: 8 },
-    { id: `${PREFIX}17`, name: 'ريم محمود',     cls: 'purchased', score: 93, phone: '01531234563', product: 'طقم سفرة 8 كراسي فاخر',cat: 'السفرة',    src: 'إنستجرام',  views: 11, sessions: 6 },
-    { id: `${PREFIX}18`, name: 'عادل منصور',    cls: 'purchased', score: 89, phone: '01641234564', product: 'كنبة 4 مقاعد جلد',     cat: 'الانتريهات', src: 'فيسبوك',    views: 10, sessions: 7 },
-    // Extra — for pre-visit followup
-    { id: `${PREFIX}19`, name: 'سارة نبيل',     cls: 'warm',      score: 67, phone: '01751234565', product: 'سرير أطفال مع دولاب',  cat: 'غرف الأطفال',src: 'فيسبوك',    views: 6,  sessions: 3 },
-    { id: `${PREFIX}20`, name: 'تامر فتحي',     cls: 'hot',       score: 84, phone: '01861234566', product: 'غرفة نوم مودرن كاملة', cat: 'غرف النوم',  src: 'إنستجرام',  views: 10, sessions: 6 },
-    // Dormant hot/warm — last_activity forced to ~40 days ago so the score-decay
-    // job (once an admin enables it) has something real to demote in the sandbox.
-    { id: `${PREFIX}21`, name: 'وليد سمير',     cls: 'hot',       score: 85, phone: '01971234567', product: 'غرفة نوم كلاسيك ملكي', cat: 'غرف النوم',  src: 'فيسبوك',    views: 9,  sessions: 5, staleDays: 40 },
-    { id: `${PREFIX}22`, name: 'منى إبراهيم',   cls: 'warm',      score: 55, phone: '01081234568', product: 'انتريه 5 مقاعد',       cat: 'الانتريهات', src: 'إنستجرام',  views: 4,  sessions: 2, staleDays: 40 },
-  ];
-
-  const insLead = db.prepare(`
-    INSERT OR REPLACE INTO lead_profiles
-      (user_id, first_name, total_score, lead_class, preferred_branch,
-       last_product, last_category, product_view_count, session_count,
-       campaign_source, platform, last_activity, created_at)
-    VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?)
-  `);
-
-  // Map the demo's Arabic src label to the canonical platform column value.
-  // TikTok stays NULL because the platform field only tracks the ManyChat
-  // channels (Instagram/Facebook) where DMs come in.
-  const srcToPlatform = (src) => {
-    if (src === 'فيسبوك')   return 'facebook';
-    if (src === 'إنستجرام') return 'instagram';
-    return null;
-  };
-  const insPhone = db.prepare(`
-    INSERT OR IGNORE INTO lead_phones (user_id, phone, created_at)
-    VALUES (?,?,?)
-  `);
-
-  const insEvent = db.prepare(`
-    INSERT INTO events (user_id, first_name, event_type, event_value, score_delta,
-                        session_count, current_score, branch, product_id, created_at)
-    VALUES (?,?,?,?,?, ?,?,?,?,?)
-  `);
-
-  db.transaction(() => {
-    for (const l of leads) {
-      const actAgo     = l.staleDays ?? (Math.floor(Math.random() * 5) + 1);
-      // created_at must be >= last_activity — a lead can't have been active
-      // before it existed. Normal leads: created 7-20 days ago. Dormant demo
-      // leads (staleDays set): created a bit before their stale last_activity.
-      const createdAgo = l.staleDays
-        ? l.staleDays + Math.floor(Math.random() * 5) + 3
-        : Math.floor(Math.random() * 14) + 7;
-      insLead.run(
-        l.id, l.name, l.score, l.cls, BRANCH,
-        l.product, l.cat, l.views, l.sessions,
-        l.src, srcToPlatform(l.src),
-        iso(daysAgo(actAgo)),
-        iso(daysAgo(createdAgo))
-      );
-      if (l.phone) insPhone.run(l.id, l.phone, iso(daysAgo(10)));
-
-      // Instagram leads carry an @handle for the sales team (demo only).
-      if (srcToPlatform(l.src) === 'instagram') {
-        db.prepare(`UPDATE lead_profiles SET ig_username = ? WHERE user_id = ?`)
-          .run(`cust_${String(l.id).slice(-2)}`, l.id);
-      }
-
-      // branch_selected event — makes the lead appear in the reception queue
-      insEvent.run(
-        l.id, l.name, 'branch_selected', BRANCH, 5,
-        l.sessions, l.score, BRANCH, null,
-        iso(daysAgo(createdAgo + 1))
-      );
-
-      // product_view events (one per "views" count — simplified to one aggregate event)
-      insEvent.run(
-        l.id, l.name, 'product_details', l.product, 3,
-        l.sessions, l.score, BRANCH, null,
-        iso(daysAgo(actAgo))
-      );
-    }
-  })();
-
-  // ── 2. Lead visits — visited leads came to the showroom ─────────────────
-  const visitedIds = [`${PREFIX}11`, `${PREFIX}12`, `${PREFIX}13`, `${PREFIX}14`, `${PREFIX}15`];
-  const purchasedIds = [`${PREFIX}16`, `${PREFIX}17`, `${PREFIX}18`];
-  const allVisited = [...visitedIds, ...purchasedIds];
-
-  const insVisit = db.prepare(`
-    INSERT INTO lead_visits (user_id, branch, visited_at, sales_rep, pre_visit_rep)
-    VALUES (?,?,?,?,?)
-  `);
-  const visitDaysAgo = [2, 3, 4, 5, 6, 8, 10, 12];
-  db.transaction(() => {
-    allVisited.forEach((uid, i) => {
-      const vDate = iso(daysAgo(visitDaysAgo[i] || 7));
-      insVisit.run(uid, BRANCH, vDate, SALES, null);
-      // mark visit_confirmed = 1 so the lead appears in "متابعة ما بعد الزيارة"
-      db.prepare(`
-        UPDATE lead_profiles SET visit_confirmed = 1, visit_at = ? WHERE user_id = ?
-      `).run(vDate, uid);
-    });
-  })();
-
-  // ── 2b. Today's arrivals — so demo_reception's «قايمة العملاء زيارة اليوم»
-  // is never empty (the visits above are 2–12 days old). Two returning
-  // customers checked in TODAY (Cairo day), never before today's Cairo start:
-  //   11 — confirmed ~90 min ago, salesperson NOT picked yet this visit (shows
-  //        the picker + «المرة اللي فاتت كان مع: demo_sales»).
-  //   12 — walk-in ~30 min ago, already standing with demo_sales.
-  {
-    const today    = cairoDay(NOW);
-    const minStart = cairoDayStart(today).getTime() + 60 * 1000;
-    const clampTs  = (msAgo) => new Date(Math.max(NOW.getTime() - msAgo, minStart));
-    const in11 = clampTs(90 * 60 * 1000);
-    const in12 = clampTs(30 * 60 * 1000);
-    const set12 = new Date(Math.max(NOW.getTime() - 25 * 60 * 1000, in12.getTime()));
-    const insCheckin = db.prepare(`
-      INSERT OR IGNORE INTO visit_checkins (user_id, branch, visit_day, checked_in_at, source, recorded_by)
-      VALUES (?, ?, ?, ?, ?, 'demo_reception')
-    `);
-    db.transaction(() => {
-      insCheckin.run(`${PREFIX}11`, BRANCH, today, toSqlUtc(in11), 'confirm');
-      insCheckin.run(`${PREFIX}12`, BRANCH, today, toSqlUtc(in12), 'walkin');
-      db.prepare(`UPDATE lead_visits SET sales_rep_set_at = ? WHERE user_id = ? AND branch = ?`)
-        .run(toSqlUtc(set12), `${PREFIX}12`, BRANCH);
-    })();
-  }
-
-  // ── 3. Purchases — 5 completed sales by demo_sales ──────────────────────
-  // The last two are older repeat contracts sitting in the two PREVIOUS
-  // calendar months, so the month filter on صفحة التعاقدات always has at least
-  // two different months of data to show in the sandbox.
-  const purchaseData = [
-    { uid: `${PREFIX}16`, price: 32000, contract: 'CNT-2026-0041', note: 'غرفة نوم كلاسيك ملكي — دفع كاش',        daysAgoN: 6,  products: ['غرفة نوم كلاسيك ملكي'] },
-    { uid: `${PREFIX}17`, price: 18500, contract: 'CNT-2026-0042', note: 'طقم سفرة 8 كراسي فاخر — تقسيط 6 شهور', daysAgoN: 8,  products: ['طقم سفرة 8 كراسي فاخر'] },
-    // Bedroom set repeats here → it becomes the best-seller overall + in غرف النوم.
-    { uid: `${PREFIX}18`, price: 24000, contract: 'CNT-2026-0043', note: 'كنبة 4 مقاعد جلد + غرفة نوم — دفع كاش',  daysAgoN: 10, products: ['كنبة 4 مقاعد جلد', 'غرفة نوم كلاسيك ملكي'] },
-    { uid: `${PREFIX}16`, price: 15750, contract: 'CNT-2026-0028', note: 'طقم سفرة 6 كراسي — الشهر اللي فات',      monthsAgoN: 1, products: ['طقم سفرة 6 كراسي'] },
-    { uid: `${PREFIX}17`, price: 21000, contract: 'CNT-2026-0014', note: 'انتريه كلاسيك — تعاقد قديم',             monthsAgoN: 2, products: ['انتريه كلاسيك'] },
-  ];
-  const insPurchase = db.prepare(`
-    INSERT INTO purchases (user_id, price, branch, notes, rep, created_at, contract_number)
-    VALUES (?,?,?,?,?,?,?)
-  `);
-  const insPurchaseItem = db.prepare(`
-    INSERT INTO purchase_items (purchase_id, product_id) VALUES (?, ?)
-  `);
-  // The catalog is normally cloned from production (hundreds of real products).
-  // But on a fresh/empty live DB the clone is empty, which would leave demo
-  // purchases with no line items and the best-selling analytics blank. Seed a
-  // tiny catalog (only if none exists) so the demo always reflects the feature.
-  if (db.prepare(`SELECT COUNT(*) c FROM products WHERE active = 1`).get().c === 0) {
-    const catIns  = db.prepare(`INSERT INTO product_categories (name) VALUES (?)`);
-    const prodIns = db.prepare(`INSERT INTO products (category_id, name) VALUES (?, ?)`);
-    const demoCatalog = {
-      'غرف النوم':   ['غرفة نوم كلاسيك ملكي', 'غرفة نوم مودرن'],
-      'السفرة':      ['طقم سفرة 8 كراسي فاخر', 'طقم سفرة 6 كراسي'],
-      'الانتريهات':  ['كنبة 4 مقاعد جلد', 'انتريه كلاسيك'],
-    };
-    db.transaction(() => {
-      for (const [cat, prods] of Object.entries(demoCatalog)) {
-        const cid = catIns.run(cat).lastInsertRowid;
-        for (const name of prods) prodIns.run(cid, name);
-      }
-    })();
-  }
-
-  // Link each demo contract to the catalog product that matches its note (so the
-  // best-selling-by-category analysis is meaningful), falling back to random.
-  const productByName = (frag) =>
-    db.prepare(`SELECT id FROM products WHERE active = 1 AND name LIKE ? LIMIT 1`).get('%' + frag + '%')?.id;
-  const pickRandomProducts = (n) => {
-    const rows = db.prepare(`SELECT id FROM products WHERE active = 1`).all();
-    if (!rows.length) return [];
-    const shuffled = rows.slice().sort(() => Math.random() - 0.5);
-    return shuffled.slice(0, Math.min(n, rows.length)).map(r => r.id);
-  };
-  db.transaction(() => {
-    purchaseData.forEach((p) => {
-      const pDate = iso(p.monthsAgoN != null ? monthsAgo(p.monthsAgoN) : daysAgo(p.daysAgoN));
-      const result = insPurchase.run(p.uid, p.price, BRANCH, p.note, SALES, pDate, p.contract);
-      const purchaseId = result.lastInsertRowid;
-
-      // Link the contract to its catalog products (by name), so the
-      // best-selling-by-category analysis has real, sensible data.
-      let productIds = (p.products || []).map(productByName).filter(Boolean);
-      if (!productIds.length) productIds = pickRandomProducts(1 + Math.floor(Math.random() * 2));
-      for (const pid of productIds) insPurchaseItem.run(purchaseId, pid);
-
-      // set purchased_at so the "اشتروا" tab in revisit works. A repeat buyer
-      // has more than one contract here, so only ever move the date FORWARD —
-      // an older back-dated contract must not rewind their last purchase.
-      db.prepare(`
-        UPDATE lead_profiles SET purchased_at = ?
-        WHERE user_id = ? AND (purchased_at IS NULL OR purchased_at < ?)
-      `).run(pDate, p.uid, pDate);
-    });
-  })();
-
-  // One buyer ALSO browsed a different branch (المعادي) before buying here — so
-  // the cross-branch customer journey + the reception heads-up show up in the
-  // demo too (ownership stays with the branch where they actually bought).
-  insVisit.run(`${PREFIX}16`, 'المعادي', iso(daysAgo(9)), 'سيلز المعادي', null);
-
-  // ── 4. Pre-visit follow-up assignments (branch_customer_followups) ───────
-  // 2 pending (not yet followed up) + 2 done (followed up + visited / not visited)
-  // `sent` = the rep ticked "بعت" (sent the first outreach). One pending lead is
-  // marked sent, the other not, so the demo shows the checkbox in both states.
-  // `attempts` = "اتصلت — لم يرد": نور الدين has 2 unanswered attempts (worked but
-  // unreachable) while تامر has none (never tried) — shows both pending states.
-  // `snoozeAgo` = snoozed_until N days AGO → already expired, so the demo queue
-  // shows the "معاد المتابعة اللي أجّلته" resurfacing badge on نور الدين.
-  const fupData = [
-    { uid: `${PREFIX}08`, name: 'نور الدين أحمد', fu: 0, sent: 1, attempts: 2, snoozeAgo: 1, visited: false, assignedAgo: 6,  summary: null },
-    { uid: `${PREFIX}20`, name: 'تامر فتحي',      fu: 0, sent: 0, attempts: 0, visited: false, assignedAgo: 4,  summary: null },
-    { uid: `${PREFIX}09`, name: 'هبة رضا',        fu: 1, sent: 1, attempts: 0, visited: false, assignedAgo: 10, summary: 'مهتمة جداً بطقم السفرة، قالت هتزور الأسبوع الجاي بعد ما يراجع ميزانيتها' },
-    { uid: `${PREFIX}07`, name: 'كريم وليد',      fu: 1, sent: 1, attempts: 1, visited: true,  assignedAgo: 12, summary: 'اتصلت بيه، قال هييجي مع زوجته — وفعلاً زاروا وشافوا غرف الأطفال', visitedAgo: 5 },
-    // Walked in & visited BEFORE any pre-visit follow-up → "زار قبل المتابعة".
-    { uid: `${PREFIX}10`, name: 'أيمن خالد',      fu: 0, sent: 0, attempts: 0, visited: true,  assignedAgo: 3,  summary: null, visitedAgo: 1 },
-  ];
-  const insFup = db.prepare(`
-    INSERT OR REPLACE INTO branch_customer_followups
-      (branch, user_id, followed_up, followed_up_at, followed_up_by, assigned_sales, assigned_at, assigned_by, call_summary, sent, sent_at, attempt_count, last_attempt_at, snoozed_until)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
-  db.transaction(() => {
-    for (const f of fupData) {
-      insFup.run(
-        BRANCH, f.uid,
-        f.fu ? 1 : 0,
-        f.fu ? iso(daysAgo(f.visitedAgo ? f.visitedAgo + 2 : 3)) : null,
-        f.fu ? SALES : null,
-        SALES,
-        iso(daysAgo(f.assignedAgo)),
-        MANAGER,
-        f.summary,
-        f.sent ? 1 : 0,
-        f.sent ? iso(daysAgo(f.assignedAgo)) : null,
-        f.attempts || 0,
-        f.attempts ? iso(daysAgo(Math.max(1, f.assignedAgo - 2))) : null,
-        f.snoozeAgo ? iso(daysAgo(f.snoozeAgo)) : null
-      );
-      // if visited after followup, also update lead_profiles
-      if (f.visited) {
-        const vDate = iso(daysAgo(f.visitedAgo || 3));
-        db.prepare(`
-          UPDATE lead_profiles SET lead_class='visited', visit_confirmed=1, visit_at=? WHERE user_id=?
-        `).run(vDate, f.uid);
-        insVisit.run(f.uid, BRANCH, vDate, SALES, SALES);
-      }
-    }
-  })();
-
-  // followup_log — the append-only PRE-visit follow-up timeline. Seed an entry
-  // for each done follow-up (and a 2nd one for هبة, to show a multi-touch
-  // timeline) so the admin's "متابعات السيلز" monitor isn't empty in the demo.
-  const insFulog = db.prepare(`
-    INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at)
-    VALUES (?,?,?,?,?)
-  `);
-  db.transaction(() => {
-    for (const f of fupData) {
-      if (f.fu && f.summary) {
-        insFulog.run(BRANCH, f.uid, SALES, f.summary,
-          iso(daysAgo(f.visitedAgo ? f.visitedAgo + 2 : 3)));
-      }
-    }
-    // A second, earlier touch for هبة رضا — shows the rep followed up more than once.
-    insFulog.run(BRANCH, `${PREFIX}09`, SALES,
-      'كلمتها أول مرة، طلبت تفاصيل أكتر عن الخامات والأسعار — بعتتلها صور', iso(daysAgo(7)));
-  })();
-
-  // ── 5. Sales targets for this month ─────────────────────────────────────
-  const insTarget = db.prepare(`
-    INSERT OR REPLACE INTO sales_targets (scope_type, scope_name, target_month, target_amount)
-    VALUES (?,?,?,?)
-  `);
-  db.transaction(() => {
-    // Targets are now CONTRACT COUNTS (not money).
-    insTarget.run('branch',     BRANCH, month, 20);   // 20 contracts for the branch
-    insTarget.run('sales_rep',  SALES,  month,  8);   // 8 contracts for demo_sales
-    insTarget.run('branch_manager', MANAGER, month, 20);
-  })();
-
-  // ── 6. Pending tasks for demo_sales ─────────────────────────────────────
-  const today = ymd(NOW);
-  const tomorrow = ymd(daysAgo(-1));
-  const insTask = db.prepare(`
-    INSERT INTO tasks (lead_id, lead_name, rep_name, due_at, note, source, status, created_at)
-    VALUES (?,?,?,?,?,?,?,?)
-  `);
-  db.transaction(() => {
-    insTask.run(`${PREFIX}08`, 'نور الدين أحمد', SALES, today,    'تابعه واسأله عن ميعاد الزيارة — مهتم جداً بغرفة النوم', 'manager', 'pending', iso(daysAgo(5)));
-    insTask.run(`${PREFIX}20`, 'تامر فتحي',      SALES, today,    'اتصل وأكّد إنه مهتم وحاول تحجزله موعد', 'manager', 'pending', iso(daysAgo(4)));
-    insTask.run(`${PREFIX}09`, 'هبة رضا',        SALES, tomorrow, 'متابعة بعد المكالمة — وعدت تزور الأسبوع الجاي', 'reschedule', 'pending', iso(daysAgo(3)));
-  })();
-
-  // ── 7. Revisit follow-up log — post-visit calls demo_sales made ──────────
-  // 2 leads followed up (فاطمة وباسم), rest still pending — shows manager
-  // who the sales rep is actively tracking and who hasn't been called yet.
-  const insRevisitFu = db.prepare(`
-    INSERT INTO revisit_followups (user_id, followed_up_by, note, created_at)
-    VALUES (?,?,?,?)
-  `);
-  db.transaction(() => {
-    insRevisitFu.run(
-      `${PREFIX}11`, SALES,
-      'اتصلت بيها، قالت لسه مش متأكدة — هتتكلم مع جوزها وترد الأسبوع الجاي',
-      iso(daysAgo(1))
-    );
-    insRevisitFu.run(
-      `${PREFIX}12`, SALES,
-      'مش بيرد على التليفون — هحاول تاني بكره',
-      iso(daysAgo(2))
-    );
-    insRevisitFu.run(
-      `${PREFIX}12`, SALES,
-      'رد وقال مش مهتم دلوقتي، ممكن بعد شهر لما يعدي الصيف',
-      iso(daysAgo(0))
-    );
-  })();
-
-  // ── Post-visit "اتقفلوا" demo — one visited customer the rep closed, so the
-  // three tabs of متابعات بعد الزيارة all have data and the name/phone search
-  // there can show its "لقيته في: ..." cross-tab hint in the sandbox. Every demo
-  // lead already carries a lead_phones row, so the search finds them all.
-  db.prepare(`
-    UPDATE lead_profiles SET
-      revisit_status     = 'lost',
-      revisit_note       = ?,
-      revisit_updated_by = ?,
-      revisit_updated_at = ?
-    WHERE user_id = ?
-  `).run('اشترى من معرض تاني — قال السعر عنده أوفر', SALES, iso(daysAgo(1)), `${PREFIX}14`);
-
-  // ── Duplicate-flag demo: mark one junk lead so the branch manager's
-  // "عملاء الفرع" view shows the duplicate badge, and so the exclusion from the
-  // rep queues/KPIs is visible in the sandbox. Reversible from the UI.
-  db.prepare(`UPDATE lead_profiles SET is_duplicate = 1 WHERE user_id = ?`).run(`${PREFIX}02`);
-
-  console.log(`🌱 Demo seed: ${leads.length} leads+events, ${allVisited.length} visits, ${purchaseData.length} purchases (over 3 months), 4 pre-visit fups, 3 revisit logs, 3 tasks, 1 duplicate — branch: ${BRANCH}`);
-}
-
-// Account-based cloned sandbox — interconnected demo_* training accounts.
-//   generate → clone production into grand_furniture_demo.db + (re)create the
-//              4 demo users INSIDE the demo DB only (production untouched).
-//   wipe     → delete the demo DB file entirely.
-// ════════════════════════════════════════════════════════════════════════════
-app.post('/api/admin/generate-demo-accounts', requireAuth, requireRole('admin'), async (req, res) => {
-  try {
-    // Step A — fresh snapshot of production into the sandbox file.
-    await cloneLiveToDemo();
-
-    // Step B — (re)create the 4 cross-linked demo users INSIDE the demo DB.
-    const demo = getDemoDb();
-    const hash = bcrypt.hashSync('123', 10);
-    const accounts = [
-      { name: 'demo_admin',     email: 'demo_admin@demo.local',     role: 'admin',          branch: null },
-      { name: 'demo_manager',   email: 'demo_manager@demo.local',   role: 'branch_manager', branch: 'عين شمس' },
-      { name: 'demo_sales',     email: 'demo_sales@demo.local',     role: 'sales',          branch: 'عين شمس' },
-      { name: 'demo_reception', email: 'demo_reception@demo.local', role: 'reception',      branch: 'عين شمس' },
-    ];
-    const upsert = demo.prepare(`
-      INSERT INTO users (name, email, password_hash, role, branch, active)
-      VALUES (?, ?, ?, ?, ?, 1)
-      ON CONFLICT(email) DO UPDATE SET
-        name = excluded.name, password_hash = excluded.password_hash,
-        role = excluded.role, branch = excluded.branch, active = 1
-    `);
-    demo.transaction(() => {
-      for (const a of accounts) {
-        // The sandbox is a fresh clone of production: if a real account's name
-        // collides with a demo name (e.g. "Demo_Sales"), rename that account's
-        // SANDBOX copy (+ its name-keyed rows) instead of failing or leaving a
-        // name twin. Production is never touched here.
-        const own = demo.prepare(`SELECT id FROM users WHERE email = ?`).get(a.email);
-        let clash;
-        while ((clash = findStaffNameConflict(demo, a.name, own?.id))) {
-          const renamed = `${String(clash.name).trim()} #${clash.id}`;
-          demo.prepare(`UPDATE users SET name = ? WHERE id = ?`).run(renamed, clash.id);
-          renameRepReferences(demo, clash.name, renamed);
-        }
-        upsert.run(a.name, a.email, hash, a.role, a.branch);
-      }
-    })();
-
-    // Step C — seed realistic fake data for the عين شمس demo branch.
-    // We wipe any previous demo-seed rows first (idempotent re-runs).
-    seedDemoData(demo);
-
-    console.log('🧪 DEMO ACCOUNTS GENERATED (sandbox cloned + 4 demo users + seed data)');
-    return res.json({
-      ok: true,
-      password: '123',
-      accounts: accounts.map(a => ({ email: a.email, role: a.role })),
-    });
-  } catch (e) {
-    console.error('[demo] generate failed:', e.message);
-    return res.status(500).json({ error: 'generate_failed' });
-  }
-});
-
-app.post('/api/admin/wipe-demo-accounts', requireAuth, requireRole('admin'), (req, res) => {
-  wipeDemoDb();
-  console.log('🗑️  DEMO SANDBOX WIPED');
-  return res.json({ ok: true });
-});
+const DEMO_REMOVED = { error: 'وضع التدريب اتشال — الحسابات التجريبية مبقتش موجودة', code: 'demo_removed' };
+app.post('/api/admin/generate-demo-accounts', requireAuth, requireRole('admin'), (req, res) => res.status(410).json(DEMO_REMOVED));
+app.post('/api/admin/wipe-demo-accounts', requireAuth, requireRole('admin'), (req, res) => res.status(410).json(DEMO_REMOVED));
 
 // ════════════════════════════════════════════════════════════════════════════
 // Notifications — admin-only macro alerts (contracts changed, big deals).
@@ -8156,9 +8110,7 @@ app.get('/api/admin/leads-aging', requireAuth, requireRole('admin'), (_req, res)
 // ════════════════════════════════════════════════════════════════════════════
 // GET /health — Health check
 // ════════════════════════════════════════════════════════════════════════════
-// Version marker — bumped on every meaningful release so the admin
-// (and our deploy checks) can confirm production is running the latest code.
-const BUILD_VERSION = '2026-11-22-o6-o4';
+// BUILD_VERSION is declared at the top of this file (the boot backup uses it).
 // How many old rows still hold 'all_branches' (never rewritten — review r2)
 // and how many profiles the one-time cleanup backed up. Counts only, cached
 // 5 minutes (Railway pings /health constantly).
@@ -8185,8 +8137,41 @@ function allBranchesCounts() {
 // Counts only, since boot (C1.12) — no ids, names, phones or keys. They make
 // the bot's test mode, the window guard and the ManyChat key checkable from
 // outside with a plain GET.
+// Phase 0 additions — booleans and counts only, never a value, path or name:
+//   jwt_secret_from_env — true when JWT_SECRET is set in the environment
+//                         (false = the signing key lives in the DB settings);
+//   jwt_rotated         — true once the DB-stored key was replaced by the
+//                         one-time r3 rotation (never with JWT_SECRET in env);
+//   users_by_role       — active staff accounts per role (live DB);
+//   zai_key_set / mcp_key_set — whether the z.ai key (live settings) and
+//                         MCP_SECRET_KEY (env) are set;
+//   usage               — hits since boot (see USAGE_ROUTES);
+//   outbound_blocked_demo — outgoing calls a demo_ session tried, refused;
+//   backup              — last_backup_at, backup_count (+ last_error);
+//   node                — the running Node version (the 22.x pin).
+let _rolesCache = { at: 0, value: null };
+function usersByRole() {
+  if (_rolesCache.value && Date.now() - _rolesCache.at < 5 * 60 * 1000) return _rolesCache.value;
+  try {
+    const rows = getLiveDb().prepare(`SELECT role, COUNT(*) AS n FROM users WHERE active = 1 GROUP BY role`).all();
+    const value = { admin: 0, branch_manager: 0, sales: 0, reception: 0, rep: 0 };
+    for (const r of rows) {
+      const k = Object.prototype.hasOwnProperty.call(value, r.role) ? r.role : 'other';
+      value[k] = (value[k] || 0) + r.n;
+    }
+    _rolesCache = { at: Date.now(), value };
+    return value;
+  } catch (_) { return null; }
+}
+function liveSettingSet(key) {
+  try {
+    const row = getLiveDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
+    return !!(row && row.value && String(row.value).trim());
+  } catch (_) { return null; }
+}
 app.get('/health', (req, res) => {
   const c = counters.snapshot();
+  const b = backup.snapshot();
   res.json({
     status:    'ok',
     timestamp: new Date().toISOString(),
@@ -8200,6 +8185,17 @@ app.get('/health', (req, res) => {
     lead_rule:      c.lead_rule,
     branch_repeats: c.branch_repeats,
     rate_limited:   c.rate_limited,
+    node:           process.versions.node,          // the Node 22 pin is checkable after a deploy
+    jwt_secret_from_env: !!process.env.JWT_SECRET,
+    jwt_rotated:    jwtRotated(),
+    users_by_role:  usersByRole(),
+    zai_key_set:    liveSettingSet('zai_api_key'),
+    mcp_key_set:    !!process.env.MCP_SECRET_KEY,
+    usage:          c.usage,
+    outbound_blocked_demo: outbound.blockedSnapshot(),
+    last_backup_at: b.last_backup_at,
+    backup_count:   b.count,
+    backup_last_error: b.last_error,
   });
 });
 
@@ -8411,8 +8407,7 @@ function runScoreDecayForDb(db) {
 
 function runScoreDecayJob() {
   try {
-    runScoreDecayForDb(getLiveDb());
-    if (fs.existsSync(DEMO_DB_PATH)) runScoreDecayForDb(getDemoDb());
+    runScoreDecayForDb(getLiveDb());   // the live DB only (the demo sandbox is removed)
   } catch (err) {
     console.error('[Cron] Error running score decay job:', err);
   }
@@ -8536,30 +8531,26 @@ setTimeout(() => {
       description: 'تنفيذ استعلام SELECT للقراءة وتحليل البيانات.',
       inputSchema: { sql_query: z.string().describe('استعلام SELECT فقط') },
     }, async ({ sql_query }) => {
+      // Phase 0: a read-only connection + the table allowlist (services/sqlGuard.js):
+      // settings, the audit log, sqlite_master and users.password_hash are refused.
       try {
-        const q = String(sql_query || '').trim();
-        if (!/^select\b/i.test(q))
-          return fail('هذه الأداة للقراءة فقط — يجب أن يبدأ الاستعلام بـ SELECT.');
-        const rows = db.prepare(q).all();
-        return ok({ row_count: rows.length, rows: rows.slice(0, 500) });
+        counters.countUsage('mcp_tool', 'mcp');
+        const r = sqlGuard.runGuardedSelect(getReadonlyDb(), sql_query, 500);
+        if (r.error) return fail(r.error);
+        return ok(r);
       } catch (e) { return fail(e.message); }
     });
 
-    // ── Tool D: Write SQL ───────────────────────────────────────────────────
+    // ── Tool D: Write SQL — OFF (phase 0, 2026-11-22) ───────────────────────
+    // Kept registered so a client that calls it gets a clear answer instead of
+    // «unknown tool»; it never runs SQL. Whether it is removed or brought back
+    // is the owner's call (overhaul PLAN.md, the MCP question).
     srv.registerTool('execute_write_sql', {
-      description: 'INSERT / UPDATE / DELETE لإصلاح البيانات. راجع WHERE بدقة قبل التنفيذ.',
-      inputSchema: { sql_query: z.string().describe('INSERT أو UPDATE أو DELETE') },
-    }, async ({ sql_query }) => {
-      try {
-        const q = String(sql_query || '').trim();
-        if (!/^(insert|update|delete|replace)\b/i.test(q))
-          return fail('يُقبل INSERT / UPDATE / DELETE / REPLACE فقط.');
-        if (/\b(drop|alter|truncate|attach|detach|vacuum)\b/i.test(q))
-          return fail('أوامر تعديل الهيكل (DROP/ALTER/TRUNCATE…) محظورة.');
-        const info = db.prepare(q).run();
-        console.error(`[mcp][WRITE] rows_affected=${info.changes} :: ${q}`);
-        return ok({ rows_affected: info.changes, last_insert_rowid: info.lastInsertRowid });
-      } catch (e) { return fail(e.message); }
+      description: 'مقفولة: الكتابة على قاعدة البيانات من MCP متوقفة (المرحلة 0). اعمل التعديل من السيستم نفسه.',
+      inputSchema: { sql_query: z.string().describe('غير مستخدم — الأداة مقفولة') },
+    }, async () => {
+      counters.countUsage('mcp_tool', 'mcp');
+      return fail('أداة الكتابة مقفولة (المرحلة 0 — الحماية). مفيش أي تعديل اتعمل. التعديلات من السيستم نفسه.');
     });
 
     return srv;
@@ -8835,6 +8826,19 @@ process.on('uncaughtException', (err) => {
 })();
 
 // ── Start Server ──────────────────────────────────────────────────────────
+// Phase 0 boot steps (never fail the boot):
+//   • where the JWT signing key comes from — a boolean, never the value;
+//   • phase 0 r4: the old demo sandbox DB is deleted if present (removed);
+//   • the daily backup schedule (04:00 Cairo; services/backup.js).
+//   • phase 0 r3: the DB-stored key is replaced ONCE (middleware/auth.js
+//     rotateJwtSecretOnce) — every older session logs in again;
+try { if (rotateJwtSecretOnce()) console.log('🔐 JWT secret rotated once (phase 0 r3) — every session from before logs in again'); }
+catch (e) { console.error('[auth] JWT secret rotation failed:', e.message); }
+console.log(`🔐 JWT_SECRET from env: ${process.env.JWT_SECRET ? 'yes' : 'NO — using the DB-stored secret (set JWT_SECRET in Railway Variables)'}`);
+try { if (removeDemoDbAtBoot()) console.log('🗑️  Old demo sandbox DB deleted at boot (the sandbox is removed, 2026-11-22)'); }
+catch (e) { console.error('[demo] boot removal failed:', e.message); }
+backup.startSchedule({ getLiveDb, dbPath: DB_PATH });
+
 app.listen(PORT, () => {
   console.log('');
   console.log('🛋️  Grand Furniture Backend — Running');

@@ -24,6 +24,7 @@
  *   META_TEST_EVENT_CODE (optional) — routes events to Test Events while wiring
  */
 const crypto = require('crypto');
+const { blockInDemo } = require('./outbound');
 
 const API_VERSION = 'v25.0';
 const LEAD_EVENT_SOURCE = 'Grand Furniture CRM';
@@ -126,6 +127,9 @@ function normalizeGender(raw) {
 function sendMetaEvent(eventName, userData = {}, eventId = undefined, custom = undefined, opts = {}) {
   try {
     if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) return; // not configured — skip
+    // Phase 0: one guard for every caller — a demo_ session never reaches Meta
+    // (the call sites' own demo_ checks stay as a first line).
+    if (blockInDemo('capi')) return;
 
     // ── user_data: as many matchable identifiers as we have ──────────────────
     const user_data = {};
@@ -245,6 +249,7 @@ async function bulkSyncHistoricalLeads(leads = []) {
   };
   try {
     if (!summary.configured) return summary;
+    if (blockInDemo('capi.bulk')) { summary.errors.push('demo: nothing sent'); return summary; }
 
     // Build events, dropping leads whose phone can't be hashed to a valid number.
     const events = [];

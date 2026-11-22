@@ -143,3 +143,7 @@ vite.config.ts.timestamp-*
 *.db-shm
 *.db-wal
 data/
+
+# Phase 0: local DB backups (services/backup.js)
+backups/
+*.db.partial

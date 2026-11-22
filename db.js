@@ -7,6 +7,7 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { classifyLead } = require('./scoring');
+const { scrubSettingsSecrets } = require('./services/secrets');
 
 // ── Persistent DB path resolution ─────────────────────────────────────────
 // Priority:
@@ -805,6 +806,44 @@ function initializeDatabase(dbPath = DB_PATH) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
 
+  // users.demo_account — 1 only on the sandbox's training accounts (made by
+  // POST /api/admin/generate-demo-accounts, in the demo DB). Login to the demo
+  // DB and every demo session require it, so a cloned live account can never
+  // log in there (phase 0 r2). Always 0 in the live DB.
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN demo_account INTEGER NOT NULL DEFAULT 0`);
+    console.log('✅ Migration: demo_account column added to users');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
+  // users.token_version (phase 0 r4, 2026-11-22) — signed into every session
+  // token (claim tv) and compared on every request (middleware/auth.js
+  // requireAuth): a token made before a change to the account's password,
+  // role, branch or active flag is dead at once (401 → one login). Bumped by
+  // the trigger below, so EVERY route that writes one of those columns —
+  // today's and any later one — logs the old sessions out without remembering
+  // to. Existing rows start at 0 and a token without tv counts as 0, so this
+  // migration alone logs nobody out.
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0`);
+    console.log('✅ Migration: token_version column added to users');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS users_token_version_bump
+    AFTER UPDATE OF password_hash, role, branch, active ON users
+    FOR EACH ROW
+    WHEN OLD.password_hash IS NOT NEW.password_hash
+      OR OLD.role          IS NOT NEW.role
+      OR OLD.branch        IS NOT NEW.branch
+      OR OLD.active        IS NOT NEW.active
+    BEGIN
+      UPDATE users SET token_version = COALESCE(OLD.token_version, 0) + 1 WHERE id = NEW.id;
+    END;
+  `);
+
   // New performance indexes
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at);
@@ -993,19 +1032,28 @@ function initializeDatabase(dbPath = DB_PATH) {
   return db;
 }
 
-// ── Account-based cloned sandbox ─────────────────────────────────────────────
-// Two physical DBs: production (grand_furniture.db) and a sandbox clone
-// (grand_furniture_demo.db). Routing is PER REQUEST via AsyncLocalStorage —
-// a request runs in the demo context only when the logged-in user's name
-// starts with `demo_`. Webhooks / background jobs / startup have no context
-// and always hit production. Existing getDb() call sites need no changes.
+// ── The demo sandbox: REMOVED (owner, 2026-11-22) ────────────────────────────
+// There used to be a second DB (grand_furniture_demo.db): «وضع التدريب», a
+// clone of production for demo_* training accounts, routed per request by a
+// signed ctx 'demo' claim. It was a copy of every live customer and phone
+// behind a second set of logins, and the phase 0 reviews kept finding ways
+// across it (cloned live accounts, live-key demo tokens, re-clones by a
+// sandbox admin). The owner approved removing it on 2026-11-22. Now:
+//   • a demo_ login is 401 and a ctx 'demo' token is never accepted
+//     (middleware/auth.js), so no request runs in the demo context;
+//   • the file (+ -wal / -shm / -journal) is deleted at boot if present
+//     (removeDemoDbAtBoot) and never copied by services/backup.js;
+//   • getDemoDb() throws instead of making a file — any code path left that
+//     still asks for the sandbox fails closed;
+//   • the isDemoContext() guards stay (outbound, CAPI, settings): harmless.
+// Webhooks / background jobs / startup have no context and hit production.
 const { AsyncLocalStorage } = require('async_hooks');
 const dbContext = new AsyncLocalStorage();
 
 const DEMO_DB_PATH = path.join(path.dirname(DB_PATH), 'grand_furniture_demo.db');
+const DEMO_DB_FILES = ['', '-wal', '-shm', '-journal'].map(x => DEMO_DB_PATH + x);
 
 let liveDbInstance = null;
-let demoDbInstance = null;
 
 function getLiveDb() {
   if (!liveDbInstance) liveDbInstance = initializeDatabase(DB_PATH);
@@ -1013,14 +1061,26 @@ function getLiveDb() {
 }
 
 function getDemoDb() {
-  if (!demoDbInstance) demoDbInstance = initializeDatabase(DEMO_DB_PATH);
-  return demoDbInstance;
+  throw new Error('demo_sandbox_removed');
 }
+
+// Deletes the old sandbox's files. → how many were removed. Never throws.
+function wipeDemoDb() {
+  closeReadonlyDb('demo');
+  let n = 0;
+  for (const f of DEMO_DB_FILES) {
+    try { if (fs.existsSync(f)) { fs.rmSync(f); n++; } }
+    catch (_) { /* best-effort */ }
+  }
+  return n;
+}
+// Boot: the sandbox's file (a clone of production) is deleted if present.
+function removeDemoDbAtBoot() { return wipeDemoDb() > 0; }
 
 // getDb() — argument-free. Reads the per-request context set by requireAuth.
 function getDb() {
   const store = dbContext.getStore();
-  return store && store.demo ? getDemoDb() : getLiveDb();
+  return store && store.demo ? getDemoDb() : getLiveDb();   // demo: throws (removed)
 }
 
 // Runs `fn` (the rest of a request) inside a live/demo DB context.
@@ -1028,23 +1088,37 @@ function runWithDbContext(isDemo, fn) {
   return dbContext.run({ demo: !!isDemo }, fn);
 }
 
-// Releases the cached demo handle + deletes its files (.db / -wal / -shm).
-function wipeDemoDb() {
-  if (demoDbInstance) { try { demoDbInstance.close(); } catch (_) {} demoDbInstance = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { if (fs.existsSync(DEMO_DB_PATH + suffix)) fs.rmSync(DEMO_DB_PATH + suffix); }
-    catch (_) { /* best-effort */ }
-  }
+// True inside a demo_ session's request (and anything it started: promises,
+// timers and fire-and-forget sends keep the context). The outbound guard
+// (services/outbound.js) keys on it.
+function isDemoContext() {
+  const store = dbContext.getStore();
+  return !!(store && store.demo);
 }
+function getDbContextName() { return isDemoContext() ? 'demo' : 'live'; }
 
-// Clones a fresh snapshot of production into the demo DB file.
-async function cloneLiveToDemo() {
-  wipeDemoDb();                       // release handle + remove stale files
-  const live = getLiveDb();
-  await live.backup(DEMO_DB_PATH);    // online backup — safe while live is in use
+// ── Read-only connections for the SQL readers (phase 0) ──────────────────────
+// The MCP run_select_sql and the admin AI chat run model-written SELECTs on a
+// connection opened readonly + query_only, separate from the app's handle, so
+// even a statement that slipped past the guard cannot write. One per context.
+const readonlyDbs = { live: null, demo: null };
+function getReadonlyDb() {
+  const name = getDbContextName();
+  if (readonlyDbs[name]) return readonlyDbs[name];
+  // Make sure the file exists and is migrated (the app's handle does that).
+  if (name === 'demo') getDemoDb(); else getLiveDb();   // demo: throws (removed)
+  const ro = new Database(name === 'demo' ? DEMO_DB_PATH : DB_PATH, { readonly: true, fileMustExist: true });
+  ro.pragma('query_only = ON');
+  ro.pragma('busy_timeout = 3000');
+  readonlyDbs[name] = ro;
+  return ro;
+}
+function closeReadonlyDb(name) {
+  if (readonlyDbs[name]) { try { readonlyDbs[name].close(); } catch (_) {} readonlyDbs[name] = null; }
 }
 
 module.exports = {
   getDb, getLiveDb, getDemoDb, runWithDbContext,
-  wipeDemoDb, cloneLiveToDemo, DEMO_DB_PATH,
+  wipeDemoDb, removeDemoDbAtBoot, DEMO_DB_PATH, DEMO_DB_FILES,
+  DB_PATH, isDemoContext, getDbContextName, getReadonlyDb,
 };

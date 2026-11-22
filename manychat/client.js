@@ -4,9 +4,12 @@
 
 const mockClient = require('./mockClient');
 const realClient = require('./realClient');
-const { getDb }  = require('../db');
+const demoClient = require('./demoClient');
+const { getDb, isDemoContext } = require('../db');
 
 function getManyChatClient() {
+  // Phase 0: a demo_ session never reaches ManyChat, whatever its DB holds.
+  if (isDemoContext()) return demoClient;
   const db = getDb();
   const apiKeyRow = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_api_key'`).get();
   
