@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-22-phase0-security-r4';
+const BUILD_VERSION = '2026-11-22-phase1-declutter';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -28,7 +28,7 @@ const { canSend, recordSend, getStateRotated, getWeeklyLimit } = require('./serv
 const { predict }          = require('./services/prediction');
 const { decide, flowIdFor }= require('./services/nextAction');
 const { syncLeadClass }    = require('./services/tagging');
-const { sendMetaEvent, bulkSyncHistoricalLeads, leadEventId } = require('./services/metaCapi');
+const { sendMetaEvent, leadEventId } = require('./services/metaCapi');
 const { callAi, getAiConfig, extractJson, isAllowedAiBaseUrl } = require('./services/ai');
 const { getManyChatClient }= require('./manychat/client');
 const counters             = require('./services/healthCounters');
@@ -237,7 +237,7 @@ function autoAssignLead(db, userId, leadName, branchHint = null) {
              WHERE lp.assigned_rep = u.name
                AND lp.lead_class NOT IN ('purchased','converted')) AS load
         FROM users u
-        WHERE u.role IN ('sales', 'rep') AND u.active = 1
+        WHERE u.role = 'sales' AND u.active = 1   -- phase 1: never a call rep
         ORDER BY load ASC, u.name ASC
         LIMIT 1
       `).get();
@@ -347,7 +347,6 @@ app.use((req, res, next) => {
 // whether it was a demo_ session. The rep dashboard and the AI SQL / MCP tools
 // count themselves (role-scoped inside their routes).
 const USAGE_ROUTES = [
-  ['ai_pages',            (m, p) => p.startsWith('/api/admin/ai/')],
   ['ai_brief',            (m, p) => /^\/api\/sales\/customers\/[^/]+\/ai-brief$/.test(p)],
   ['mcp',                 (m, p) => p.startsWith('/api/mcp/')],
   ['analytics_campaigns', (m, p) => p === '/api/analytics'],
@@ -1141,62 +1140,30 @@ app.post('/api/events', validateSecret, validatePayload, rateLimiter, (req, res)
 // ── Dashboard Cache ────────────────────────────────────────────────────────
 // Phase 0: one entry per DB context × scope («live|admin», «demo|rep», …), so
 // a demo_ session is never served the live numbers or the reverse. Who gets
-// what (read from the portal: only AdminDashboardView and
-// SalesRepDashboardView call it):
+// what (read from the portal: only AdminDashboardView calls it):
 //   admin → everything (company-wide numbers);
-//   rep   → recent_hot_leads only (the one field SalesRepDashboardView reads),
-//           the same top-10 list reps get today;
 //   anyone else → 403 (no portal page of theirs calls it; branch managers
 //           have /api/branch/overview).
 const DASHBOARD_TTL_MS = 15 * 1000;
 const dashboardCache = new Map();           // `${ctx}|${scope}` → { data, timestamp }
-// Ids of the hot leads served to each rep in the last 30 minutes, per context
-// and per REP (phase 0 r4: keyed by the rep's user id — one rep loading the
-// dashboard no longer opens those leads for every other rep). A rep may OPEN
-// those (GET /api/leads/:user_id, read routes) as their page does today; a
-// write (task, sale, sent flow, revisit note) needs the lead to be his
-// (canActOnLead) — the served grant is read-only.
-const repServedLeads = { live: new Map(), demo: new Map() };   // rep id → Map(user_id → last served ms)
-const REP_SERVED_MS = 30 * 60 * 1000;
+// Phase 1 (2026-11-22): the call-rep («مندوب») dashboard is gone — 0 rep
+// users live; the role value stays valid in the users table so an old row
+// never crashes a login, but /api/dashboard is admin-only and a rep opens
+// only a lead that is his (leadIsMine). The 30-minute «served on my
+// dashboard» grant went with the page.
 function dashboardScope(user) {
-  if (user?.role === 'admin') return 'admin';
-  if (user?.role === 'rep') return 'rep';
-  return null;
-}
-function rememberRepServed(ctx, repId, leads) {
-  if (repId == null) return;
-  const byRep = repServedLeads[ctx]; const now = Date.now();
-  const key = String(repId);
-  if (!byRep.has(key)) byRep.set(key, new Map());
-  const m = byRep.get(key);
-  for (const l of leads || []) if (l && l.user_id) m.set(l.user_id, now);
-  for (const [rid, mm] of byRep) {
-    for (const [id, t] of mm) if (now - t > REP_SERVED_MS) mm.delete(id);
-    if (!mm.size) byRep.delete(rid);
-  }
-}
-function repWasServed(ctx, repId, userId) {
-  if (repId == null) return false;
-  const m = repServedLeads[ctx].get(String(repId));
-  const t = m && m.get(userId);
-  return t != null && Date.now() - t <= REP_SERVED_MS;
+  return user?.role === 'admin' ? 'admin' : null;
 }
 
 app.get('/api/dashboard', requireAuth, (req, res) => {
   const scope = dashboardScope(req.user);
   if (!scope) return res.status(403).json({ error: 'Forbidden' });
   const ctx = getDbContextName();
-  if (scope === 'rep' && ctx === 'live') counters.countUsage('rep_dashboard', req.user.role);
   const key = `${ctx}|${scope}`;
   const hit = dashboardCache.get(key);
-  if (hit && (Date.now() - hit.timestamp < DASHBOARD_TTL_MS)) {
-    if (scope === 'rep') rememberRepServed(ctx, req.user.id, hit.data.recent_hot_leads);
-    return res.json(hit.data);
-  }
-  const full = computeDashboard(getDb());
-  const data = scope === 'admin' ? full : { recent_hot_leads: full.recent_hot_leads };
+  if (hit && (Date.now() - hit.timestamp < DASHBOARD_TTL_MS)) return res.json(hit.data);
+  const data = computeDashboard(getDb());
   dashboardCache.set(key, { data, timestamp: Date.now() });
-  if (scope === 'rep') rememberRepServed(ctx, req.user.id, data.recent_hot_leads);
   return res.json(data);
 });
 
@@ -1516,7 +1483,9 @@ app.get('/api/leads', requireAuth, (req, res) => {
          WHERE e.user_id = lead_profiles.user_id
            AND e.event_type = 'branch_selected'
            AND COALESCE(NULLIF(e.branch,''), e.event_value) IS NOT NULL
-         ORDER BY e.created_at DESC LIMIT 1) AS requested_branch
+         ORDER BY e.created_at DESC LIMIT 1) AS requested_branch,
+      -- phase 1: the list shows a phone (the profile's, else the first one he gave), never the raw id
+      (SELECT ph.phone FROM lead_phones ph WHERE ph.user_id = lead_profiles.user_id ORDER BY ph.id LIMIT 1) AS first_phone
     FROM lead_profiles
     ${where}
     ORDER BY total_score DESC, last_activity DESC
@@ -1742,7 +1711,7 @@ function canSeeLead(db, user, userId) {
   if (role === 'admin' || role === 'reception') return true;
   if (role === 'branch_manager') return leadTiedToBranch(db, userId, user.branch || null);
   if (role === 'sales') return leadIsMine(db, userId, user.name) || leadTiedToBranch(db, userId, user.branch || null);
-  if (role === 'rep') return leadIsMine(db, userId, user.name) || repWasServed(getDbContextName(), user.id, userId);
+  if (role === 'rep') return leadIsMine(db, userId, user.name);   // phase 1: no dashboard grant
   return false;
 }
 // What a WRITE that ties the lead to the writer needs (phase 0 r4): the same
@@ -2022,7 +1991,7 @@ function linkVisitSales(db, { userId, branch, salesRep, operator }) {
 // (leadTiedToBranch), so a salesperson confirming one would open any customer
 // for himself; reception's desk (reception, admin, the reception managers and
 // the legacy rep dashboard's reception tab) keeps it.
-app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager', 'rep'), (req, res) => {
+app.post('/api/visits/confirm', requireAuth, authorizeRoles('reception', 'admin', 'branch_manager'), (req, res) => {
   if (denyNonReceptionManager(req, res)) return;
   const { phone, visit_code, branch, user_id } = req.body || {};
   const db = getDb();
@@ -2885,230 +2854,30 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Admin Achievements — composite-score leaderboards for sales reps & branches.
-//
-// Score formula (weights configurable in settings, default 30/30/40):
-//   followup_rate = followups_done / phones_received
-//   visit_rate    = visits_done    / followups_done
-//   close_rate    = purchases_done / visits_done
-//   score = followup_rate*W1 + visit_rate*W2 + close_rate*W3   (0..100)
-//
-// "phones_received" = customers assigned to this sales/branch AND lead has
-// at least one phone in lead_phones (i.e. the customer actually left a number).
+// Removed in phase 1 (2026-11-22, «شيل الزحمة», owner-approved): points /
+// badges / levels (achievements + their weights), the call-rep analytics
+// (0 rep users live), the admin AI pages (control + chat), the «مسح كل
+// الزيارات» reset, the Meta «warm-up» of old customers. Each old URL answers
+// 410 Gone with an Arabic line, so an old portal tab still open during the
+// deploy shows a message instead of crashing. The AI brief inside the sales
+// queue (/api/sales/customers/:userId/ai-brief) stays.
 // ════════════════════════════════════════════════════════════════════════════
-function getAchievementWeights() {
-  const db  = getDb();
-  const row = db.prepare(`SELECT key, value FROM settings WHERE key IN (
-    'achievement_followup_weight','achievement_visit_weight','achievement_close_weight'
-  )`).all();
-  const m = Object.fromEntries(row.map(r => [r.key, parseFloat(r.value) || 0]));
-  const w = {
-    followup: m.achievement_followup_weight || 30,
-    visit:    m.achievement_visit_weight    || 30,
-    close:    m.achievement_close_weight    || 40,
-  };
-  return w;
-}
-
-function computeScore(metrics, weights) {
-  const fr = metrics.phones_received  ? metrics.followups_done / metrics.phones_received : 0;
-  const vr = metrics.followups_done   ? metrics.visits_done    / metrics.followups_done  : 0;
-  const cr = metrics.visits_done      ? metrics.purchases_done / metrics.visits_done     : 0;
-  return {
-    followup_rate: Math.round(fr * 100),
-    visit_rate:    Math.round(vr * 100),
-    close_rate:    Math.round(cr * 100),
-    score:         Math.round(fr * weights.followup + vr * weights.visit + cr * weights.close),
-  };
-}
-
-app.get('/api/admin/achievements/sales', requireAuth, requireRole('admin'), (req, res) => {
-  const db = getDb();
-  const { branch, rep, startDate, endDate } = req.query;
-  let scopeClause = '';
-  const scopeParams = [];
-  if (branch) { scopeClause += ` AND f.branch = ?`;          scopeParams.push(branch); }
-  if (rep)    { scopeClause += ` AND f.assigned_sales = ?`;  scopeParams.push(rep); }
-  // Date range bounds the cohort by when the customer was assigned to the rep.
-  const dr = dateRangeClause('f.assigned_at', startDate, endDate);
-  scopeClause += dr.clause;
-  scopeParams.push(...dr.params);
-  const branchClause = scopeClause;
-  const branchParam  = scopeParams;
-
-  // For each (sales_rep, branch): count phones_received, followups_done,
-  // visits_done (by that rep at that branch), purchases_done (by that rep).
-  const rows = db.prepare(`
-    SELECT
-      f.assigned_sales AS sales_rep,
-      f.branch         AS branch,
-      COUNT(DISTINCT CASE WHEN ph.user_id IS NOT NULL THEN f.user_id END)   AS phones_received,
-      SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END)                    AS followups_done,
-      (SELECT COUNT(DISTINCT v.user_id) FROM lead_visits v
-        WHERE (v.sales_rep = f.assigned_sales OR v.pre_visit_rep = f.assigned_sales)
-          AND v.branch = f.branch)                                         AS visits_done,
-      (SELECT COUNT(DISTINCT p.user_id) FROM purchases p
-        WHERE p.rep = f.assigned_sales AND p.branch = f.branch)             AS purchases_done
-    FROM branch_customer_followups f
-    LEFT JOIN lead_phones ph ON ph.user_id = f.user_id
-    WHERE f.assigned_sales IS NOT NULL ${branchClause}
-    GROUP BY f.assigned_sales, f.branch
-  `).all(...branchParam);
-
-  const weights = getAchievementWeights();
-  const enriched = rows.map(r => ({ ...r, ...computeScore(r, weights) }))
-    .sort((a, b) => b.score - a.score)
-    .map((r, i) => ({ ...r, rank: i + 1 }));
-
-  // Attach badges
-  const badges = db.prepare(`
-    SELECT entity_id, badge_code, badge_label, earned_at, score
-    FROM achievement_badges WHERE entity_type = 'sales'
-    ORDER BY earned_at DESC
-  `).all();
-  const badgesByRep = badges.reduce((acc, b) => {
-    (acc[b.entity_id] ||= []).push(b);
-    return acc;
-  }, {});
-  for (const r of enriched) r.badges = badgesByRep[r.sales_rep] || [];
-
-  return res.json({ weights, rows: enriched });
-});
-
-app.get('/api/admin/achievements/branches', requireAuth, requireRole('admin'), (req, res) => {
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT
-      f.branch AS branch,
-      COUNT(DISTINCT CASE WHEN ph.user_id IS NOT NULL THEN f.user_id END)  AS phones_received,
-      SUM(CASE WHEN f.followed_up = 1 THEN 1 ELSE 0 END)                   AS followups_done,
-      (SELECT COUNT(DISTINCT v.user_id) FROM lead_visits v
-        WHERE v.branch = f.branch)                                         AS visits_done,
-      (SELECT COUNT(DISTINCT p.user_id) FROM purchases p
-        WHERE p.branch = f.branch)                                         AS purchases_done
-    FROM branch_customer_followups f
-    LEFT JOIN lead_phones ph ON ph.user_id = f.user_id
-    WHERE f.branch IS NOT NULL
-    GROUP BY f.branch
-  `).all();
-
-  const weights = getAchievementWeights();
-  const enriched = rows.map(r => ({ ...r, ...computeScore(r, weights) }))
-    .sort((a, b) => b.score - a.score)
-    .map((r, i) => ({ ...r, rank: i + 1 }));
-
-  const badges = db.prepare(`
-    SELECT entity_id, badge_code, badge_label, earned_at, score
-    FROM achievement_badges WHERE entity_type = 'branch'
-    ORDER BY earned_at DESC
-  `).all();
-  const badgesByBranch = badges.reduce((acc, b) => {
-    (acc[b.entity_id] ||= []).push(b);
-    return acc;
-  }, {});
-  for (const r of enriched) r.badges = badgesByBranch[r.branch] || [];
-
-  return res.json({ weights, rows: enriched });
-});
-
-app.post('/api/admin/achievements/award', requireAuth, requireRole('admin'), (req, res) => {
-  const { entity_type, entity_id, badge_code, badge_label, score } = req.body || {};
-  if (!['sales','branch'].includes(entity_type)) return res.status(400).json({ error: 'bad_entity_type' });
-  if (!entity_id || !badge_code || !badge_label) return res.status(400).json({ error: 'missing_fields' });
-
-  const db = getDb();
-  try {
-    db.prepare(`
-      INSERT INTO achievement_badges (entity_type, entity_id, badge_code, badge_label, score)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(entity_type, entity_id, badge_code, badge_label, score ?? null);
-    return res.json({ ok: true });
-  } catch (e) {
-    // UNIQUE violation = badge already awarded → idempotent
-    if (String(e.message).includes('UNIQUE')) return res.json({ ok: true, alreadyEarned: true });
-    return res.status(500).json({ error: 'award_failed' });
-  }
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// GET /api/admin/reps-analytics — per-call-rep performance (role='rep').
-// Returns per-rep counters: leads assigned, hot/visited/purchased among them,
-// messages triggered, tasks pending/done. No personal tools — pure analytics.
-// ════════════════════════════════════════════════════════════════════════════
-app.get('/api/admin/reps-analytics', requireAuth, requireRole('admin'), (_req, res) => {
-  const db = getDb();
-
-  // All users with role='rep' (call reps / موديريتورز)
-  const reps = db.prepare(`
-    SELECT name, email, branch, active, created_at
-    FROM users
-    WHERE role = 'rep'
-    ORDER BY name
-  `).all();
-
-  // Lead aggregates grouped by assigned_rep
-  const leadStats = db.prepare(`
-    SELECT
-      assigned_rep AS rep,
-      COUNT(*) AS leads_assigned,
-      SUM(CASE WHEN lead_class = 'hot'       THEN 1 ELSE 0 END) AS hot_leads,
-      SUM(CASE WHEN lead_class IN ('visited','purchased','converted') THEN 1 ELSE 0 END) AS visited,
-      SUM(CASE WHEN lead_class = 'purchased' THEN 1 ELSE 0 END) AS purchased
-    FROM lead_profiles
-    WHERE assigned_rep IS NOT NULL AND assigned_rep != ''
-    GROUP BY assigned_rep
-  `).all();
-  const leadsByRep = Object.fromEntries(leadStats.map(r => [r.rep, r]));
-
-  // Messages sent per rep
-  const msgStats = db.prepare(`
-    SELECT sent_by_rep AS rep, COUNT(*) AS messages_sent
-    FROM messages_sent
-    WHERE sent_by_rep IS NOT NULL
-    GROUP BY sent_by_rep
-  `).all();
-  const msgsByRep = Object.fromEntries(msgStats.map(r => [r.rep, r.messages_sent]));
-
-  // Tasks per rep
-  const taskStats = db.prepare(`
-    SELECT rep_name AS rep,
-      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS tasks_pending,
-      SUM(CASE WHEN status = 'done'    THEN 1 ELSE 0 END) AS tasks_done
-    FROM tasks
-    WHERE rep_name IS NOT NULL
-    GROUP BY rep_name
-  `).all();
-  const tasksByRep = Object.fromEntries(taskStats.map(r => [r.rep, r]));
-
-  const rows = reps.map(u => {
-    const ls = leadsByRep[u.name]   || {};
-    const ts = tasksByRep[u.name]   || {};
-    const leads     = ls.leads_assigned || 0;
-    const visited   = ls.visited        || 0;
-    const purchased = ls.purchased      || 0;
-    return {
-      name:           u.name,
-      email:          u.email,
-      branch:         u.branch,
-      active:         u.active,
-      leads_assigned: leads,
-      hot_leads:      ls.hot_leads || 0,
-      visited,
-      purchased,
-      messages_sent:  msgsByRep[u.name] || 0,
-      tasks_pending:  ts.tasks_pending  || 0,
-      tasks_done:     ts.tasks_done     || 0,
-      conversion_rate: leads   ? Math.round((visited   / leads)   * 100) : 0,
-      close_rate:      visited ? Math.round((purchased / visited) * 100) : 0,
-    };
-  }).sort((a, b) => (b.purchased - a.purchased) || (b.visited - a.visited));
-
-  return res.json({ rows });
-});
-
-app.get('/api/settings/achievement-weights', requireAuth, requireRole('admin'), (_req, res) => {
-  return res.json(getAchievementWeights());
-});
+const PHASE1_REMOVED = [
+  ['get',  '/api/admin/achievements/sales'],
+  ['get',  '/api/admin/achievements/branches'],
+  ['post', '/api/admin/achievements/award'],
+  ['get',  '/api/settings/achievement-weights'],
+  ['put',  '/api/settings/achievement-weights'],
+  ['get',  '/api/admin/reps-analytics'],
+  ['get',  '/api/admin/ai/status'],
+  ['post', '/api/admin/ai/test'],
+  ['get',  '/api/admin/ai/recent-briefs'],
+  ['post', '/api/admin/ai/chat'],
+  ['post', '/api/admin/reset-visits'],
+  ['post', '/api/admin/meta/sync-historical'],
+];
+const removedRoute = (_req, res) => res.status(410).json({ error: 'removed', message: 'الخاصية دي اتشالت من السيستم' });
+for (const [m, p] of PHASE1_REMOVED) app[m](p, requireAuth, removedRoute);
 
 // Admin alert: surface ManyChat External Requests that still send the
 // literal placeholder "{{cuf_…}}" because the user_field reference was
@@ -3266,25 +3035,6 @@ app.put('/api/settings/forecast-weights', requireAuth, requireRole('admin'), (re
   return res.json({ ok: true, weights: { with_phone: w, without_phone: wo } });
 });
 
-app.put('/api/settings/achievement-weights', requireAuth, requireRole('admin'), (req, res) => {
-  const { followup, visit, close } = req.body || {};
-  const f = parseFloat(followup), v = parseFloat(visit), c = parseFloat(close);
-  if ([f, v, c].some(n => !Number.isFinite(n) || n < 0 || n > 100)) {
-    return res.status(400).json({ error: 'invalid_weights' });
-  }
-  if (Math.round(f + v + c) !== 100) {
-    return res.status(400).json({ error: 'weights_must_sum_to_100' });
-  }
-  const db = getDb();
-  const upsert = db.prepare(`
-    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-  `);
-  upsert.run('achievement_followup_weight', String(f));
-  upsert.run('achievement_visit_weight',    String(v));
-  upsert.run('achievement_close_weight',    String(c));
-  return res.json({ ok: true, weights: getAchievementWeights() });
-});
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/branch/overview — branch manager's read-only view of THEIR branch.
@@ -3485,6 +3235,11 @@ app.get('/api/branch/customers', requireAuth, authorizeRoles('branch_manager', '
       COALESCE(f.auto_assigned, 0) AS auto_assigned,
       CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END AS visited,
       lv.sales_rep AS showroom_rep,
+      -- phase 1: «لسه ما اتوزعوش» leaves out whoever already came (any
+      -- branch, or a confirmed visit) or bought — they are not to distribute.
+      CASE WHEN EXISTS (SELECT 1 FROM lead_visits av WHERE av.user_id = req.user_id)
+             OR COALESCE(lp.visit_confirmed, 0) = 1 THEN 1 ELSE 0 END AS visited_any,
+      CASE WHEN EXISTS (SELECT 1 FROM purchases bp WHERE bp.user_id = req.user_id) THEN 1 ELSE 0 END AS bought,
       ${crossBranchCols('req.user_id')}
     FROM (
       SELECT DISTINCT e.user_id
@@ -3941,6 +3696,8 @@ app.post('/api/branch/customers/bulk-assign', requireAuth, authorizeRoles('branc
       ON f.user_id = req.user_id AND f.branch = ?
     WHERE COALESCE(lp.is_duplicate, 0) = 0
       AND COALESCE(lp.visit_confirmed, 0) = 0
+      AND NOT EXISTS (SELECT 1 FROM lead_visits av WHERE av.user_id = req.user_id)   -- phase 1: came already
+      AND NOT EXISTS (SELECT 1 FROM purchases bp WHERE bp.user_id = req.user_id)     -- phase 1: bought already
       AND (f.id IS NULL OR f.assigned_sales IS NULL OR TRIM(f.assigned_sales) = '')
     ORDER BY total_score DESC
   `).all(branch, branch, branch);
@@ -4886,203 +4643,7 @@ app.get('/api/sales/customers/:userId/ai-brief', requireAuth,
   return res.json({ ok: true, cached: false, brief, draft_message: draft });
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-// Admin AI control panel — status/test/oversight for the z.ai integration.
-//   GET  /api/admin/ai/status        — configured? which model? usage counts.
-//   POST /api/admin/ai/test          — fires one trivial live call, times it.
-//   GET  /api/admin/ai/recent-briefs — last 20 generated briefs (oversight —
-//                                      admin can literally read what the AI
-//                                      is producing for real customers).
-// ════════════════════════════════════════════════════════════════════════════
-app.get('/api/admin/ai/status', requireAuth, requireRole('admin'), (req, res) => {
-  const { configured, model, baseUrl } = getAiConfig();
-  const db = getDb();
-  const stats = db.prepare(`
-    SELECT COUNT(*) AS briefs_generated,
-      MAX(updated_at) AS last_generated_at
-    FROM ai_briefs
-  `).get();
-  return res.json({
-    configured, model,
-    base_url_custom: baseUrl !== 'https://api.z.ai/api/paas/v4/chat/completions',
-    briefs_generated:   stats.briefs_generated || 0,
-    last_generated_at:  stats.last_generated_at || null,
-  });
-});
 
-app.post('/api/admin/ai/test', requireAuth, requireRole('admin'), async (req, res) => {
-  const { configured, model } = getAiConfig();
-  if (!configured) {
-    return res.status(400).json({ ok: false, unconfigured: true,
-      error: 'مفيش مفتاح z.ai متسجّل — حطّه فوق في نفس الصفحة أو من الإعدادات' });
-  }
-  const start = Date.now();
-  const result = await callAi(
-    [{ role: 'user', content: 'رد بكلمة "تمام" بس، من غير أي شرح.' }],
-    { maxTokens: 300, temperature: 0 }
-  );
-  const latencyMs = Date.now() - start;
-  if (!result.ok) {
-    return res.status(502).json({ ok: false, error: result.error, latency_ms: latencyMs, model });
-  }
-  return res.json({ ok: true, model: result.model, latency_ms: latencyMs, reply: result.text });
-});
-
-app.get('/api/admin/ai/recent-briefs', requireAuth, requireRole('admin'), (req, res) => {
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT b.user_id, lp.first_name, b.brief, b.draft_message, b.model, b.updated_at
-    FROM ai_briefs b
-    LEFT JOIN lead_profiles lp ON lp.user_id = b.user_id
-    ORDER BY b.updated_at DESC
-    LIMIT 20
-  `).all();
-  return res.json({ briefs: rows });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// Admin AI chat — a conversational, READ-ONLY analyst over the whole CRM.
-//   POST /api/admin/ai/chat  { messages: [{role:'user'|'assistant', content}] }
-//
-// The model can call run_select_sql (guarded to a single SELECT statement) to
-// look up real numbers before answering. There is no write tool exposed here
-// — structurally, not just by prompt instruction, the AI cannot modify system
-// data through this endpoint. It only reads and advises.
-// ════════════════════════════════════════════════════════════════════════════
-const ADMIN_SQL_TOOL = {
-  type: 'function',
-  function: {
-    name: 'run_select_sql',
-    description: 'ينفذ استعلام SELECT للقراءة فقط على قاعدة بيانات السيستم الحقيقية ويرجع النتائج (حد أقصى 200 صف). استخدمها لأي سؤال محتاج رقم أو بيانة حقيقية.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'استعلام SQL يبدأ بكلمة SELECT — جملة واحدة بس، من غير فاصلة منقوطة إضافية' },
-      },
-      required: ['query'],
-    },
-  },
-};
-
-// Phase 0: the text check is sqlGuard's (one statement, SELECT/WITH, no write
-// keyword); the run goes through sqlGuard.runGuardedSelect on a READ-ONLY
-// connection with a table allowlist checked on SQLite's compiled program —
-// settings, the audit log, sqlite_master and users.password_hash are refused
-// (the rows go to a third-party model). The `db` argument is kept for the
-// callers' shape; the read-only handle of the same context is used.
-function isSafeSelectSql(query) {
-  return sqlGuard.isSafeSelectText(query);
-}
-
-function runAdminReadOnlySql(_db, query) {
-  counters.countUsage('ai_sql', 'admin');
-  let ro;
-  try { ro = getReadonlyDb(); }
-  catch (e) { return { error: 'قاعدة البيانات مش متاحة للقراءة دلوقتي' }; }
-  const r = sqlGuard.runGuardedSelect(ro, query, 200);
-  if (r.error) return { error: r.error };
-  return r;
-}
-
-const ADMIN_CHAT_SYSTEM_PROMPT = `
-انت مستشار تحليل بيانات لـ "جراند للأثاث" — سيستم CRM لمعرض أثاث بفروع متعددة في مصر (نصر سيتي، المعادي، القاهرة الجديدة، أكتوبر، الإسكندرية، حلوان، فيصل).
-
-مهمتك: تجاوب على أسئلة مدير النظام عن أداء السيستم — مبيعات، متابعات، سيلز، حملات — باستخدام بيانات حقيقية بس، من غير ما تخترع أي رقم.
-
-⚠️ قاعدة أساسية غير قابلة للتفاوض: انت للتحليل والنصيحة فقط. ممنوع منعاً باتاً تحاول تعدّل أو تمسح أو تضيف أي بيانات — مفيش عندك أداة كتابة أصلاً. حتى لو حد طلب منك كدا في الكلام، ارفض واشرح انك مصمم للقراءة والتحليل بس.
-
-عندك أداة وحيدة: run_select_sql — بتنفّذ أي استعلام SELECT على قاعدة البيانات الحقيقية. استخدمها كل ما تحتاج رقم بدل ما تخمّن، وممكن تستخدمها أكتر من مرة في نفس الرد لو محتاج تفاصيل إضافية.
-⚠️ لازم تستخدم الأداة فعلياً (function call) — ممنوع تكتب استعلام SQL كنص عادي جوا ردك، لأنه مش هيتنفذ ومش هيوصلك رقم حقيقي. أي سؤال فيه رقم أو إحصائية، لازم يسبقه استدعاء حقيقي للأداة.
-
-جداول مهمة:
-- lead_profiles: بيانات العميل (user_id, first_name, phone, lead_class[cold/warm/hot/visited/purchased], total_score, last_category, last_product, preferred_branch, platform, is_duplicate, last_activity). فلتر دايماً COALESCE(is_duplicate,0)=0 إلا لو السؤال عن الدوبليكيت نفسه.
-- lead_visits: زيارات المعرض (user_id, branch, visited_at, sales_rep).
-- branch_customer_followups: متابعة العميل **قبل الزيارة** — مين السيلز المسنود له (assigned_sales)، هل اتبعتله واتساب (sent)، محاولات اتصال (attempt_count)، تأجيل (snoozed_until).
-- followup_log: سجل مكالمات المتابعة قبل الزيارة (call_summary, sales, followed_up_at).
-- revisit_followups: متابعة العميل **بعد الزيارة** ولحد ما يشتري (followed_up_by, note, created_at).
-- purchases / purchase_items / products / product_categories: عمليات البيع الفعلية (branch, price, created_at, rep).
-- tasks: مهام محددة بموعد لكل عميل (due_at, done).
-- events: كل تفاعل خام للعميل (event_type, event_value, category, created_at) — مصدر الحقيقة الأساسي.
-- users: حسابات السيستم (name, role[admin/branch_manager/sales/rep/reception], branch).
-- sales_targets: المستهدفات الشهرية لكل فرع/سيلز.
-- ممنوع عليك (الأداة هترفض): جدول settings، وsystem_audit_log، وsqlite_master، وعمود users.password_hash — من users اختار الأعمدة بالاسم (name, role, branch).
-
-نقط مهمة عشان تحليلك يكون صح:
-- فيه فرق جوهري بين "قبل الزيارة" (branch_customer_followups + followup_log) و"بعد الزيارة" (revisit_followups) — متلخبطش بينهم.
-- "بعت واتساب" (sent=1) مش نفسه "اتسجلت متابعة" — ممكن السيلز يبعت والعميل ميردش، فتفتكر متابعش وهو فعلاً حاول.
-- ملكية العميل بتتحدد بـ assigned_sales قبل الزيارة أو sales_rep بعد الزيارة — مش نفس العمود دايماً.
-- لو حد سألك عن الإيراد الفعلي استخدم جدول purchases مباشرة، مش أي رقم تقديري.
-- رد بالعامية المصرية، مختصر ومباشر، ابدأ بالإجابة مش بمقدمة طويلة. لو الاستعلام رجّع فاضي أو رقم مش موجود، قول كدا بصراحة.
-- أرقام الموبايل بتوصلك كرموز زي ⟨phone:1…78⟩ — لو محتاج تبحث برقم، حط الرمز زي ما هو جوه الاستعلام بين علامتين '…'، وممنوع تخمّن الرقم.
-`.trim();
-
-app.post('/api/admin/ai/chat', requireAuth, requireRole('admin'), async (req, res) => {
-  const db = getDb();
-  if (!getAiConfig().configured) {
-    return res.status(400).json({ error: 'الذكاء الاصطناعي مش متظبط — حط مفتاح z.ai في الإعدادات → API', unconfigured: true });
-  }
-
-  const rawHistory = Array.isArray(req.body?.messages) ? req.body.messages : [];
-  const cleanHistory = rawHistory
-    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-    .slice(-20)
-    .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
-
-  if (!cleanHistory.length || cleanHistory[cleanHistory.length - 1].role !== 'user') {
-    return res.status(400).json({ error: 'محتاج رسالة من المستخدم' });
-  }
-
-  const messages = [{ role: 'system', content: ADMIN_CHAT_SYSTEM_PROMPT }, ...cleanHistory];
-
-  // The admin explicitly wants deep, patient analysis over speed — no cost
-  // concern (free/cheap tiers), so give the loop lots of room to investigate
-  // before giving up. Still bounded, not literally infinite: a runaway loop
-  // would just hang the request and burn provider quota for no benefit.
-  const MAX_TOOL_ROUNDS = 20;
-  const queriesRun = [];
-  // C1.11: ONE masker for this HTTP request, shared by every round — the
-  // model sees ⟨phone:N…XY⟩ tokens, never a phone; its SQL is unmasked here
-  // before it runs; the reply and queries_run are unmasked for the admin.
-  const masker = createPhoneMasker();
-
-  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const result = await callAi(messages, {
-      maxTokens: 4000,
-      temperature: 0.3,
-      tools: [ADMIN_SQL_TOOL],
-      timeoutMs: 120000,
-      masker,
-    });
-
-    if (!result.ok) {
-      return res.status(result.unconfigured ? 400 : 502).json({ error: result.error, unconfigured: !!result.unconfigured });
-    }
-
-    if (result.toolCalls) {
-      messages.push({ role: 'assistant', content: result.text || null, tool_calls: result.toolCalls });
-      for (const call of result.toolCalls) {
-        let args = {};
-        try { args = JSON.parse(call.function?.arguments || '{}'); } catch (_) { /* malformed args → guard below rejects */ }
-        // The model's SQL as it wrote it — tokens, never a phone (masked again
-        // by the same masker in case the model ever typed a raw number).
-        console.error(`[ai-chat] SQL by ${req.user?.name}: ${masker.maskText(String(args.query))}`);
-        const un = masker.unmaskSql(args.query);
-        const queryOutput = un.ok
-          ? runAdminReadOnlySql(db, un.sql)
-          : { error: 'رقم مش معروف في المحادثة دي — استخدم الرمز زي ما وصلك' };
-        queriesRun.push({ query: args.query, ok: !queryOutput.error });
-        // Real rows go into the history; the next callAi round masks them.
-        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(queryOutput) });
-      }
-      continue; // ask the model again with the tool results in context
-    }
-
-    return res.json({ ok: true, reply: masker.unmaskText(result.text), model: result.model,
-      queries_run: queriesRun.map(q => ({ ...q, query: masker.unmaskText(q.query) })) });
-  }
-
-  return res.status(502).json({ error: 'محتاج استعلامات كتير جداً عشان يرد — جرّب تسأل بشكل أبسط أو أكتر تحديداً' });
-});
 
 // ════════════════════════════════════════════════════════════════════════════
 // Pre-visit follow-up LOG — the rep can record SEVERAL follow-ups over time for
@@ -5465,7 +5026,27 @@ app.post('/api/purchases', requireAuth, (req, res) => {
   // to every branch manager). If the client didn't send one, use the rep's
   // current branch, else the customer's most-recent visit branch, else their
   // preferred branch.
-  let branchVal = (branch && String(branch).trim()) || null;
+  // Phase 1 (2026-11-22): a sales / branch-manager sale is ALWAYS in his own
+  // branch (a typed other branch is refused, never stored); an admin's typed
+  // branch must be one of the system's (intakeBranch — the 6 codes, their
+  // aliases, an active_branches id), else 400 — never free text as a branch.
+  const typedBranch = branch != null && String(branch).trim() !== '' ? String(branch).trim() : null;
+  let branchVal = null;
+  if (role === 'sales' || role === 'branch_manager') {
+    const own = req.user.branch || null;
+    if (!own) {
+      return res.status(400).json({ error: 'حسابك مش متربط بفرع — كلّم مدير النظام', code: 'no_own_branch' });
+    }
+    if (typedBranch && intakeBranch(typedBranch, { db }) !== own && typedBranch !== own) {
+      return res.status(403).json({ error: 'تقدر تسجّل البيعة في فرعك بس', code: 'other_branch' });
+    }
+    branchVal = own;
+  } else if (typedBranch) {
+    branchVal = intakeBranch(typedBranch, { db });
+    if (!branchVal) {
+      return res.status(400).json({ error: 'الفرع ده مش من فروع السيستم — اختار من القايمة', code: 'invalid_branch' });
+    }
+  }
   if (!branchVal && rep) {
     branchVal = db.prepare(`SELECT branch FROM users WHERE TRIM(name) = TRIM(?) LIMIT 1`).get(rep)?.branch || null;
   }
@@ -6904,9 +6485,22 @@ app.put('/api/scoring-rules', requireAuth, requireRole('admin'), (req, res) => {
 // all — the value itself never leaves the server. The portal's key fields
 // still show «set / غير مُعَيَّن»; a new key is saved by typing over the mask
 // (PUT below ignores a mask sent back unchanged). services/secrets.js.
+// Phase 1 (2026-11-22): settings that no code reads any more — not shown, not
+// written (PUT answers 410). Their rows stay in the table untouched.
+//   company_name / manychat_page_id / openai_api_key / facebook_pixel_id —
+//     never read anywhere; reminder_job_enabled / manychat_reminder_flow —
+//     the 3-day reminder job (removed); achievement_* — points & badges
+//     (removed). The trigger-engine flows (manychat_flow_*) and
+//     weekly_message_limit stay readable: POST /api/trigger-message stays
+//     until phase 8, though no portal page calls it now.
+const RETIRED_SETTINGS = new Set([
+  'company_name', 'manychat_page_id', 'openai_api_key', 'facebook_pixel_id',
+  'reminder_job_enabled', 'manychat_reminder_flow',
+  'achievement_followup_weight', 'achievement_visit_weight', 'achievement_close_weight',
+]);
 app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
   const db   = getDb();
-  const rows = db.prepare(`SELECT key, value FROM settings`).all();
+  const rows = db.prepare(`SELECT key, value FROM settings`).all().filter(r => !RETIRED_SETTINGS.has(r.key));
   return res.json(secrets.settingsForClient(rows));
 });
 
@@ -6914,12 +6508,8 @@ app.get('/api/settings', requireAuth, requireRole('admin'), (req, res) => {
 // Admin-only (exposes the webhook secret so it can be pasted into ManyChat).
 app.get('/api/integration-status', requireAuth, requireRole('admin'), (req, res) => {
   const apiKey = (getSetting('manychat_api_key') || '').trim();
-  const flowKeys = [
-    'manychat_flow_immediate', 'manychat_flow_branch_info',
-    'manychat_flow_offer',     'manychat_flow_reengage',
-    'manychat_visit_flow',     'manychat_purchase_flow',
-    'manychat_reminder_flow',
-  ];
+  // Phase 1: only the flows something still sends (visit confirmed, purchase).
+  const flowKeys = ['manychat_visit_flow', 'manychat_purchase_flow'];
   const missing_flows = flowKeys.filter(k => !(getSetting(k) || '').trim());
 
   return res.json({
@@ -6945,6 +6535,7 @@ app.put('/api/settings/:key', requireAuth, requireRole('admin'), (req, res) => {
   // Phase 0: the session signing key is never written through the API.
   // (r3) nor the flag of its one-time rotation.
   if (secrets.NEVER_LISTED.has(key) || key === ROTATED_FLAG) return res.status(400).json({ error: 'not_editable' });
+  if (RETIRED_SETTINGS.has(key)) return res.status(410).json({ error: 'removed', message: 'الإعداد ده اتشال — مالوش تأثير' });
   const db = getDb();
   // A secret field saved without typing a new value sends back the mask GET
   // gave it — keep the stored key (answer ok, as a save of the same value).
@@ -6985,7 +6576,7 @@ app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 app.post('/api/users', requireAuth, requireRole('admin'), (req, res) => {
-  let { name, email, password, role = 'rep', branch } = req.body || {};
+  let { name, email, password, role = 'sales', branch } = req.body || {};
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
@@ -7587,6 +7178,75 @@ app.get('/api/admin/search', requireAuth, requireRole('admin'), (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/search?q= — the top bar's search, for EVERY role, each within its
+// own scope (phase 1, 2026-11-22). By name or any phone (Arabic digits and
+// «+20 / 0100-…» spellings fold the same way as the other boxes: searchTerms).
+//   admin     → every customer;
+//   reception → every customer it may open (canSeeLead: reception opens any
+//               profile; the profile itself trims other branches away);
+//   branch_manager → customers tied to his branch (leadTiedToBranch);
+//   sales / rep    → his own customers (leadIsMine).
+// The SQL narrows to the scope first (so a common name can't push his own
+// customers out of the page), and every row returned is re-checked with the
+// same predicate the profile uses — a result always opens.
+// ════════════════════════════════════════════════════════════════════════════
+const SEARCH_SCOPE_MINE = `
+  SELECT user_id FROM lead_profiles WHERE assigned_rep = @n
+  UNION SELECT user_id FROM branch_customer_followups WHERE TRIM(assigned_sales) = TRIM(@n)
+  UNION SELECT user_id FROM lead_visits WHERE TRIM(sales_rep) = TRIM(@n) OR pre_visit_rep = @n
+  UNION SELECT user_id FROM followup_log WHERE sales = @n
+  UNION SELECT user_id FROM purchases WHERE TRIM(rep) = TRIM(@n)
+  UNION SELECT user_id FROM revisit_followups WHERE followed_up_by = @n
+  UNION SELECT lead_id FROM tasks WHERE rep_name = @n
+  UNION SELECT user_id FROM messages_sent WHERE sent_by_rep = @n`;
+const SEARCH_SCOPE_BRANCH = `
+  SELECT user_id FROM lead_profiles WHERE preferred_branch = @b
+  UNION SELECT user_id FROM events WHERE branch = @b
+          OR (event_type IN ('branch_selected','location_request') AND event_value = @b)
+  UNION SELECT user_id FROM lead_visits WHERE branch = @b
+  UNION SELECT user_id FROM visit_checkins WHERE branch = @b
+  UNION SELECT user_id FROM branch_customer_followups WHERE branch = @b
+  UNION SELECT user_id FROM followup_log WHERE branch = @b
+  UNION SELECT user_id FROM purchases WHERE branch = @b
+  UNION SELECT lp.user_id FROM lead_profiles lp JOIN users su ON su.name = lp.assigned_rep WHERE su.branch = @b`;
+const SEARCH_PAGE = 20;
+function searchScopeOf(user) {
+  const role = user?.role;
+  if (role === 'admin' || role === 'reception') return { sql: null, check: (db, id) => canSeeLead(db, user, id) };
+  if (role === 'branch_manager') {
+    if (!user.branch) return null;
+    return { sql: SEARCH_SCOPE_BRANCH, params: { b: user.branch }, check: (db, id) => leadTiedToBranch(db, id, user.branch) };
+  }
+  if (role === 'sales' || role === 'rep') {
+    if (!user.name) return null;
+    return { sql: SEARCH_SCOPE_MINE, params: { n: user.name }, check: (db, id) => leadIsMine(db, id, user.name) };
+  }
+  return null;
+}
+app.get('/api/search', requireAuth, (req, res) => {
+  const t = searchTerms(req.query.q);
+  if (!t || t.q.length < 2) return res.json({ results: [] });
+  const scope = searchScopeOf(req.user);
+  if (!scope) return res.json({ results: [] });
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT lp.user_id, lp.first_name, lp.lead_class, lp.preferred_branch, lp.last_activity,
+      COALESCE(NULLIF(lp.phone, ''), (SELECT ph.phone FROM lead_phones ph
+                          WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
+    FROM lead_profiles lp
+    WHERE (lp.first_name LIKE @like ESCAPE '\\'
+       OR lp.phone LIKE @phoneLike ESCAPE '\\'
+       OR lp.user_id IN (SELECT user_id FROM lead_phones WHERE phone LIKE @phoneLike ESCAPE '\\'))
+      ${scope.sql ? `AND lp.user_id IN (${scope.sql})` : ''}
+    ORDER BY lp.last_activity DESC
+    LIMIT ${SEARCH_PAGE * 3}
+  `).all({ like: t.like, phoneLike: t.phoneLike, ...(scope.params || {}) });
+  const results = rows.filter(r => scope.check(db, r.user_id)).slice(0, SEARCH_PAGE)
+    .map(({ last_activity, ...r }) => r);
+  return res.json({ results });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // CSV export — Leads & Contracts as UTF-8 (with BOM, so Arabic opens correctly
 // in Excel). Admin-only. Streams an attachment.
 // ════════════════════════════════════════════════════════════════════════════
@@ -7653,46 +7313,6 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
 // growing DB / runaway table before it bites. DB file size, per-table row
 // counts, server uptime & memory. Admin-only.
 // ════════════════════════════════════════════════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/admin/meta/sync-historical — "Pixel warm-up": bulk-send every lead
-// with a valid phone to the Meta CRM dataset as Lead events (batched ×500,
-// sequential). Explicit admin action — awaited so the UI can show real results.
-// Refused for demo sandbox sessions (training data must never reach the ad
-// account). Never crashes: all failures land in the JSON summary.
-// ════════════════════════════════════════════════════════════════════════════
-app.post('/api/admin/meta/sync-historical', requireAuth, requireRole('admin'), async (req, res) => {
-  try {
-    if (isDemoContext()) {
-      return res.status(400).json({ error: 'المزامنة مش متاحة من حساب الديمو — دي بيانات تدريب' });
-    }
-    if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) {
-      return res.status(400).json({ error: 'Meta CAPI مش متظبط — حط META_PIXEL_ID و META_ACCESS_TOKEN في إعدادات السيرفر' });
-    }
-
-    const db = getDb();
-    // Every lead that has ANY phone (profile.phone or any lead_phones row).
-    const leads = db.prepare(`
-      SELECT lp.user_id, lp.first_name, lp.last_name, lp.gender, lp.preferred_branch,
-        COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
-                            WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) AS phone
-      FROM lead_profiles lp
-      WHERE COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
-                                WHERE ph.user_id = lp.user_id ORDER BY ph.id LIMIT 1)) IS NOT NULL
-    `).all();
-
-    console.log(`[meta-capi] warm-up started by ${req.user?.name}: ${leads.length} leads with phones`);
-    const result = await bulkSyncHistoricalLeads(leads);
-
-    createNotification(db, 'admin', 'meta_warmup',
-      `Pixel Warm-up: اتبعت ${result.sent} من ${result.eligible} عميل لفيسبوك` +
-      (result.failed_batches ? ` (${result.failed_batches} دفعة فشلت)` : ''));
-
-    return res.json({ ok: result.failed_batches === 0, ...result });
-  } catch (err) {
-    console.error('[meta-capi] warm-up endpoint error:', err.message);
-    return res.status(500).json({ error: 'فشلت المزامنة — راجع لوج السيرفر' });
-  }
-});
 
 app.get('/api/admin/system-health', requireAuth, requireRole('admin'), (req, res) => {
   const fs = require('fs');
@@ -7913,41 +7533,6 @@ app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => 
       DO UPDATE SET target_amount = excluded.target_amount
   `).run(scope_type, name, month, amount);
   return res.json({ ok: true, scope_type, scope_name: name, target_month: month, target_amount: amount });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/admin/reset-visits — hard-reset all visit data: removes every
-// visit_confirmed event, clears visit flags on lead_profiles, and wipes the
-// follow_up_state for affected leads so they re-enter the funnel as new.
-// ════════════════════════════════════════════════════════════════════════════
-app.post('/api/admin/reset-visits', requireAuth, requireRole('admin'), (req, res) => {
-  const db = getDb();
-  const d1 = db.prepare(`
-    DELETE FROM events
-    WHERE event_type = 'visit_confirmed'
-      AND user_id IN (SELECT user_id FROM lead_profiles WHERE visit_confirmed = 1)
-  `).run();
-  const d2 = db.prepare(`
-    UPDATE lead_profiles
-    SET visit_confirmed     = 0,
-        lead_class          = 'new',
-        total_score         = 0,
-        visit_at            = NULL,
-        visit_code          = NULL,
-        revisit_status      = NULL,
-        revisit_note        = NULL,
-        revisit_updated_by  = NULL,
-        revisit_updated_at  = NULL
-    WHERE visit_confirmed = 1
-  `).run();
-  const d3 = db.prepare(`
-    DELETE FROM follow_up_state
-    WHERE user_id IN (SELECT user_id FROM lead_profiles WHERE lead_class = 'new')
-  `).run();
-  const d4 = db.prepare(`DELETE FROM lead_visits`).run();
-  const d5 = db.prepare(`DELETE FROM visit_checkins`).run();
-  console.log(`🔄 RESET-VISITS: events=${d1.changes} profiles=${d2.changes} follow_up=${d3.changes} lead_visits=${d4.changes} visit_checkins=${d5.changes}`);
-  return res.json({ ok: true, events_deleted: d1.changes, profiles_reset: d2.changes, follow_up_cleared: d3.changes, lead_visits_cleared: d4.changes, visit_checkins_cleared: d5.changes });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -8327,50 +7912,10 @@ app.delete('/api/products/:id', requireAuth, canEditCatalog, (req, res) => {
 });
 
 // ── Background Jobs ───────────────────────────────────────────────────────
-function runAbandonedIntentJob() {
-  try {
-    const db = getDb();
-    // OFF unless an admin turns it on (C1.9): its targets are idle > 3 days,
-    // i.e. outside Meta's 24 h window. Even when on, each send passes the
-    // window guard (local_stale pre-filter, then ManyChat getInfo).
-    if (getSetting('reminder_job_enabled', 'false') !== 'true') return;
-    const reminderFlowSetting = db.prepare(`SELECT value FROM settings WHERE key = 'manychat_reminder_flow'`).get();
-    
-    if (!reminderFlowSetting || !reminderFlowSetting.value || reminderFlowSetting.value.trim() === '') {
-      console.warn('[Scheduler] ⚠️ Abandoned-intent job skipped — manychat_reminder_flow is empty. Set it in Settings → API.');
-      return; // No flow configured
-    }
-
-    // Find leads who requested location > 3 days ago, haven't visited, and haven't been reminded
-    const targets = db.prepare(`
-      SELECT user_id 
-      FROM lead_profiles 
-      WHERE location_requested = 1 
-        AND visit_confirmed = 0 
-        AND location_reminder_sent IS NULL 
-        AND last_activity < datetime('now', '-3 days')
-    `).all();
-
-    for (const target of targets) {
-      guardedSendFlow(db, { user_id: target.user_id, flow_id: reminderFlowSetting.value.trim(), site: 'reminder' })
-        .then((r) => {
-          if (!r.sent) return; // skipped (logged + counted by the guard) or failed — not marked as sent
-          db.prepare(`UPDATE lead_profiles SET location_reminder_sent = datetime('now') WHERE user_id = ?`)
-            .run(target.user_id);
-          console.log(`[Cron] Sent abandoned intent reminder to ${target.user_id}`);
-        })
-        .catch(err => console.error(`[Cron] Failed to send reminder to ${target.user_id}:`, err.message));
-    }
-  } catch (err) {
-    console.error('[Cron] Error running abandoned intent job:', err);
-  }
-}
-
-// Run once on startup after 5 seconds, then every 1 hour
-setTimeout(() => {
-  runAbandonedIntentJob();
-  setInterval(runAbandonedIntentJob, 60 * 60 * 1000);
-}, 5000);
+// The 3-day «abandoned intent» reminder (runAbandonedIntentJob) was removed in
+// phase 1 (2026-11-22): it was off (C1.9) and its targets are outside Meta's
+// 24 h window anyway. Its settings rows (reminder_job_enabled,
+// manychat_reminder_flow) stay in the table, unread.
 
 // ── Score decay reclassification job ──────────────────────────────────────
 // lead_class only gets recomputed when a NEW event arrives (see processScore

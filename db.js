@@ -831,14 +831,21 @@ function initializeDatabase(dbPath = DB_PATH) {
   } catch (e) {
     if (!e.message.includes('duplicate column name')) throw e;
   }
+  // Phase 1 (2026-11-22): name and email bump it too (a renamed account was
+  // already logged out by requireAuth's name check; an email change — the
+  // login identity — now is as well). The trigger is re-created on every boot
+  // so an old DB with the r4 version (4 columns) gets the 6-column one.
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS users_token_version_bump
-    AFTER UPDATE OF password_hash, role, branch, active ON users
+    DROP TRIGGER IF EXISTS users_token_version_bump;
+    CREATE TRIGGER users_token_version_bump
+    AFTER UPDATE OF password_hash, role, branch, active, name, email ON users
     FOR EACH ROW
     WHEN OLD.password_hash IS NOT NEW.password_hash
       OR OLD.role          IS NOT NEW.role
       OR OLD.branch        IS NOT NEW.branch
       OR OLD.active        IS NOT NEW.active
+      OR OLD.name          IS NOT NEW.name
+      OR OLD.email         IS NOT NEW.email
     BEGIN
       UPDATE users SET token_version = COALESCE(OLD.token_version, 0) + 1 WHERE id = NEW.id;
     END;
@@ -864,22 +871,17 @@ function initializeDatabase(dbPath = DB_PATH) {
 
   // ── Seed default settings (idempotent) ────────────────────────────────────
   const defaultSettings = [
-    ['company_name',           'Grand Furniture'],
     ['active_branches',        '[{"id":"nasr_city","name":"نصر سيتي"},{"id":"maadi","name":"المعادي"},{"id":"new_cairo","name":"القاهرة الجديدة"},{"id":"october","name":"أكتوبر"},{"id":"alexandria","name":"الإسكندرية"}]'],
     ['weekly_message_limit',   '2'],
     ['manychat_api_key',           ''],
-    ['manychat_page_id',           ''],
     // Event-triggered flows (fired automatically on lead state changes)
     ['manychat_visit_flow',        ''],
     ['manychat_purchase_flow',     ''],
-    ['manychat_reminder_flow',     ''],
     // Intelligent trigger flows (fired by /api/trigger-message decision engine)
     ['manychat_flow_immediate',    ''],   // hot lead — active in last 6 hours
     ['manychat_flow_branch_info',  ''],   // confirmed visit or location request
     ['manychat_flow_offer',        ''],   // recent product_details event
     ['manychat_flow_reengage',     ''],   // warm/hot lead inactive ≥ 3 days
-    ['openai_api_key',             ''],
-    ['facebook_pixel_id',      ''],
     ['scoring_hot_threshold',  '75'],
     ['scoring_warm_threshold', '31'],
     ['lead_expiry_days',       '30'],
@@ -907,18 +909,13 @@ function initializeDatabase(dbPath = DB_PATH) {
     ['webhook_enforce',        'false'],
     // Auto-assign a lead to the least-loaded rep when it first turns warm.
     ['auto_assign_enabled',    'true'],
-    // Achievement scoring weights (must sum to 100). Editable from Settings.
-    ['achievement_followup_weight', '30'],
-    ['achievement_visit_weight',    '30'],
-    ['achievement_close_weight',    '40'],
+    // (phase 1: company_name, manychat_page_id, openai_api_key,
+    // facebook_pixel_id, the 3-day reminder's two keys and the achievement
+    // weights are no longer seeded or read — existing rows stay.)
     // Visit forecast — expected % of customers who picked a branch and
     // will actually show up, split by whether they shared a phone number.
     ['forecast_with_phone_weight',    '80'],
     ['forecast_without_phone_weight', '35'],
-    // The 3-day «abandoned intent» reminder (runAbandonedIntentJob) — OFF by
-    // default (C1.9): its targets are idle > 3 days, i.e. outside Meta's 24 h
-    // window. Even when on, every send passes the window guard.
-    ['reminder_job_enabled',          'false'],
     // O4 — the follow-up SLA (hours) for a lead who said he comes today /
     // tomorrow (visit_planned): /api/branch/sla-alerts flags him after this
     // many hours with zero effort (the general SLA stays 48 h).
