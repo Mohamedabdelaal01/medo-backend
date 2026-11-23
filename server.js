@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-22-honest-numbers-r2';
+const BUILD_VERSION = '2026-11-23-purchase-value-always';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -5314,16 +5314,46 @@ async function linesFromBody(items) {
   const v = await grandCatalog.getCatalogNow();
   return grandCatalog.normalizeItems(items, v.catalog);
 }
-// Meta Purchase value (owner Q2, 2026-11-22): the paid amount staff typed when
-// there is one, else the estimate; EGP; only when > 0. Setting
-// capi_purchase_value = 'off' sends the event with no value (rollback).
-function purchaseValueFor(paid, est) {
-  if (getSetting('capi_purchase_value', 'on') === 'off') return null;
+// Meta Purchase value (owner Q2, 2026-11-22; always sent since 2026-11-23, Meta's
+// «Send value parameters for your purchase events»: every Purchase must carry
+// value + currency). In order: the paid amount staff typed, else the sale's
+// list-price estimate, else the typical sale (typicalSaleValue: the median of
+// the last 90 days' known sales), else 0. Always a whole number, never null.
+// Setting capi_purchase_value = 'off' sends 0 (no amount of ours goes to Meta,
+// the parameter is still there).
+function purchaseValueFor(paid, est, db) {
+  if (getSetting('capi_purchase_value', 'on') === 'off') return 0;
   const p = Number(paid);
   if (Number.isFinite(p) && p > 0) return Math.round(p);
   const e = est && Number(est.total);
   if (Number.isFinite(e) && e > 0) return Math.round(e);
-  return null;
+  return typicalSaleValue(db || getDb());
+}
+// The median sale of the last 90 days (a sale's paid amount, else its
+// estimate; sales with neither are left out), when there are at least
+// TYPICAL_SALE_MIN of them; else 0. Kept 10 minutes. Never throws.
+const TYPICAL_SALE_MIN = 5;
+const TYPICAL_SALE_TTL_MS = 10 * 60 * 1000;
+let typicalSaleCache = null;   // { at, value }
+function typicalSaleValue(db) {
+  if (typicalSaleCache && Date.now() - typicalSaleCache.at < TYPICAL_SALE_TTL_MS) return typicalSaleCache.value;
+  let value = 0;
+  try {
+    const vals = db.prepare(`
+      SELECT CASE WHEN p.price > 0 THEN p.price ELSE e.list_total_estimate END AS v
+      FROM purchases p LEFT JOIN purchase_estimates e ON e.purchase_id = p.id
+      WHERE datetime(p.created_at) >= datetime('now', '-90 days')
+        AND (p.price > 0 OR e.list_total_estimate > 0)
+      ORDER BY v`).all().map(r => Number(r.v)).filter(v => Number.isFinite(v) && v > 0);
+    if (vals.length >= TYPICAL_SALE_MIN) {
+      const m = vals.length >> 1;
+      value = Math.round(vals.length % 2 ? vals[m] : (vals[m - 1] + vals[m]) / 2);
+    }
+  } catch (e) {
+    console.error('[meta-capi] typical sale value failed:', e && e.message);
+  }
+  typicalSaleCache = { at: Date.now(), value };
+  return value;
 }
 // The sale row + its catalog items + lead_class 'purchased'. Call it INSIDE a
 // db.transaction, so a failure never leaves a counted sale without its items.
@@ -5347,7 +5377,8 @@ function insertPurchaseRows(db, p) {
 //   1) Meta CAPI "Purchase" — offline conversion back to the ad account so Meta
 //      can optimize toward real buyers. Skipped entirely for demo/training
 //      sandbox sessions (a demo_ user works on the demo DB — never pollute the
-//      ad data). Fire-and-forget — never blocks the response. No value sent.
+//      ad data). Fire-and-forget — never blocks the response. Always value + EGP
+//      (purchaseValueFor).
 //   2) the admin war-room notification (reception's sale says who entered it)
 //   3) the ManyChat purchase flow (Event-Triggered Flow: Purchase Made)
 // Meta's Purchase for one sale: the same event_id (purchase_<id>) on every
@@ -5365,7 +5396,7 @@ function sendPurchaseEvent(capiLead, { userId, purchaseId, value, eventTime }) {
     { phone: capiLead?.phone, firstName: capiLead?.first_name, lastName: capiLead?.last_name,
       gender: capiLead?.gender, branch: capiLead?.preferred_branch, externalId: userId },
     `purchase_${purchaseId}`,
-    value ? { value, currency: 'EGP' } : undefined,
+    { value: Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.round(Number(value)) : 0, currency: 'EGP' },
     eventTime ? { eventTime } : {});
 }
 // How long Meta's Purchase waits for the estimate when no paid price was typed
@@ -5375,12 +5406,12 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
   // Meta's Purchase (the response has already gone). A typed paid price is the
   // value: sent at once, the estimate is stored beside it. Otherwise it waits
   // at most PURCHASE_ESTIMATE_WAIT_MS for the estimate and goes with whatever
-  // value is known then (or none). One send per sale here; the backfill
+  // value is known then (purchaseValueFor's fallback). One send per sale here; the backfill
   // (backfillPurchaseEstimates) re-sends with the same event_id only for a sale
   // whose estimate never got stored (a restart mid-estimate) — Meta dedups.
   const demo = isDemoContext();
   const capiLead = demo ? null : capiLeadOf(db, userId);
-  const paidValue = purchaseValueFor(price, null);
+  const paidValue = purchaseValueFor(price, null, db);
   const paidTyped = Number.isFinite(Number(price)) && Number(price) > 0;
   let sent = false;
   const sendOnce = (value) => {
@@ -5390,14 +5421,14 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
     catch (err) { console.error('[meta-capi] Purchase failed:', err && err.message); }
   };
   if (paidTyped) sendOnce(paidValue);
-  const timer = paidTyped ? null : setTimeout(() => sendOnce(null), PURCHASE_ESTIMATE_WAIT_MS);
+  const timer = paidTyped ? null : setTimeout(() => sendOnce(purchaseValueFor(price, null, db)), PURCHASE_ESTIMATE_WAIT_MS);
   if (timer && typeof timer.unref === 'function') timer.unref();
   estimatePurchase(db, purchaseId).then((est) => {
     if (timer) clearTimeout(timer);
-    sendOnce(purchaseValueFor(price, est));
+    sendOnce(purchaseValueFor(price, est, db));
   }).catch(err => {
     if (timer) clearTimeout(timer);
-    sendOnce(null);
+    sendOnce(purchaseValueFor(price, null, db));
     console.error('[meta-capi] Purchase after estimate failed:', err && err.message);
   });
 
@@ -5453,7 +5484,7 @@ async function backfillPurchaseEstimates(db) {
       if (r.in_window === 1) {
         // a paid price was sent at once at sale time: the resend carries the same value
         sendPurchaseEvent(capiLeadOf(db, r.user_id), { userId: r.user_id, purchaseId: r.id,
-          value: purchaseValueFor(r.price, est), eventTime: Number(r.ts) || undefined });
+          value: purchaseValueFor(r.price, est, db), eventTime: Number(r.ts) || undefined });
         out.resent++;
       }
     }
