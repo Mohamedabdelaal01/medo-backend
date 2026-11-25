@@ -347,17 +347,104 @@ function categoryOf(m, names) {
   return { category: code, category_ar: ar ? ar.slice(0, 200) : null };
 }
 
+// ── «مخصوص» (2026-11-26): a piece in the showroom that is in no catalogue ────
+// Owner: «في منتجات بتبقي موجودة احيانا في المعرض وغير موجودة في الكتالوج او
+// التسعير … عايزين يبقي في كاتيجوري جديد اسمه مخصوص … بس طبعا مينزلش في
+// الكتالوج او التسعير». Staff TYPE it: { kind: 'custom', name, piece?, price?, qty? }.
+// It lives on the contract only (purchase_lines kind = 'custom', no model /
+// variant id, no category): never sent to the prices system (quoteLinesOf skips
+// it), never a products row, never in the best sellers (server.js /api/analytics
+// counts it apart as `customSold`). Its typed price (optional, whole EGP) is the
+// estimate's number for that line; with no price the estimate is not complete.
+const CUSTOM_KIND       = 'custom';
+const MAX_CUSTOM_LINES  = 20;
+const CUSTOM_NAME_MAX   = 80;
+const CUSTOM_PIECE_MAX  = 40;
+// A typed piece price is the first staff-typed number that reaches Meta (as
+// the estimate): furniture-scale bounds, so a slipped key («45000000» for a
+// 45,000 sofa, «5» for 5,000) is refused out loud instead of stored and sent
+// (review r1). 0 stays allowed (a piece given free). The frontend's
+// parsePiecePrice (frontend/src/utils/catalog.js) keeps the same numbers.
+const CUSTOM_PRICE_MAX  = 1000000;     // one piece
+const CUSTOM_PRICE_MIN  = 50;          // 1–49 = a typo; 0 = free
+const CUSTOM_TOTAL_MAX  = 2000000;     // every custom line's price × qty on one contract
+const isCustom = (l) => !!l && l.kind === CUSTOM_KIND;
+const CUSTOM_UNCHECKED = 'custom_price_unchecked';
+// Typed text → one line of plain text: every whitespace run (new lines, tabs)
+// is one space; other control / direction-override characters go.
+function cleanTyped(v) {
+  if (typeof v !== 'string') return null;
+  return v.replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .replace(/\s+/g, ' ').trim();
+}
+// The typed piece price: empty → null; whole EGP (Arabic digits, «ج.م» /
+// «جنيه» accepted; a separator only between real groups of three: «4,500»,
+// «٤٬٥٠٠», «1,250,000» — «4,5» or «4 5» is refused, never read as 45) → the
+// number; anything else → undefined (refused). Range: 0, or CUSTOM_PRICE_MIN…
+// CUSTOM_PRICE_MAX (out of range → { range: true }, its own message).
+const PRICE_GROUPED = /^\d{1,3}([,،٬' ])\d{3}(?:\1\d{3})*$/;
+const priceInRange = (n) => n === 0 || (n >= CUSTOM_PRICE_MIN && n <= CUSTOM_PRICE_MAX);
+function customPrice(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v) || v < 0) return undefined;
+    return priceInRange(v) ? v : { range: true };
+  }
+  if (typeof v !== 'string') return undefined;
+  const s = v.replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660)).replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0))
+    .replace(/ج\.?م\.?|جنيه/g, '').replace(/\s+/g, ' ').trim();
+  if (s === '') return null;
+  if (!/^\d{1,9}$/.test(s) && !PRICE_GROUPED.test(s)) return undefined;
+  const n = Number(s.replace(/[,،٬' ]/g, ''));
+  return priceInRange(n) ? n : { range: true };
+}
+const fmtEgp = (n) => new Intl.NumberFormat('en-US').format(n);
+function normalizeCustom(it, qty) {
+  for (const k of ['model_id', 'variant_id', 'with']) {
+    if (it[k] != null) return BAD('bad_custom', 'القطعة المخصوصة مالهاش موديل من الكتالوج — اكتبها تاني');
+  }
+  if (it.name != null && typeof it.name !== 'string') return BAD('custom_name_required', 'اكتب اسم القطعة المخصوصة');
+  const name = cleanTyped(it.name) || '';
+  if (!name) return BAD('custom_name_required', 'اكتب اسم القطعة المخصوصة');
+  if ([...name].length > CUSTOM_NAME_MAX) return BAD('custom_name_too_long', `اسم القطعة المخصوصة طويل — ${CUSTOM_NAME_MAX} حرف بالكتير`);
+  if (it.piece != null && typeof it.piece !== 'string') return BAD('bad_custom_piece', 'نوع القطعة لازم يكون كلام');
+  const piece = cleanTyped(it.piece) || null;
+  if (piece && [...piece].length > CUSTOM_PIECE_MAX) return BAD('custom_piece_too_long', `نوع القطعة طويل — ${CUSTOM_PIECE_MAX} حرف بالكتير`);
+  const price = customPrice(it.price);
+  if (price === undefined) return BAD('bad_custom_price', 'سعر القطعة المخصوصة أرقام بس من غير كسور (مثلاً 4500) — أو سيبه فاضي');
+  if (price && price.range) {
+    return BAD('custom_price_range', `سعر القطعة المخصوصة لازم يبقى من ${fmtEgp(CUSTOM_PRICE_MIN)} لـ ${fmtEgp(CUSTOM_PRICE_MAX)} جنيه — راجع السعر (لو القطعة هدية اكتب 0، ولو مش عارفه سيبه فاضي)`);
+  }
+  return { line: { kind: CUSTOM_KIND, model_id: null, variant_id: null, with: [], with_titles: [], qty,
+    title: name, model_title: null, category: null, category_ar: null, custom_piece: piece, custom_price: price } };
+}
+
 function normalizeItems(raw, cat) {
   if (!Array.isArray(raw)) return { lines: [] };
   if (raw.length > MAX_LINES) return BAD('too_many_items', `العقد فيه أكتر من ${MAX_LINES} سطر — قسّمه على عقدين`);
-  if (!cat) return BAD('catalog_unavailable', 'الأسعار مش متاحة دلوقتي — جرّب كمان شوية');
-  const { byModel, byVariant } = indexCatalog(cat);
+  const customCount = raw.filter(it => isObj(it) && it.kind === CUSTOM_KIND).length;
+  if (customCount > MAX_CUSTOM_LINES) return BAD('too_many_custom', `العقد فيه أكتر من ${MAX_CUSTOM_LINES} قطعة مخصوصة — جمّعهم أو قسّم العقد`);
+  // A contract of custom pieces only needs no catalogue (the prices system may be down).
+  if (!cat && customCount < raw.length) return BAD('catalog_unavailable', 'الأسعار مش متاحة دلوقتي — جرّب كمان شوية');
+  const { byModel, byVariant } = cat ? indexCatalog(cat) : { byModel: new Map(), byVariant: new Map() };
   const catNames = categoryNames(cat);
   const lines = [];
+  let customTotal = 0;
   for (const it of raw) {
     if (!isObj(it)) return BAD('bad_item', 'فيه منتج مش مفهوم — اختاره تاني من القايمة');
     let qty = it.qty == null || it.qty === '' ? 1 : Number(it.qty);
     if (!Number.isInteger(qty) || qty < 1 || qty > 99) return BAD('bad_qty', 'العدد لازم يكون رقم من 1 لـ 99');
+    if (it.kind === CUSTOM_KIND) {
+      const c = normalizeCustom(it, qty);
+      if (c.code) return c;
+      lines.push(c.line);
+      customTotal += (c.line.custom_price || 0) * qty;
+      if (customTotal > CUSTOM_TOTAL_MAX) {
+        return BAD('custom_total_too_big', `مجموع أسعار القطع المخصوصة أكتر من ${fmtEgp(CUSTOM_TOTAL_MAX)} جنيه — راجع الأسعار والعدد`);
+      }
+      continue;
+    }
+    if (it.kind != null) return BAD('bad_item', 'فيه منتج مش مفهوم — اختاره تاني من القايمة');
     const modelId = str(it.model_id);
     const variantId = str(it.variant_id);
     if ((modelId ? 1 : 0) + (variantId ? 1 : 0) !== 1) return BAD('bad_item', 'فيه منتج مش مفهوم — اختاره تاني من القايمة');
@@ -396,8 +483,9 @@ function normalizeItems(raw, cat) {
 }
 
 // The quote's request lines from stored lines.
+// A custom line («مخصوص») is never part of it: it is not the prices system's.
 function quoteLinesOf(lines) {
-  return lines.map(l => (l.kind === 'set' && !l.variant_id
+  return lines.filter(l => !isCustom(l)).map(l => (l.kind === 'set' && !l.variant_id
     ? { model_id: l.model_id, qty: l.qty, ...(l.with && l.with.length ? { with: l.with } : {}) }
     : { variant_id: l.variant_id, qty: l.qty }));
 }
@@ -488,6 +576,55 @@ async function remoteQuote(reqLines, version) {
 async function estimate(lines) {
   try {
     if (!Array.isArray(lines) || !lines.length) return { source: 'none', total: null, complete: false, version: null, lines: [], warnings: [] };
+    const catIdx = [];
+    lines.forEach((l, i) => { if (!isCustom(l)) catIdx.push(i); });
+    const custom = lines.map((l, i) => ({ l, i })).filter(x => isCustom(x.l));
+    if (!custom.length) return await estimateCatalog(lines);
+    // «مخصوص» (2026-11-26): the custom lines are priced by what staff typed
+    // (price × qty); the rest by the prices system as always (only those lines
+    // are sent). Complete only when every line has a number. The catalogue part
+    // not priceable at all (source 'none') → no total, as before.
+    // A typed number past the bounds (a contract saved before them, review r1)
+    // counts as NO price: never in the total (so never Meta's value, the sales
+    // value or the median), the estimate never complete, warning CUSTOM_UNCHECKED.
+    const typedOf = (l) => {
+      // custom_price on a line just validated, price on a stored line (readPurchaseLines)
+      const typed = l.custom_price !== undefined ? l.custom_price : l.price;
+      return Number.isInteger(typed) && typed >= 0 ? typed : null;
+    };
+    const overTotal = custom.reduce((s, { l }) => s + (typedOf(l) || 0) * (Number(l.qty) || 1), 0) > CUSTOM_TOTAL_MAX;
+    const cLines = custom.map(({ l, i }) => {
+      const typed = typedOf(l);
+      const unchecked = typed != null && (overTotal || !priceInRange(typed));
+      const unit = unchecked ? null : typed;
+      return { index: i, unit_price: unit, line_total: unit == null ? null : unit * (Number(l.qty) || 1),
+        warnings: [unchecked ? CUSTOM_UNCHECKED : unit == null ? 'custom_no_price' : 'custom'] };
+    });
+    const cTotal = cLines.reduce((s, x) => s + (x.line_total || 0), 0);
+    const cComplete = cLines.every(x => x.unit_price != null);
+    const cWarn = [...new Set(cLines.flatMap(x => x.warnings).filter(w => w !== 'custom'))];
+    if (!catIdx.length) {
+      return { source: 'custom', total: cLines.some(x => x.unit_price != null) ? Math.round(cTotal) : null, complete: cComplete,
+        version: null, lines: cLines, warnings: cWarn };
+    }
+    const base = await estimateCatalog(lines.filter(l => !isCustom(l)));
+    if (base.source === 'none' || base.total == null) {
+      return { ...base, total: null, complete: false, lines: [], warnings: [...(base.warnings || []), ...cWarn] };
+    }
+    const merged = [
+      ...base.lines.map((x, j) => ({ ...x, index: catIdx[x.index != null ? x.index : j] ?? catIdx[j] })),
+      ...cLines,
+    ].sort((a, b) => a.index - b.index);
+    return { ...base, total: Math.round(base.total + cTotal), complete: base.complete === true && cComplete,
+      lines: merged, warnings: [...(base.warnings || []), ...cWarn] };
+  } catch (e) {
+    console.error('[grand-catalog] estimate failed:', e && e.message);
+    return { source: 'none', total: null, complete: false, version: null, lines: [], warnings: [] };
+  }
+}
+// The prices system's estimate of catalogue lines only.
+async function estimateCatalog(lines) {
+  try {
     const reqLines = quoteLinesOf(lines);
     const v = await getCatalog();
     const q = await remoteQuote(reqLines, v.version);
@@ -587,5 +724,6 @@ function _reset() {
 
 module.exports = {
   getCatalog, getCatalogNow, configureStore, catalogueStatus, normalizeItems, quoteLinesOf, quoteFromCatalog, estimate, pricesView, snapshot,
-  baseUrl, catalogueUrl, _reset, MAX_LINES,
+  baseUrl, catalogueUrl, _reset, MAX_LINES, isCustom, CUSTOM_KIND, MAX_CUSTOM_LINES, CUSTOM_NAME_MAX, CUSTOM_PIECE_MAX,
+  CUSTOM_PRICE_MIN, CUSTOM_PRICE_MAX, CUSTOM_TOTAL_MAX, CUSTOM_UNCHECKED,
 };

@@ -439,7 +439,7 @@ function initializeDatabase(dbPath = DB_PATH) {
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       purchase_id  INTEGER NOT NULL,
       line_index   INTEGER NOT NULL,
-      kind         TEXT NOT NULL,          -- 'set' | 'piece'
+      kind         TEXT NOT NULL,          -- 'set' | 'piece' | 'custom' («مخصوص», 2026-11-26: typed, no ids)
       model_id     TEXT,                   -- gid://shopify/Product/… (the room / set)
       variant_id   TEXT,                   -- gid://shopify/ProductVariant/… (a piece; null for a set by model)
       with_json    TEXT,                   -- a set's changed pieces: ["gid://shopify/ProductVariant/…"]
@@ -457,7 +457,7 @@ function initializeDatabase(dbPath = DB_PATH) {
       list_total_estimate  INTEGER,        -- whole EGP at that day's LIST prices; NULL = could not be priced
       estimate_complete    INTEGER NOT NULL DEFAULT 0,
       catalog_version      TEXT,
-      source               TEXT,           -- 'quote' | 'catalog_cache' | 'none'
+      source               TEXT,           -- 'quote' | 'catalog_cache' | 'custom' (custom lines only) | 'none'
       lines_json           TEXT,           -- [{ index, unit_price, line_total, warnings[] }]
       warnings_json        TEXT,
       computed_at          DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -492,6 +492,12 @@ function initializeDatabase(dbPath = DB_PATH) {
     // r2: which secret fetched a saved staff copy (a 16-hex hash, never the
     // secret) — a boot shows it as staff only when it is the current one's.
     ['grand_catalog_cache', 'secret_fp', 'TEXT'],
+    // «مخصوص» (2026-11-26): a piece in the showroom that is in no catalogue,
+    // typed on the contract (kind = 'custom'; title = its name). Its piece kind
+    // (free text, optional) and its typed price (whole EGP, optional). Never a
+    // products row, never sent to the prices system.
+    ['purchase_lines', 'custom_piece', 'TEXT'],
+    ['purchase_lines', 'custom_price', 'INTEGER'],
   ]) {
     const have = db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col);
     if (!have) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);

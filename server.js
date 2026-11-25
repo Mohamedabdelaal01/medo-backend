@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-25-contracts-filters-r2';
+const BUILD_VERSION = '2026-11-26-custom-lines';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -3003,7 +3003,7 @@ app.post('/api/reception/sales', requireAuth, authorizeRoles('reception', 'admin
   if (dup) return fail(409, dup.code, dup.error, { purchase_id: dup.purchase_id });
 
   // Legacy product_id text = the first product's name (old reports read it).
-  const legacyLabel = (lines[0] ? lines[0].title : null)
+  const legacyLabel = legacyLabelOf(lines)
     || (products.ids.length ? db.prepare(`SELECT name FROM products WHERE id = ?`).get(products.ids[0])?.name : null) || null;
 
   let linkedVisit = false;
@@ -5480,18 +5480,53 @@ function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds, li
 // ── A sale's lines from the prices system (2026-11-22, «قسم الأسعار») ────────
 // items → purchase_lines (ids + titles, visible to staff); the estimate →
 // purchase_estimates (admin only, services/grandCatalog.js estimate()).
+//   «مخصوص» (2026-11-26): a custom line (kind 'custom') is the typed name /
+//   piece kind / piece price — no catalogue id, no category (grandCatalog.js).
+//   Readers get { kind: 'custom', custom: true, title, piece, price, qty }.
 function linesSignature(lines) {
-  return (lines || []).map(l => [l.kind, l.model_id || '', l.variant_id || '', [...(l.with || [])].sort().join('+'), l.qty].join('|'))
+  return (lines || []).map(l => (l.kind === 'custom'
+    ? ['custom', l.title || '', l.custom_piece ?? l.piece ?? '', l.custom_price ?? l.price ?? '', l.qty].join('|')
+    : [l.kind, l.model_id || '', l.variant_id || '', [...(l.with || [])].sort().join('+'), l.qty].join('|')))
     .sort().join(',');
 }
 function writePurchaseLines(db, purchaseId, lines) {
   db.prepare(`DELETE FROM purchase_lines WHERE purchase_id = ?`).run(purchaseId);
   const ins = db.prepare(`INSERT INTO purchase_lines (purchase_id, line_index, kind, model_id, variant_id, with_json, with_titles_json,
-                            qty, title, model_title, category, category_ar) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
-  lines.forEach((l, i) => ins.run(purchaseId, i, l.kind, l.model_id || null, l.variant_id || null,
-    l.with && l.with.length ? JSON.stringify(l.with) : null,
-    l.with_titles && l.with_titles.length ? JSON.stringify(l.with_titles) : null,
-    l.qty, l.title || null, l.model_title || null, l.category || null, l.category_ar || null));
+                            qty, title, model_title, category, category_ar, custom_piece, custom_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  lines.forEach((l, i) => {
+    const custom = l.kind === 'custom';
+    ins.run(purchaseId, i, l.kind, custom ? null : (l.model_id || null), custom ? null : (l.variant_id || null),
+      !custom && l.with && l.with.length ? JSON.stringify(l.with) : null,
+      !custom && l.with_titles && l.with_titles.length ? JSON.stringify(l.with_titles) : null,
+      l.qty, l.title || null, custom ? null : (l.model_title || null), custom ? null : (l.category || null),
+      custom ? null : (l.category_ar || null),
+      custom ? (l.custom_piece || null) : null,
+      custom && Number.isInteger(l.custom_price) ? l.custom_price : null);
+  });
+}
+// The legacy purchases.product_id text (old reports read it): the first
+// catalogue line's title; a contract of custom pieces only → «<name> (مخصوص)».
+function legacyLabelOf(lines) {
+  const firstCat = (lines || []).find(l => l.kind !== 'custom');
+  if (firstCat) return firstCat.title || null;
+  const firstCustom = (lines || [])[0];
+  return firstCustom ? `${firstCustom.title} (مخصوص)` : null;
+}
+// One stored line as words (notifications, the ledger): «سرير ماريو ×2»,
+// «ترابيزة رخام ×2 (مخصوص · ترابيزة · 4,500 ج.م)». Everything linesSignature
+// compares is in the words, so a ledger row of a changed price or piece kind
+// never reads the same from and to (review r1). A just-validated line carries
+// custom_piece / custom_price, a stored one (readPurchaseLines) piece / price.
+function lineWords(l) {
+  if (!l) return '';
+  const qty = Number(l.qty) > 1 ? ` ×${l.qty}` : '';
+  if (l.kind === 'custom') {
+    const piece = l.custom_piece ?? l.piece ?? null;
+    const price = l.custom_price !== undefined ? l.custom_price : l.price;
+    const extra = [piece, Number.isInteger(price) ? `${new Intl.NumberFormat('en-US').format(price)} ج.م` : null].filter(Boolean);
+    return `${l.title || 'قطعة'}${qty} (${['مخصوص', ...extra].join(' · ')})`;
+  }
+  return `${l.title || l.model_title || 'منتج'}${qty}`;
 }
 // Which write of a sale's lines is current: every writePurchaseLines deletes
 // and re-inserts, and AUTOINCREMENT never reuses an id, so MAX(id) only grows.
@@ -5507,11 +5542,19 @@ function readPurchaseLines(db, ids) {
   if (!ids.length) return out;
   for (let i = 0; i < ids.length; i += 500) {
     const chunk = ids.slice(i, i + 500);
-    const rows = db.prepare(`SELECT purchase_id, kind, model_id, variant_id, with_json, with_titles_json, qty, title, model_title
+    const rows = db.prepare(`SELECT purchase_id, kind, model_id, variant_id, with_json, with_titles_json, qty, title, model_title,
+                                    custom_piece, custom_price
                              FROM purchase_lines WHERE purchase_id IN (${chunk.map(() => '?').join(',')})
                              ORDER BY purchase_id, line_index`).all(...chunk);
     for (const r of rows) {
       if (!out.has(r.purchase_id)) out.set(r.purchase_id, []);
+      if (r.kind === 'custom') {
+        // piece / price = what staff typed (linesSignature and the estimate read them)
+        out.get(r.purchase_id).push({ kind: 'custom', custom: true, model_id: null, variant_id: null, with: [], with_titles: [],
+          qty: r.qty, title: r.title, model_title: null, piece: r.custom_piece || null,
+          price: r.custom_price == null ? null : r.custom_price });
+        continue;
+      }
       out.get(r.purchase_id).push({
         kind: r.kind, model_id: r.model_id, variant_id: r.variant_id, with: parseJsonArr(r.with_json),
         with_titles: parseJsonArr(r.with_titles_json), qty: r.qty, title: r.title, model_title: r.model_title,
@@ -5727,13 +5770,17 @@ function afterPurchase(db, req, { userId, purchaseId, rep, branch, price, contra
     console.error('[meta-capi] Purchase after estimate failed:', err && err.message);
   });
 
-  // Every purchase → macro alert for the admin war-room.
+  // Every purchase → macro alert for the admin war-room. A custom piece
+  // («مخصوص», 2026-11-26) is named in it: it is in no catalogue.
+  const customWords = (readPurchaseLines(db, [purchaseId]).get(purchaseId) || [])
+    .filter(l => l.kind === 'custom').map(lineWords);
   createNotification(db, 'admin', 'new_purchase',
     `تم إغلاق تعاقد جديد (عقد: ${contractNumber || '—'}) بقيمة ` +
     `${new Intl.NumberFormat('en-US').format(Number(price) || 0)} ج.م بواسطة ` +
     `${rep || '؟'} في فرع ${branch || '—'}` +
     (viaReception ? ` — اتسجّل من الاستقبال بواسطة ${req.user?.name || '؟'}`
-      : creditedByOther ? ` — سجّلها ${req.user?.name || '؟'} باسم السيلز` : ''));
+      : creditedByOther ? ` — سجّلها ${req.user?.name || '؟'} باسم السيلز` : '') +
+    (customWords.length ? ` — فيه قطع مش في الكتالوج: ${customWords.join(' + ')}` : ''));
 
   // Event-Triggered Flow: Purchase Made — through the 24 h window guard (C1.9).
   // A walk-in sale (walkin_…) is skipped as no_manychat_id with no API call.
@@ -5868,7 +5915,7 @@ app.post('/api/purchases', requireAuth, async (req, res) => {
 
   // Legacy product_id text field is kept for backward compat; for new flows
   // we store the first selected product's name there so old reports still work.
-  let legacyProductLabel = product_id || (lines[0] ? lines[0].title : null) || null;
+  let legacyProductLabel = product_id || legacyLabelOf(lines) || null;
   if (!legacyProductLabel && productIds.length) {
     const firstProduct = db.prepare(`SELECT name FROM products WHERE id = ?`).get(productIds[0]);
     if (firstProduct) legacyProductLabel = firstProduct.name;
@@ -7080,6 +7127,10 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
   }
   // a row deleted while the catalogue was read
   if (!db.prepare(`SELECT 1 FROM purchases WHERE id = ?`).get(row.id)) return res.status(404).json({ error: 'contract_not_found' });
+  // What the contract held (synchronous from here to the commit): a lines edit
+  // that changes them is written in the ledger and the admin's notification.
+  const oldLines = readPurchaseLines(db, [row.id]).get(row.id) || [];
+  const linesChanged = !!newLines && linesSignature(oldLines) !== linesSignature(newLines);
 
   db.transaction(() => {
     db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
@@ -7109,7 +7160,16 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
     }
     if (newLines) {
       writePurchaseLines(db, row.id, newLines);
-      db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(newLines[0].title || null, row.id);
+      db.prepare(`UPDATE purchases SET product_id = ? WHERE id = ?`).run(legacyLabelOf(newLines), row.id);
+    }
+    if (linesChanged) {
+      // display-only ledger row (not in REVERTABLE_AUDIT_TABLES): the words
+      // before / after, custom pieces tagged «(مخصوص)»
+      auditLog(db, req.user?.name, 'contract_lines_change', row.user_id, {
+        table: 'purchases', where: { id: row.id }, row: null,
+        from: oldLines.map(lineWords).join(' + ') || null, to: newLines.map(lineWords).join(' + ') || null,
+        contract_number: newNumber || row.contract_number || null, branch: row.branch || null,
+      });
     }
     if (newRep) {
       db.prepare(`UPDATE purchases SET rep = ? WHERE id = ?`).run(newRep, row.id);
@@ -7124,7 +7184,8 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
   createNotification(db, 'admin', 'contract_modified',
     `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]` +
     (newRep ? ` — البيعة بقت باسم [${newRep}] بدل [${row.rep || '—'}]` : '') +
-    (newAt ? ` — التاريخ بقى [${dayIn.day}] بدل [${oldDay || '—'}]` : ''));
+    (newAt ? ` — التاريخ بقى [${dayIn.day}] بدل [${oldDay || '—'}]` : '') +
+    (linesChanged ? ` — المنتجات بقت [${newLines.map(lineWords).join(' + ')}]` : ''));
 
   // The estimate stays the list price of the day it was recorded (a date edit
   // never re-prices it); Meta's Purchase already sent is never sent again.
@@ -7425,9 +7486,19 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
       FROM purchase_lines pl
       JOIN purchases pur     ON pur.id = pl.purchase_id
       JOIN lead_profiles lp  ON lp.user_id = pur.user_id
-      WHERE 1=1 ${purR.clause}
+      WHERE pl.kind <> 'custom' ${purR.clause}
         ${branchClause} ${campaignClause}
     )`;
+  // «مخصوص» (2026-11-26): a custom piece is no product — it is in none of the
+  // lists below; the same filters count it apart, as ONE bucket (customSold).
+  const customSold = db.prepare(`
+    SELECT COALESCE(SUM(pl.qty), 0) AS units, COUNT(DISTINCT pur.id) AS contracts, COUNT(DISTINCT pur.user_id) AS buyers
+    FROM purchase_lines pl
+    JOIN purchases pur     ON pur.id = pl.purchase_id
+    JOIN lead_profiles lp  ON lp.user_id = pur.user_id
+    WHERE pl.kind = 'custom' ${purR.clause}
+      ${branchClause} ${campaignClause}
+  `).get(...purR.params, ...branchParam, ...campaignParam);
   // Best-selling overall (all categories). The product's name and category
   // come from its newest line (MAX(rid): SQLite takes the bare columns from it).
   const topSelling = db.prepare(`
@@ -7473,6 +7544,7 @@ app.get('/api/analytics', requireAuth, requireRole('admin'), (req, res) => {
     topSelling,
     salesByCategory,
     sellingByCategory,
+    customSold: { units: customSold.units || 0, contracts: customSold.contracts || 0, buyers: customSold.buyers || 0 },
     meta: { from: fromDate, to: toDate, timezone: CAIRO_TZ, branch: branch || null, campaign: campaign || null,
             branch_applies_to: 'sales' },
   });
@@ -8373,8 +8445,13 @@ app.get('/api/search', requireAuth, (req, res) => {
 // in Excel). Admin-only. Streams an attachment.
 // ════════════════════════════════════════════════════════════════════════════
 const CSV_BOM = '﻿';
+// A cell starting with = + - @ (or a tab / CR) opens as a FORMULA in Excel /
+// Sheets, quoted or not (OWASP «CSV injection»): staff-typed text — a custom
+// piece's name, a first name — gets a leading ' (review r1). Plain numbers and
+// phones («-5», «+20 100…») stay as they are.
 const csvCell = (v) => {
-  const s = v == null ? '' : String(v);
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s) && !/^[+-]?\d[\d\s]*$/.test(s)) s = "'" + s;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 const csvRow = (arr) => arr.map(csvCell).join(',');
@@ -8417,8 +8494,12 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
       lp.first_name,
       COALESCE(lp.phone, (SELECT ph.phone FROM lead_phones ph
                           WHERE ph.user_id = p.user_id ORDER BY ph.id LIMIT 1)) AS phone,
-      (SELECT GROUP_CONCAT(COALESCE(pl.title, '') || CASE WHEN pl.qty > 1 THEN ' ×' || pl.qty ELSE '' END, ' + ')
-         FROM purchase_lines pl WHERE pl.purchase_id = p.id) AS lines_text,
+      (SELECT GROUP_CONCAT(COALESCE(pl.title, '') || CASE WHEN pl.qty > 1 THEN ' ×' || pl.qty ELSE '' END
+                           || CASE WHEN pl.kind = 'custom' THEN ' (مخصوص'
+                                || CASE WHEN pl.custom_piece IS NOT NULL THEN ' · ' || pl.custom_piece ELSE '' END
+                                || CASE WHEN pl.custom_price IS NOT NULL THEN ' · ' || pl.custom_price || ' ج.م' ELSE '' END
+                                || ')' ELSE '' END, ' + ')
+         FROM (SELECT * FROM purchase_lines WHERE purchase_id = p.id ORDER BY line_index) pl) AS lines_text,
       e.list_total_estimate, e.estimate_complete
     FROM purchases p
     LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
@@ -8431,7 +8512,10 @@ app.get('/api/admin/export/contracts.csv', requireAuth, requireRole('admin'), (r
     r.contract_number || '', r.first_name || '', r.phone || '',
     blm[r.branch] || r.branch || '', r.rep || '', r.created_at || '',
     r.lines_text || '', r.price > 0 ? r.price : '',
-    r.list_total_estimate != null ? `${r.list_total_estimate}${r.estimate_complete ? '' : ' (ناقص)'}` : '',
+    // an estimate row with no number (custom pieces with no price) → «— (ناقص)»,
+    // like the contracts table; no estimate row at all → blank
+    r.list_total_estimate != null ? `${r.list_total_estimate}${r.estimate_complete ? '' : ' (ناقص)'}`
+      : (r.estimate_complete === 0 ? '— (ناقص)' : ''),
   ]);
   return sendCsv(res, 'contracts-export.csv',
     ['رقم التعاقد', 'العميل', 'التليفون', 'الفرع', 'السيلز', 'تاريخ التعاقد', 'المنتجات', 'المدفوع', 'تقريبي (أسعار القايمة يوم البيعة)'], out);
