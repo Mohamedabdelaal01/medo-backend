@@ -33,7 +33,24 @@ try {
   process.exit(1);
 }
 
-const currentMonth = () => new Date().toISOString().slice(0, 7); // YYYY-MM
+// Months are CAIRO months (2026-11-25, like server.js): 'YYYY-MM' of now in
+// Cairo, and a month's [start, end) as UTC SQL text for datetime(col).
+const CAIRO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit',
+  day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+const cairoParts = (d) => Object.fromEntries(CAIRO.formatToParts(d).map((x) => [x.type, x.value]));
+const currentMonth = () => { const p = cairoParts(new Date()); return `${p.year}-${p.month}`; };
+function cairoStartUtc(y, m) {               // 00:00 Cairo on the 1st of month m (1-12) of year y
+  const want = Date.UTC(y, m - 1, 1); let t = want;
+  for (let i = 0; i < 3; i++) {
+    const p = cairoParts(new Date(t));
+    t += want - Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  }
+  return new Date(t).toISOString().slice(0, 19).replace('T', ' ');
+}
+function monthSql(col, month) {
+  const [y, m] = month.split('-').map(Number);
+  return { clause: ` AND datetime(${col}) >= ? AND datetime(${col}) < ?`, params: [cairoStartUtc(y, m), cairoStartUtc(m === 12 ? y + 1 : y, m === 12 ? 1 : m + 1)] };
+}
 const ok   = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: 'خطأ: ' + msg }], isError: true });
 
@@ -57,19 +74,21 @@ server.registerTool(
       const month = (target_month && /^\d{4}-\d{2}$/.test(target_month))
         ? target_month : currentMonth();
 
-      let revWhere = `strftime('%Y-%m', created_at) = ?`;
-      const revParams = [month];
+      const rm = monthSql('created_at', month);
+      let revWhere = '1=1';
+      const revParams = [];
       if (branch) { revWhere += ' AND branch = ?'; revParams.push(branch); }
       const revenue = db.prepare(
-        `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${revWhere}`
-      ).get(...revParams).r;
+        `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${revWhere}${rm.clause}`
+      ).get(...revParams, ...rm.params).r;
 
-      let visWhere = `strftime('%Y-%m', visited_at) = ?`;
-      const visParams = [month];
+      const vm = monthSql('visited_at', month);
+      let visWhere = '1=1';
+      const visParams = [];
       if (branch) { visWhere += ' AND branch = ?'; visParams.push(branch); }
       const visits = db.prepare(
-        `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
-      ).get(...visParams).n;
+        `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}${vm.clause}`
+      ).get(...visParams, ...vm.params).n;
 
       let target;
       if (branch) {

@@ -51,6 +51,9 @@
 //     per-branch table of the period view a chat / phone belongs to the
 //     branch the customer first chose in the chat (up to the range's end) —
 //     else «لسه مختارش فرع» (the cohort view: one row per person, above).
+//   • Salespeople (2026-11-25): a performance row is shown only for a name with
+//     an ACTIVE account (sellers / hideStopped, below); what a stopped one did
+//     stays in every total — checked by backend/scripts/smoke-stopped-sales.js.
 'use strict';
 
 module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUtcToDate, normalizeBranch }) {
@@ -59,7 +62,11 @@ module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUt
   const CHAT_EVENT = (a = 'e') => `NOT ${WALKIN_EVENT(a)}`;
   const WALKIN_PHONE_MINUTES = 5;
 
-  const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
+  // A real calendar day «YYYY-MM-DD» in 2000–2100 (2026-11-25 review: 9999-12-31
+  // passed, then its next day '+010000-01' threw inside the Cairo bounds → 500;
+  // 0001–0099 mapped to 1900s bounds). Out of the years → the route's 400.
+  const DAY_MIN = '2000-01-01', DAY_MAX = '2100-12-31';
+  const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && v >= DAY_MIN && v <= DAY_MAX
     && !Number.isNaN(Date.parse(v + 'T00:00:00Z')) && new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v;
   const dayOf = (s) => { const d = sqlUtcToDate(s); return d && !Number.isNaN(d.getTime()) ? cairoDay(d) : null; };
   const msOf = (s) => { const d = sqlUtcToDate(s); return d ? d.getTime() : NaN; };
@@ -367,6 +374,15 @@ module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUt
     };
   }
 
+  // (person|branch) → the salesperson lead_visits names for that visit.
+  function visitRepOf(db) {
+    const repOf = new Map();
+    for (const r of db.prepare(`SELECT user_id, branch, sales_rep FROM lead_visits WHERE sales_rep IS NOT NULL AND TRIM(sales_rep) <> ''`).all()) {
+      repOf.set(`${r.user_id}|${nb(r.branch)}`, r.sales_rep);
+    }
+    return repOf;
+  }
+
   // GET /api/sales/analytics («أداء السيلز») — per salesperson and per branch,
   // every number from the range (Cairo days):
   //   served      — distinct people with a visit in the range at the branch (a
@@ -380,14 +396,14 @@ module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUt
   //                 paid amount, once per contract), whether or not that
   //                 customer's visit is in the range.
   // A row is any (salesperson, branch) with people served OR contracts.
-  function salesByRep(db, { from, to, sales = null, branch = null }) {
-    const facts = loadFacts(db);
+  // `skip(user_id)` (optional) leaves a person out of «served» — the branch
+  // overview passes the leads the manager flagged as duplicates (is_duplicate),
+  // as its all-time numbers always did; the admin page passes nothing.
+  function salesByRep(db, { from, to, sales = null, branch = null, skip = null, facts: given = null }) {
+    const facts = given || loadFacts(db);
     const wantBranch = branch ? nb(branch) : null;
     const ok = (b) => !wantBranch || b === wantBranch;
-    const repOf = new Map();
-    for (const r of db.prepare(`SELECT user_id, branch, sales_rep FROM lead_visits WHERE sales_rep IS NOT NULL AND TRIM(sales_rep) <> ''`).all()) {
-      repOf.set(`${r.user_id}|${nb(r.branch)}`, r.sales_rep);
-    }
+    const repOf = visitRepOf(db);
     const rows = new Map(); const branches = new Map();
     const row = (rep, b) => {
       const k = `${rep}|${b}`;
@@ -399,7 +415,7 @@ module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUt
       return branches.get(b);
     };
     for (const v of facts.visits) {
-      if (!ok(v.branch) || !inRange(v.day, from, to)) continue;
+      if (!ok(v.branch) || !inRange(v.day, from, to) || (skip && skip(v.user_id))) continue;
       const rep = repOf.get(`${v.user_id}|${v.branch}`);
       if (!rep || (sales && rep !== sales)) continue;
       row(rep, v.branch).served.add(v.user_id);
@@ -424,6 +440,97 @@ module.exports = function makeHonestNumbers({ cairoDay, cairoDayBoundsSql, sqlUt
     return { bySales, byBranch };
   }
 
+  // GET /api/branch/overview WITH a range (2026-11-25, the manager's «من يوم
+  // لـ يوم»): the branch's people in [from, to] Cairo days. A contract is the
+  // proof the customer was at the branch with that salesperson, so the range's
+  // contracts count in «زاروا» / «اتخدموا» / «اشتروا» too (review r1: a buyer
+  // whose visit was in an earlier period, his sale written with no check-in —
+  // POST /api/purchases writes none — was in the contracts and the money but
+  // a buyer in no period: «اشتروا 0» next to «عدد التعاقدات 1»):
+  //   visited — distinct people with a visit at the branch in the range (a
+  //             check-in by its Cairo day; before check-ins existed, the first
+  //             visit lead_visits kept), duplicates (skip) left out, PLUS
+  //             everyone with a contract at the branch in the range.
+  //   per salesperson:
+  //     bought — distinct customers with a contract from him at the branch
+  //              dated in the range (his contract rows' people);
+  //     served — the people he served at the branch in the range (lead_visits'
+  //              salesperson of that visit) ∪ his buyers → bought ≤ served.
+  //   served / bought (branch) — the same people, distinct across the rows
+  //             (a contract with no salesperson is in «زاروا» and the totals,
+  //             in no row — the «من غير سيلز» line).
+  // Contracts and their value are counted in server.js with the SQL of
+  // GET /api/contracts, so the overview's total is the contracts page's. The
+  // admin's «أداء السيلز» (salesByRep) keeps its own stated rule.
+  function branchPeriod(db, { branch, from, to, skip = null }) {
+    const facts = loadFacts(db);
+    const b = nb(branch);
+    const repOf = visitRepOf(db);
+    const visitors = new Set();
+    const rows = new Map();
+    const row = (rep) => {
+      if (!rows.has(rep)) rows.set(rep, { sales_rep: rep, served: new Set(), buyers: new Set() });
+      return rows.get(rep);
+    };
+    for (const v of facts.visits) {
+      if (v.branch !== b || !inRange(v.day, from, to) || (skip && skip(v.user_id))) continue;
+      visitors.add(v.user_id);
+      const rep = repOf.get(`${v.user_id}|${v.branch}`);
+      if (rep) row(rep).served.add(v.user_id);
+    }
+    for (const p of facts.purchases) {
+      if (p.branch !== b || !inRange(p.day, from, to)) continue;
+      visitors.add(p.user_id);
+      if (p.rep == null || String(p.rep).trim() === '') continue;
+      const r = row(p.rep); r.buyers.add(p.user_id); r.served.add(p.user_id);
+    }
+    const served = new Set(); const bought = new Set();
+    for (const r of rows.values()) { for (const u of r.served) served.add(u); for (const u of r.buyers) bought.add(u); }
+    return {
+      visited: visitors.size, served: served.size, bought: bought.size,
+      bySales: [...rows.values()].map((r) => ({ sales_rep: r.sales_rep, served: r.served.size, bought: r.buyers.size })),
+    };
+  }
+
+  // ── stopped salespeople (2026-11-25, owner: «اللي يتوقف يتأرشف وميبانش تاني») ──
+  // Every performance / ranking / target / activity view shows a person's row
+  // ONLY while his account is active. A name on a visit / contract / follow-up
+  // whose account is stopped (users.active = 0) — or that has no account any
+  // more (a removed or renamed-away name) — gets no row and no name there.
+  // The roles that can carry a performance row: the salespeople, and a branch
+  // manager / admin who recorded a sale in his own name («أنا» in «البيعة
+  // تتحسب لمين؟»): an active manager is not a stopped salesperson.
+  // What the hidden rows did STAYS in every total (the contracts happened):
+  // `hideStopped` returns the rows to show and the part of the total they held
+  // («الإجمالي فيه N تعاقد (X ج.م) لسيلز اتوقفوا»). Re-activating an account
+  // brings its rows back (nothing is deleted or rewritten).
+  const SELLER_ROLES = new Set(['sales', 'rep', 'branch_manager', 'admin']);
+  const trimName = (n) => (n == null ? '' : String(n).trim());
+  function sellers(db) {
+    const active = new Set(); const stopped = new Set();
+    for (const u of db.prepare(`SELECT name, role, active FROM users`).all()) {
+      if (!SELLER_ROLES.has(u.role) || !trimName(u.name)) continue;
+      (Number(u.active) === 1 ? active : stopped).add(trimName(u.name));
+    }
+    for (const n of active) stopped.delete(n);
+    return { active, stopped, shown: (n) => active.has(trimName(n)) };
+  }
+  // rows → { rows: the ones to show, hidden: { rows, removed, ...sums } }.
+  // `sum` maps a field of `hidden` to the row's number for it; `removed` is
+  // true when a hidden name has no stopped account (a removed name).
+  function hideStopped(rows, who, nameOf, sum = {}) {
+    const kept = []; const hidden = { rows: 0, removed: false };
+    for (const k of Object.keys(sum)) hidden[k] = 0;
+    for (const r of rows) {
+      const n = nameOf(r);
+      if (who.shown(n)) { kept.push(r); continue; }
+      hidden.rows += 1;
+      if (!who.stopped.has(trimName(n))) hidden.removed = true;
+      for (const [k, f] of Object.entries(sum)) hidden[k] += Number(f(r)) || 0;
+    }
+    return { rows: kept, hidden };
+  }
+
   return { WALKIN_EVENT, CHAT_EVENT, isDay, rangeSql, weekOf, addDays, dayOf, homeFunnel, periodVisits, weekly, build, chatTotals,
-    salesByRep, normBranch: nb };
+    salesByRep, branchPeriod, normBranch: nb, sellers, hideStopped, SELLER_ROLES };
 };

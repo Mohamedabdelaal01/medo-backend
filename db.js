@@ -746,6 +746,15 @@ function initializeDatabase(dbPath = DB_PATH) {
     );
     CREATE INDEX IF NOT EXISTS idx_fulog_user ON followup_log(user_id, followed_up_at DESC);
   `);
+  // kind (2026-11-25 review): NULL = a follow-up someone did; 'handoff' = the
+  // showroom handoff's note (server.js logFollowup) — not a call, so the
+  // branch manager's range «تابع» (followup_log) never counts it. Rows written
+  // before the column existed are recognised by the handoff's fixed opening.
+  try { db.exec(`ALTER TABLE followup_log ADD COLUMN kind TEXT`); } catch (_) { /* already there */ }
+  try {
+    db.prepare(`UPDATE followup_log SET kind = 'handoff'
+                WHERE kind IS NULL AND call_summary LIKE 'العميل زار الفرع. تابعه قبل الزيارة [%'`).run();
+  } catch (e) { console.warn('[followup_log kind backfill] skipped:', e.message); }
 
   // revisit_followups: append-only log of re-visit follow-up attempts for
   // customers who visited but didn't buy — so we can see WHEN and HOW MANY

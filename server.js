@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-24-purchase-value-estimate-only';
+const BUILD_VERSION = '2026-11-25-manager-range-stopped-sales-r2';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -185,7 +185,7 @@ function normalizePlannedDay(raw) {
 // stays UTC (datetime('now') → 'YYYY-MM-DD HH:MM:SS'); these helpers only turn
 // "today in Cairo" into UTC bounds. Intl knows Egypt's summer time — never
 // hard-code +2/+3 and never use SQLite 'localtime' (the server runs in UTC).
-// The existing UTC "today"/month counters (dashboard, targets) are NOT moved.
+// Every month counter is a Cairo month since 2026-11-25 (currentMonth below).
 const CAIRO_TZ = 'Africa/Cairo';
 const _cairoFmt = new Intl.DateTimeFormat('en-CA', { timeZone: CAIRO_TZ, year: 'numeric', month: '2-digit',
   day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
@@ -1551,6 +1551,10 @@ app.put('/api/leads/:user_id/assign', requireAuth, requireRole('admin'), (req, r
   const db = getDb();
   const lead = db.prepare(`SELECT user_id FROM lead_profiles WHERE user_id = ?`).get(req.params.user_id);
   if (!lead) return res.status(404).json({ error: 'lead_not_found' });
+  // 2026-11-25: only an ACTIVE salesperson (never a stopped one or a free-typed name).
+  if (rep_name && !db.prepare(`SELECT 1 FROM users WHERE TRIM(name) = TRIM(?) AND role IN ('sales','rep') AND active = 1`).get(String(rep_name))) {
+    return res.status(400).json({ error: 'السيلز ده متوقف أو مش موجود — اختار من القايمة', code: 'rep_not_active' });
+  }
 
   db.prepare(`UPDATE lead_profiles SET assigned_rep = ? WHERE user_id = ?`)
     .run(rep_name || null, req.params.user_id);
@@ -1979,7 +1983,7 @@ function linkVisitSales(db, { userId, branch, salesRep, operator }) {
   // handoff and move the follow-up record over to the showroom rep.
   if (preVisitRep && preVisitRep !== salesRep) {
     const logSummary = `العميل زار الفرع. تابعه قبل الزيارة [${preVisitRep}]، ولكن استقبله في الصالة [${salesRep}].`;
-    logFollowup(db, branch, userId, salesRep, logSummary);
+    logFollowup(db, branch, userId, salesRep, logSummary, 'handoff');   // a note, not a call
     db.prepare(`
       UPDATE branch_customer_followups SET
         assigned_sales = ?,
@@ -3078,22 +3082,25 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
   `).all(me, me, me, ...(myBranch ? [myBranch] : []));
 
   // This-month performance — flagged-duplicate visits don't count as "served".
+  // The CAIRO month (2026-11-25), the month of his target card.
+  const mVisit = cairoMonthSql('visited_at', currentMonth());
+  const mBuy   = cairoMonthSql('p.created_at', currentMonth());
+  const mSale  = cairoMonthSql('created_at', currentMonth());
   const servedMonth = db.prepare(`
     SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits
-    WHERE sales_rep = ? AND strftime('%Y-%m', visited_at) = strftime('%Y-%m','now')
+    WHERE sales_rep = ?${mVisit.clause}
       AND ${NOT_DUPLICATE('lead_visits.user_id')}
-  `).get(me).n;
+  `).get(me, ...mVisit.params).n;
   const boughtMonth = db.prepare(`
     SELECT COUNT(DISTINCT v.user_id) AS n
     FROM lead_visits v
     JOIN purchases p ON p.user_id = v.user_id AND p.rep = ?
-    WHERE v.sales_rep = ?
-      AND strftime('%Y-%m', p.created_at) = strftime('%Y-%m','now')
-  `).get(me, me).n;
+    WHERE v.sales_rep = ?${mBuy.clause}
+  `).get(me, me, ...mBuy.params).n;
   const salesMonth = db.prepare(`
     SELECT COALESCE(SUM(price),0) AS total FROM purchases
-    WHERE rep = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m','now')
-  `).get(me).total;
+    WHERE rep = ?${mSale.clause}
+  `).get(me, ...mSale.params).total;
 
   const kpis = {
     served_month:  servedMonth,
@@ -3119,7 +3126,13 @@ app.get('/api/sales/my', requireAuth, authorizeRoles('sales'), (req, res) => {
 //                 (once per contract — no join fan-out);
 //   contracts   — his contracts in the range at the branch, even when that
 //                 customer's first visit was before the range.
-//   follow-ups  — the follow-ups DONE in the range (followed_up_at, Cairo days).
+//   follow-ups  — with dates: the distinct customers he followed up in the
+//                 range, from followup_log (2026-11-25: the manager's range
+//                 rule; the showroom handoff's note never counts); without
+//                 dates: the follow-ups the state rows hold (all-time rule).
+// A stopped salesperson (users.active = 0) or a name with no account has no
+// row (2026-11-25); `stopped_sales` says what of the range's contracts those
+// rows held (only when one was hidden).
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) => {
   const db = getDb();
@@ -3137,24 +3150,61 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     followed_up: 0, fu_visited: 0, fu_not_visited: 0,
   }));
 
-  // Follow-up stats per (assigned_sales, branch): the follow-ups done in the
-  // range (followed_up_at, Cairo days) — the page's dates apply to them too.
-  const fuWhere  = [`f.assigned_sales IS NOT NULL`, `f.followed_up = 1`];
-  const fuParams = [];
-  if (sales)  { fuWhere.push(`f.assigned_sales = ?`); fuParams.push(sales); }
-  if (branch) { fuWhere.push(`f.branch = ?`);         fuParams.push(branch); }
-  const fr = honest.rangeSql('f.followed_up_at', from || null, to || null);
-  if (fr.clause) { fuWhere.push(fr.clause.replace(/^ AND /, '')); fuParams.push(...fr.params); }
-  const fuStats = db.prepare(`
-    SELECT f.assigned_sales AS sales_rep, f.branch AS branch,
-      COUNT(*) AS followed_up,
-      SUM(CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END) AS fu_visited
-    FROM branch_customer_followups f
-    LEFT JOIN lead_visits lv
-      ON lv.user_id = f.user_id AND lv.branch = f.branch
-    WHERE ${fuWhere.join(' AND ')}
-    GROUP BY f.assigned_sales, f.branch
-  `).all(...fuParams);
+  // Follow-up stats per (salesperson, branch).
+  // With dates (2026-11-25, the manager's rule — branchOverviewRange): the
+  // distinct customers he followed up in the range, from the append-only
+  // followup_log (the state row keeps only the LAST follow-up and is reset by
+  // a reassignment or the showroom handoff; the handoff's own note, kind
+  // 'handoff', is not a call and never counts); fu_visited = of them, the ones
+  // who visited that branch (any day). So the admin and the branch manager
+  // count the same follow-ups for the same days.
+  // Without dates: the follow-ups the state rows hold now (followed_up = 1) —
+  // the manager's all-time answer's rule.
+  const ranged = !!(from || to);
+  let fuStats;
+  if (ranged) {
+    // NOT_DUPLICATE: a customer the manager flagged duplicate is no
+    // follow-up, as in the manager's own range (2026-11-25 review).
+    const lw = [`l.sales IS NOT NULL`, `TRIM(l.sales) <> ''`, `COALESCE(l.kind, '') <> 'handoff'`, NOT_DUPLICATE('l.user_id')];
+    const lp = [];
+    if (sales)  { lw.push(`TRIM(l.sales) = TRIM(?)`); lp.push(sales); }
+    const lr = honest.rangeSql('l.followed_up_at', from || null, to || null);
+    fuStats = db.prepare(`
+      SELECT TRIM(l.sales) AS sales_rep, l.branch AS branch, l.user_id AS user_id,
+        EXISTS (SELECT 1 FROM lead_visits lv WHERE lv.user_id = l.user_id AND lv.branch = l.branch) AS visited
+      FROM followup_log l
+      WHERE ${lw.join(' AND ')}${lr.clause}
+    `).all(...lp, ...lr.params);
+    // distinct customers per (salesperson, branch) — the branch normalized like the rows'
+    const per = new Map();
+    for (const f of fuStats) {
+      const b = honest.normBranch(f.branch);
+      if (branch && b !== honest.normBranch(branch)) continue;
+      const k = `${f.sales_rep}|${b}`;
+      if (!per.has(k)) per.set(k, { sales_rep: f.sales_rep, branch: b, people: new Map() });
+      const p = per.get(k).people;
+      p.set(f.user_id, (p.get(f.user_id) || 0) || f.visited);
+    }
+    fuStats = [...per.values()].map((g) => ({
+      sales_rep: g.sales_rep, branch: g.branch, followed_up: g.people.size,
+      fu_visited: [...g.people.values()].filter(Boolean).length,
+    }));
+  } else {
+    const fuWhere  = [`f.assigned_sales IS NOT NULL`, `f.followed_up = 1`, NOT_DUPLICATE('f.user_id')];
+    const fuParams = [];
+    if (sales)  { fuWhere.push(`f.assigned_sales = ?`); fuParams.push(sales); }
+    if (branch) { fuWhere.push(`f.branch = ?`);         fuParams.push(branch); }
+    fuStats = db.prepare(`
+      SELECT f.assigned_sales AS sales_rep, f.branch AS branch,
+        COUNT(*) AS followed_up,
+        SUM(CASE WHEN lv.user_id IS NOT NULL THEN 1 ELSE 0 END) AS fu_visited
+      FROM branch_customer_followups f
+      LEFT JOIN lead_visits lv
+        ON lv.user_id = f.user_id AND lv.branch = f.branch
+      WHERE ${fuWhere.join(' AND ')}
+      GROUP BY f.assigned_sales, f.branch
+    `).all(...fuParams);
+  }
 
   const keyOf = (rep, br) => `${rep}|${honest.normBranch(br)}`;
   const idx = new Map(enriched.map(r => [keyOf(r.sales_rep, r.branch), r]));
@@ -3171,7 +3221,10 @@ app.get('/api/sales/analytics', requireAuth, requireRole('admin'), (req, res) =>
     if (!idx.has(k)) { idx.set(k, row); enriched.push(row); }
   }
 
-  return res.json({ bySales: enriched, byBranch });
+  // Stopped salespeople (2026-11-25): no row; byBranch (people per branch)
+  // keeps them, and stopped_sales says their contracts in the range.
+  const shown = hideStoppedRows(db, enriched);
+  return res.json({ bySales: shown.rows, byBranch, ...shown.extra });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3334,8 +3387,13 @@ app.get('/api/admin/forecast-debug', requireAuth, requireRole('admin'), (_req, r
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/branch/overview — branch manager's read-only view of THEIR branch.
-//   branch_manager → locked to its own branch. admin → ?branch=<id>
+//   branch_manager → locked to its own branch (a ?branch is ignored). admin → ?branch=<id>
 //   Returns branch KPIs + per-salesperson performance for that branch only.
+//   Optional ?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD (either may be empty;
+//   Cairo days, 2026-11-25 «رجّعلي فلترة التاريخ للمديرين»): every period
+//   number then counts only what happened in [startDate, endDate] and the
+//   answer carries `range: { from, to }` — see branchOverviewRange below.
+//   Without them the answer is the all-time one, unchanged.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'admin'), (req, res) => {
   const role = req.user?.role;
@@ -3344,7 +3402,17 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     : (req.query.branch || null);
   if (!branch) return res.status(400).json({ error: 'branch_required' });
 
+  const startDate = String(req.query.startDate ?? '').trim() || null;
+  const endDate   = String(req.query.endDate ?? '').trim() || null;
+  if ((startDate && !honest.isDay(startDate)) || (endDate && !honest.isDay(endDate))) {
+    return res.status(400).json({ error: 'التاريخ لازم يكون YYYY-MM-DD' });
+  }
+  if (startDate && endDate && startDate > endDate) {
+    return res.status(400).json({ error: 'تاريخ البداية لازم يكون قبل تاريخ النهاية أو نفس اليوم' });
+  }
+
   const db = getDb();
+  if (startDate || endDate) return res.json(branchOverviewRange(db, branch, startDate, endDate));
 
   // Customers who requested this branch in the CHAT (branch_selected) — even if
   // not visited. The walk-in route's event is not a request (2026-11-22).
@@ -3441,44 +3509,210 @@ app.get('/api/branch/overview', requireAuth, authorizeRoles('branch_manager', 'a
     if (!byName.has(a.sales_rep)) { byName.set(a.sales_rep, row); bySales.push(row); }
   }
 
-  // Attach each rep's CURRENT-MONTH target + achievement (revenue this month),
-  // and the follow-up rate (followed-up ÷ assigned).
+  // Attach each rep's CURRENT-MONTH target + achievement (contracts this
+  // Cairo month — the month the «الشهر ده» filter counts), and the follow-up
+  // rate (followed-up ÷ assigned).
+  const tMonth = cairoMonth();
   for (const r of bySales) {
     r.contracts    = r.contracts || 0;
-    r.target       = getTarget(db, 'sales_rep', r.sales_rep);   // a CONTRACTS target now
-    r.target_pct   = pctAchieved(monthContracts(db, { rep: r.sales_rep, branch }), r.target);
+    r.target       = getTarget(db, 'sales_rep', r.sales_rep, tMonth);   // a CONTRACTS target now
+    r.target_pct   = pctAchieved(cairoMonthContracts(db, { rep: r.sales_rep, branch, month: tMonth }), r.target);
     r.followup_rate = r.assigned ? Math.round((r.followed_up / r.assigned) * 100) : 0;
   }
 
   const served      = bySales.reduce((s, r) => s + r.served, 0);
   const bought      = bySales.reduce((s, r) => s + r.bought, 0);
-  const totalSales  = bySales.reduce((s, r) => s + r.total_sales, 0);
-  // Total contracts for the branch (count of purchase rows in this branch).
-  const contractsCount = db.prepare(
-    `SELECT COUNT(*) AS c FROM purchases WHERE branch = ?`
-  ).get(branch).c || 0;
+  // ALL the branch's contracts and their value = «التعاقدات» › «كل الشهور»
+  // (2026-11-25 review: the total was the rows' sum, so a contract with no
+  // salesperson was in the count beside it but not in «إجمالي البيع»); the
+  // rows stay his own contracts, no_rep_* = the rest (as with a range).
+  const totals = db.prepare(
+    `SELECT COUNT(*) AS count, COALESCE(SUM(price), 0) AS total FROM purchases WHERE branch = ?`
+  ).get(branch);
+  const repContracts = bySales.reduce((s, r) => s + (r.contracts || 0), 0);
+  const repSales     = bySales.reduce((s, r) => s + (r.total_sales || 0), 0);
 
-  // Branch target progress — current month's target vs this month's CONTRACTS.
-  const branchTarget = getTarget(db, 'branch', branch);
-  const branchMonthContracts = monthContracts(db, { branch });
+  // Branch target progress — this Cairo month's target vs its CONTRACTS.
+  const branchTarget = getTarget(db, 'branch', branch, tMonth);
+  const branchMonthContracts = cairoMonthContracts(db, { branch, month: tMonth });
+
+  // Stopped salespeople (2026-11-25): no row; their contracts stay in the
+  // totals above (computed from every row) and are said in stopped_sales.
+  const shown = hideStoppedRows(db, bySales);
 
   return res.json({
     branch,
-    target_month: currentMonth(),
+    target_month: tMonth,
+    ...shown.extra,
     kpis: {
       requested,
       visited,
       bought,
-      total_sales: totalSales,        // kept for backward-compat
-      contracts_count: contractsCount, // headline metric now
+      total_sales: totals.total,
+      contracts_count: totals.count,
+      no_rep_contracts: totals.count - repContracts,
+      no_rep_sales: totals.total - repSales,
       close_rate: served ? Math.round((bought / served) * 100) : 0,
       target:          branchTarget,
       month_contracts: branchMonthContracts,
       target_pct:      pctAchieved(branchMonthContracts, branchTarget),
     },
-    bySales,
+    bySales: shown.rows,
   });
 });
+
+// Per-salesperson rows without the stopped ones (honest.sellers / hideStopped)
+// → { rows, extra }: extra = { stopped_sales: { contracts, total_sales,
+// removed } } — what the hidden rows held of the totals — only when a row was
+// hidden (with nobody stopped the answer is the one it always was).
+function hideStoppedRows(db, rows, nameOf = (r) => r.sales_rep) {
+  const { rows: kept, hidden } = honest.hideStopped(rows, honest.sellers(db), nameOf,
+    { contracts: (r) => r.contracts, total_sales: (r) => r.total_sales });
+  return {
+    rows: kept,
+    extra: hidden.rows ? { stopped_sales: { contracts: hidden.contracts, total_sales: hidden.total_sales, removed: hidden.removed } } : {},
+  };
+}
+
+// /api/branch/overview with a range (2026-11-25). Every number counts what
+// happened in [from, to] Cairo days (either end may be open):
+//   requested    — chat people with a branch_selected for this branch in the range
+//   visited      — people with a visit at the branch in the range (honest.branchPeriod)
+//   per salesperson (honest.branchPeriod):
+//     bought       — distinct customers with a contract from him at the branch
+//                  dated in the range (so «اشتروا» never misses a contract
+//                  whose visit was in an earlier period)
+//     served       — the people he served at the branch in the range ∪ his
+//                  buyers (bought ≤ served); the branch's visited also holds
+//                  everyone with a contract there in the range
+//     contracts / total_sales — his contracts at this branch dated in the
+//                  range: the SQL of GET /api/contracts (p.branch = ? + the
+//                  same Cairo-day bounds), so the rows add up to that page
+//     followed_up / fu_visited — distinct customers he followed up in the
+//                  range, from the append-only followup_log (the state row
+//                  keeps only the LAST follow-up and is reset by a
+//                  reassignment / the showroom handoff; the handoff's own log
+//                  row, kind 'handoff', is not a call and never counts);
+//                  fu_visited = of them, visited the branch (any day)
+//     assigned     — customers assigned to him NOW (a state, not an event: the
+//                  follow-up table keeps one row per customer, so «assigned in
+//                  the range» would hide the ones still waiting)
+//   contracts_count / total_sales (branch) — ALL the branch's contracts in the
+//                  range = the contracts page's «N تعاقد — إجمالي X» for the
+//                  same days; no_rep_* = the ones with no salesperson (in the
+//                  total, in no row)
+//   The target is this CAIRO month's (cairoMonthContracts), like the all-time
+//   answer, so under «الشهر ده» month_contracts = contracts_count.
+// Duplicates the manager flagged (is_duplicate) stay out of visited / served /
+// follow-ups, as in the all-time answer; contracts never leave a total.
+function branchOverviewRange(db, branch, from, to) {
+  const isDup = new Set(db.prepare(`SELECT user_id FROM lead_profiles WHERE is_duplicate = 1`).all().map((r) => r.user_id));
+  const skip = (uid) => isDup.has(uid);
+
+  const er = honest.rangeSql('e.created_at', from, to);
+  const requested = db.prepare(`
+    SELECT COUNT(DISTINCT e.user_id) AS n FROM events e
+    WHERE e.event_type = 'branch_selected' AND (e.event_value = ? OR e.branch = ?) AND ${honest.CHAT_EVENT('e')}${er.clause}
+  `).get(branch, branch, ...er.params).n;
+
+  const period = honest.branchPeriod(db, { branch, from, to, skip });
+
+  const pr = honest.rangeSql('p.created_at', from, to);
+  const contractsBy = db.prepare(`
+    SELECT p.rep AS rep, COUNT(*) AS contracts, COALESCE(SUM(p.price), 0) AS total_sales
+    FROM purchases p WHERE p.branch = ?${pr.clause}
+    GROUP BY p.rep
+  `).all(branch, ...pr.params);
+  const totals = db.prepare(`
+    SELECT COUNT(*) AS count, COALESCE(SUM(p.price), 0) AS total FROM purchases p WHERE p.branch = ?${pr.clause}
+  `).get(branch, ...pr.params);
+
+  const blankRow = (name) => ({
+    sales_rep: name, served: 0, bought: 0, not_bought: 0,
+    close_rate: 0, total_sales: 0, contracts: 0, assigned: 0, followup_rate: 0,
+    followed_up: 0, fu_visited: 0, fu_not_visited: 0,
+  });
+  const byName = new Map();
+  const rowOf = (name) => { if (!byName.has(name)) byName.set(name, blankRow(name)); return byName.get(name); };
+  for (const r of period.bySales) {
+    const row = rowOf(r.sales_rep);
+    row.served = r.served; row.bought = r.bought;
+  }
+  let noRepContracts = 0, noRepSales = 0;
+  for (const c of contractsBy) {
+    if (c.rep == null || String(c.rep).trim() === '') { noRepContracts += c.contracts; noRepSales += c.total_sales; continue; }
+    const row = rowOf(c.rep);
+    row.contracts += c.contracts; row.total_sales += c.total_sales;
+  }
+
+  const fr = honest.rangeSql('l.followed_up_at', from, to);
+  const fuStats = db.prepare(`
+    SELECT
+      TRIM(l.sales)                                                         AS sales_rep,
+      COUNT(DISTINCT l.user_id)                                             AS followed_up,
+      COUNT(DISTINCT CASE WHEN lv.user_id IS NOT NULL THEN l.user_id END)   AS fu_visited
+    FROM followup_log l
+    LEFT JOIN (
+      SELECT DISTINCT user_id FROM lead_visits WHERE branch = ?
+    ) lv ON lv.user_id = l.user_id
+    WHERE l.branch = ? AND l.sales IS NOT NULL AND TRIM(l.sales) <> ''
+      AND COALESCE(l.kind, '') <> 'handoff'
+      AND ${NOT_DUPLICATE('l.user_id')}${fr.clause}
+    GROUP BY TRIM(l.sales)
+  `).all(branch, branch, ...fr.params);
+  for (const s of fuStats) {
+    const row = rowOf(s.sales_rep);
+    row.followed_up    = s.followed_up;
+    row.fu_visited     = s.fu_visited;
+    row.fu_not_visited = s.followed_up - s.fu_visited;
+  }
+  const assignedStats = db.prepare(`
+    SELECT TRIM(assigned_sales) AS sales_rep, COUNT(*) AS assigned
+    FROM branch_customer_followups
+    WHERE branch = ? AND assigned_sales IS NOT NULL AND TRIM(assigned_sales) <> ''
+      AND ${NOT_DUPLICATE('branch_customer_followups.user_id')}
+    GROUP BY TRIM(assigned_sales)
+  `).all(branch);
+  for (const a of assignedStats) rowOf(a.sales_rep).assigned = a.assigned;
+
+  const bySales = [...byName.values()];
+  const tMonth = cairoMonth();
+  for (const r of bySales) {
+    r.not_bought    = r.served - r.bought;
+    r.close_rate    = r.served ? Math.round((r.bought / r.served) * 100) : 0;
+    r.target        = getTarget(db, 'sales_rep', r.sales_rep, tMonth);
+    r.target_pct    = pctAchieved(cairoMonthContracts(db, { rep: r.sales_rep, branch, month: tMonth }), r.target);
+    r.followup_rate = r.assigned ? Math.round((r.followed_up / r.assigned) * 100) : 0;
+  }
+  bySales.sort((a, b) => b.total_sales - a.total_sales || b.contracts - a.contracts || b.served - a.served);
+
+  // distinct people across the rows (one customer can be in two salespeople's rows)
+  const served = period.served;
+  const bought = period.bought;
+  const branchTarget = getTarget(db, 'branch', branch, tMonth);
+  const branchMonthContracts = cairoMonthContracts(db, { branch, month: tMonth });
+  const shown = hideStoppedRows(db, bySales);   // stopped salespeople: no row (2026-11-25)
+  return {
+    branch,
+    range: { from: from || null, to: to || null },
+    target_month: tMonth,
+    ...shown.extra,
+    kpis: {
+      requested,
+      visited: period.visited,
+      bought,
+      total_sales: totals.total,
+      contracts_count: totals.count,
+      no_rep_contracts: noRepContracts,
+      no_rep_sales: noRepSales,
+      close_rate: served ? Math.round((bought / served) * 100) : 0,
+      target:          branchTarget,
+      month_contracts: branchMonthContracts,
+      target_pct:      pctAchieved(branchMonthContracts, branchTarget),
+    },
+    bySales: shown.rows,
+  };
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/branch/customers — customers who requested this branch + follow-up status
@@ -3589,11 +3823,14 @@ function addPlannedBadges(db, rows, branchOf) {
 
 // Records a completed follow-up in the append-only log (history survives
 // reassignment). Only called when a follow-up is actually marked done.
-function logFollowup(db, branch, userId, sales, summary) {
+// `kind`: NULL = a follow-up someone did; 'handoff' = the showroom handoff's
+// note (the customer visited, the follow-up moved to the showroom rep) — not a
+// call, so the manager's range «تابع» never counts it (db.js backfills it).
+function logFollowup(db, branch, userId, sales, summary, kind = null) {
   db.prepare(`
-    INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at)
-    VALUES (?, ?, ?, ?, datetime('now'))
-  `).run(branch, userId, sales || null, (summary && String(summary).trim()) || null);
+    INSERT INTO followup_log (branch, user_id, sales, call_summary, followed_up_at, kind)
+    VALUES (?, ?, ?, ?, datetime('now'), ?)
+  `).run(branch, userId, sales || null, (summary && String(summary).trim()) || null, kind);
 }
 
 // Full cross-branch journey of a customer: every visit (which branch, which rep)
@@ -3685,9 +3922,13 @@ function createNotification(db, audience, type, message) {
 }
 
 // ── Sales-target helpers ────────────────────────────────────────────────────
-// Current calendar month as 'YYYY-MM'.
+// Current month as 'YYYY-MM' — the CAIRO month (2026-11-25: every month
+// counter is a Cairo month, CLAUDE.md «Day boundaries are Cairo days»; it was
+// the UTC month, so from 00:00 to 02:00/03:00 Cairo on the 1st the target
+// card, the salesperson's own target and the targets screen still showed the
+// month before). Targets stay stored per 'YYYY-MM' key.
 function currentMonth() {
-  return new Date().toISOString().slice(0, 7);
+  return cairoMonth();
 }
 
 // Monthly target for a scope. `month` defaults to the current calendar month.
@@ -3700,33 +3941,52 @@ function getTarget(db, scopeType, scopeName, month) {
   return row ? (Number(row.target_amount) || 0) : 0;
 }
 
-// Revenue (SUM of purchase price) generated WITHIN a calendar month, optionally
+// Revenue (SUM of purchase price) generated WITHIN a Cairo month, optionally
 // scoped to a branch or a sales rep. `month` defaults to the current month.
 function monthRevenue(db, { branch, rep, month } = {}) {
-  let where = `strftime('%Y-%m', created_at) = ?`;
-  const params = [month || currentMonth()];
+  const r = cairoMonthSql('created_at', month || currentMonth());
+  let where = '1=1'; const params = [];
   if (branch) { where += ` AND branch = ?`; params.push(branch); }
   if (rep)    { where += ` AND rep = ?`;    params.push(rep); }
   return db.prepare(
-    `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${where}`
-  ).get(...params).r || 0;
+    `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${where}${r.clause}`
+  ).get(...params, ...r.params).r || 0;
 }
 
-// Count of CONTRACTS (purchases) recorded WITHIN a calendar month, optionally
+// Count of CONTRACTS (purchases) recorded WITHIN a Cairo month, optionally
 // scoped to a branch or rep. This replaces revenue as the headline metric — the
 // business tracks number of contracts, not money. `month` defaults to current.
+// The same count as cairoMonthContracts (the branch overview's target).
 function monthContracts(db, { branch, rep, month } = {}) {
-  let where = `strftime('%Y-%m', created_at) = ?`;
-  const params = [month || currentMonth()];
-  if (branch) { where += ` AND branch = ?`; params.push(branch); }
-  if (rep)    { where += ` AND rep = ?`;    params.push(rep); }
-  return db.prepare(
-    `SELECT COUNT(*) AS c FROM purchases WHERE ${where}`
-  ).get(...params).c || 0;
+  return cairoMonthContracts(db, { branch, rep, month: month || currentMonth() });
 }
 
 function pctAchieved(actual, target) {
   return target > 0 ? Math.round(((actual || 0) / target) * 100) : 0;
+}
+
+// ── Cairo months (2026-11-25 review) ────────────────────────────────────────
+// The branch overview's target month and the contracts page's month picker
+// are CAIRO months (the 1st 00:00 Cairo → the last day 24:00 Cairo, through
+// honest.rangeSql), so «الشهر ده» / «نوفمبر» count the same contracts as «من
+// يوم لـ يوم» over the same days. A contract at 00:40 Cairo on the 1st (22:40
+// UTC the day before) is the new month's. Since 2026-11-25 every other month
+// counter is too (currentMonth, monthRevenue / monthContracts above: the admin
+// home's target, /api/sales/my-target, /api/sales/my, the targets screen, MCP).
+function cairoMonth(d = new Date()) { return cairoDay(d).slice(0, 7); }
+function lastDayOfMonth(month) {
+  const [y, mo] = month.split('-').map(Number);
+  return new Date(Date.UTC(y, mo, 0)).toISOString().slice(0, 10);
+}
+// ` AND …` — `col` inside the Cairo month 'YYYY-MM'.
+function cairoMonthSql(col, month) { return honest.rangeSql(col, `${month}-01`, lastDayOfMonth(month)); }
+// Contracts in a Cairo month (default: this one), optionally by branch / rep.
+function cairoMonthContracts(db, { branch, rep, month } = {}) {
+  const r = cairoMonthSql('created_at', month || cairoMonth());
+  let where = '1=1'; const params = [];
+  if (branch) { where += ' AND branch = ?'; params.push(branch); }
+  if (rep)    { where += ' AND rep = ?';    params.push(rep); }
+  return db.prepare(`SELECT COUNT(*) AS c FROM purchases WHERE ${where}${r.clause}`).get(...params, ...r.params).c || 0;
 }
 
 // (dateRangeClause — a UTC `date(col)` range — was removed 2026-11-22: every
@@ -4198,6 +4458,16 @@ app.patch('/api/branch/customers/:userId/followup', requireAuth, authorizeRoles(
   const summary = newVal ? (call_summary && String(call_summary).trim()) || null : null;
 
   const db = getDb();
+  // 2026-11-25 review: the admin may name who called, but only an ACTIVE
+  // account (a stopped or free-typed name would be credited a follow-up in
+  // followup_log — the range «تابع» and leadIsMine — the same rule as every
+  // picker, rep_not_active). His own name (what the portal sends) is fine.
+  if (newVal && role !== 'branch_manager' && byName
+      && byName !== String(req.user?.name || '').trim()
+      && !db.prepare(`SELECT 1 FROM users WHERE TRIM(name) = TRIM(?) AND active = 1
+                      AND role IN ('sales','rep','branch_manager','admin')`).get(byName)) {
+    return res.status(400).json({ error: 'السيلز ده متوقف أو مش موجود — اختار من القايمة', code: 'rep_not_active' });
+  }
   // Phase 0 r3: same scope as …/assign — the lead exists and, for a branch
   // manager, has its own tie to his branch; checked before the row is written.
   if (!branchCustomerKnown(db, userId) || (role === 'branch_manager' && !leadOwnBranchTie(db, userId, branch))) {
@@ -5129,7 +5399,13 @@ app.patch('/api/branch/users/:id/toggle-active', requireAuth, authorizeRoles('ad
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const next = u.active ? 0 : 1;
+  // The wanted state (2026-11-25 review): «رجّعه» sends active 1, «إيقاف»
+  // active 0, so a page opened before someone else's change never does the
+  // opposite of its button (a repeat press changes nothing). No body = the
+  // old flip, for a portal that has not updated yet.
+  const want = req.body?.active;
+  if (want !== undefined && ![0, 1, true, false].includes(want)) return res.status(400).json({ error: 'bad_active' });
+  const next = want === undefined ? (u.active ? 0 : 1) : (want ? 1 : 0);
   db.prepare(`UPDATE users SET active = ? WHERE id = ?`).run(next, id);
   console.log(`🔄 USER ${next ? 'ACTIVATED' : 'DEACTIVATED'}: id:${id} by ${req.user?.name}`);
   return res.json({ ok: true, id, active: next });
@@ -5746,6 +6022,21 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
   // typed with spaces / dashes / +2 still matches. It sits INSIDE the same WHERE
   // as the status + RBAC clauses (never widening either), so the manager searches
   // the WHOLE scoped set — not just the newest 300 rows the list shows.
+  // ?rep= (2026-11-25 review): one person's post-visit customers — the
+  // «نقل» tool's second group, so a STOPPED salesperson's waiting visited
+  // customers can be moved off him (they have no performance row any more).
+  // The admin also gives ?branch= (his scope is every branch). It only
+  // narrows the role scoping above, never widens it.
+  const repFilter = (req.query.rep && String(req.query.rep).trim()) || null;
+  if (repFilter) {
+    rbacWhere += ` AND TRIM(${OWNER_REP_SQL}) = TRIM(?)`;
+    params.push(repFilter);
+    if (role === 'admin' && req.query.branch) {
+      rbacWhere += ` AND ${OWNER_BRANCH_SQL} = ?`;
+      params.push(String(req.query.branch));
+    }
+  }
+
   const search = searchTerms(req.query.q);
   // A 1-3 digit fragment isn't a phone search: '%50%' hits nearly every number
   // in the branch and floods the 300-row list — pushing the row the manager
@@ -5801,6 +6092,12 @@ app.get('/api/revisit/customers', requireAuth, authorizeRoles('admin', 'branch_m
     ORDER BY COALESCE(lp.revisit_updated_at, lp.purchased_at, lp.last_activity) DESC
     LIMIT 300
   `).all(...params);
+  // A work-queue flag, not a performance row (2026-11-25 review): the owner
+  // (sales_rep) has no ACTIVE account — stopped, or a removed name — so
+  // nobody's queue holds this customer until a person moves him («نقل» /
+  // assign-post). The same rule as every hidden performance row.
+  const who = honest.sellers(db);
+  for (const c of customers) c.owner_stopped = c.sales_rep && !who.shown(c.sales_rep) ? 1 : 0;
 
   // Searching? Tell the UI how many rows the SAME search (and the SAME role
   // scoping) hits in each tab — that's what lets the page say "لقيته في: اشتروا"
@@ -6007,10 +6304,15 @@ app.get('/api/revisit/analytics', requireAuth, authorizeRoles('admin', 'branch_m
     return { ...o, conversion: total ? Math.round((o.bought / total) * 100) : 0 };
   };
 
+  // Stopped salespeople (2026-11-25): no row; their customers stay in the
+  // summary and the branches, stopped_sales.customers says how many.
+  const { rows: salesRows, hidden } = honest.hideStopped([...salesMap.values()], honest.sellers(db), (r) => r.sales_rep,
+    { customers: (r) => r.pending + r.bought + r.lost });
   return res.json({
     summary,
     byBranch: [...branchMap.values()].map(withRate).sort((a, b) => b.bought - a.bought),
-    bySales:  [...salesMap.values()].map(withRate).sort((a, b) => b.bought - a.bought),
+    bySales:  salesRows.map(withRate).sort((a, b) => b.bought - a.bought),
+    ...(hidden.rows ? { stopped_sales: { customers: hidden.customers, removed: hidden.removed } } : {}),
   });
 });
 
@@ -6028,14 +6330,16 @@ app.get('/api/admin/sales-followup-monitor', requireAuth, authorizeRoles('admin'
   const db = getDb();
 
   // Admin sees every showroom rep; a branch manager sees ONLY their own branch's
-  // reps (include inactive ones too — their history still matters).
+  // reps — the active ones (2026-11-25; before, the stopped ones were listed too).
   const myBranch = req.user?.role === 'branch_manager' ? (req.user.branch || null) : null;
   if (req.user?.role === 'branch_manager' && !myBranch) {
     return res.status(400).json({ error: 'branch_required' });
   }
+  // 2026-11-25 (owner: «اللي يتوقف يتأرشف وميبانش تاني»): ACTIVE ones only — a
+  // stopped salesperson's history stays in the data, never as a row here.
   const reps = myBranch
-    ? db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') AND branch = ? ORDER BY name`).all(myBranch)
-    : db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') ORDER BY branch, name`).all();
+    ? db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') AND active = 1 AND branch = ? ORDER BY name`).all(myBranch)
+    : db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales','rep') AND active = 1 ORDER BY branch, name`).all();
 
   // ── PRE-visit (branch_customer_followups, customer not yet visited) ─────────
   const preAgg = db.prepare(`
@@ -6154,15 +6458,15 @@ app.get('/api/admin/sales-daily-activity', requireAuth, authorizeRoles('admin', 
   const db = getDb();
 
   // Same scoping as the follow-up monitor above: admin sees every showroom rep;
-  // a branch manager sees ONLY their own branch's reps (inactive included —
-  // their history still matters).
+  // a branch manager sees ONLY their own branch's reps — active ones only
+  // (2026-11-25: a stopped salesperson gets no row).
   const myBranch = req.user?.role === 'branch_manager' ? (req.user.branch || null) : null;
   if (req.user?.role === 'branch_manager' && !myBranch) {
     return res.status(400).json({ error: 'branch_required' });
   }
   const reps = myBranch
-    ? db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') AND branch = ? ORDER BY name`).all(myBranch)
-    : db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') ORDER BY branch, name`).all();
+    ? db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') AND active = 1 AND branch = ? ORDER BY name`).all(myBranch)
+    : db.prepare(`SELECT name, branch, active FROM users WHERE role IN ('sales','rep') AND active = 1 ORDER BY branch, name`).all();
 
   const days = Math.min(60, Math.max(1, parseInt(req.query.days, 10) || 14));
   // CAIRO days (2026-11-22 «أرقام حقيقية» r2): the window is the last `days`
@@ -6366,10 +6670,11 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   // above already constrains non-admins, so these only narrow further).
   const { startDate, endDate, branch: fBranch, rep: fRep } = req.query;
 
-  // month=YYYY-MM → التعاقدات بتاعة الشهر ده بس. A month here is a UTC calendar
-  // month, exactly like currentMonth()/monthRevenue() and the targets screen —
-  // we don't invent a Cairo-local month just for this page. Bad input is a 400,
-  // never a silent "here's everything".
+  // month=YYYY-MM → التعاقدات بتاعة الشهر ده بس. A month here is a CAIRO month
+  // (2026-11-25 review: the UTC month put a contract made at 00:10 Cairo on
+  // the 1st in the month before, so «نوفمبر» and «من يوم لـ يوم» 11-01 → 11-30
+  // listed different contracts, and the branch overview's «الشهر ده» a third
+  // set). Bad input is a 400, never a silent "here's everything".
   const monthRaw = String(req.query.month ?? '').trim();
   let month = null;
   if (monthRaw) {
@@ -6377,11 +6682,11 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
       return res.status(400).json({ error: 'الشهر لازم يكون بصيغة YYYY-MM (مثال: 2026-09)' });
     }
     month = monthRaw;
-    // strftime('%Y-%m', …) normalises BOTH date formats living in this table
-    // ("YYYY-MM-DD HH:MM:SS" written by us, and ISO "…T…Z" from older rows) —
-    // a raw substr(p.created_at,1,7) would too, but only by luck of the prefix.
-    where += ` AND strftime('%Y-%m', p.created_at) = ?`;
-    params.push(month);
+    // datetime(…) in rangeSql reads BOTH date formats living in this table
+    // ("YYYY-MM-DD HH:MM:SS" written by us, and ISO "…T…Z" from older rows).
+    const mr = cairoMonthSql('p.created_at', month);
+    where += mr.clause;
+    params.push(...mr.params);
   }
 
   if ((startDate && !honest.isDay(startDate)) || (endDate && !honest.isDay(endDate))) {
@@ -6452,16 +6757,16 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   // Every month that actually HAS contracts for this user — feeds the month
   // picker (and the "أقرب شهر فيه تعاقدات" shortcut when the chosen month is
   // empty), so it's scoped by role only and ignores the month filter itself.
-  const months = db.prepare(`
-    SELECT strftime('%Y-%m', p.created_at) AS month,
-           COUNT(*) AS count,
-           COALESCE(SUM(p.price), 0) AS total
-    FROM purchases p
-    WHERE ${roleWhere}
-    GROUP BY month
-    HAVING month IS NOT NULL
-    ORDER BY month DESC
-  `).all(...roleParams);
+  // Grouped by each contract's CAIRO month (honest.dayOf), the month= filter's.
+  const monthAgg = new Map();
+  for (const r of db.prepare(`SELECT p.created_at, p.price FROM purchases p WHERE ${roleWhere}`).all(...roleParams)) {
+    const day = honest.dayOf(r.created_at);
+    if (!day) continue;
+    const m = day.slice(0, 7);
+    if (!monthAgg.has(m)) monthAgg.set(m, { month: m, count: 0, total: 0 });
+    const a = monthAgg.get(m); a.count += 1; a.total += Number(r.price) || 0;
+  }
+  const months = [...monthAgg.values()].sort((a, b) => (a.month < b.month ? 1 : a.month > b.month ? -1 : 0));
 
   // ADMIN ONLY: the same filter set's estimate summary (no LIMIT).
   let estimateSummary = {};
@@ -7906,11 +8211,14 @@ app.post('/api/admin/swap-reps', requireAuth, requireRole('admin'), (req, res) =
   if (!aId || !bId || String(aId) === String(bId)) {
     return res.status(400).json({ error: 'اختار سيلزين مختلفين' });
   }
-  const a = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(aId);
-  const b = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(bId);
+  const a = db.prepare(`SELECT id, name, branch, role, active FROM users WHERE id = ?`).get(aId);
+  const b = db.prepare(`SELECT id, name, branch, role, active FROM users WHERE id = ?`).get(bId);
   if (!a || !b) return res.status(404).json({ error: 'سيلز مش موجود' });
   if (!['sales', 'rep'].includes(a.role) || !['sales', 'rep'].includes(b.role)) {
     return res.status(400).json({ error: 'التبديل للسيلز بس' });
+  }
+  if (Number(a.active) !== 1 || Number(b.active) !== 1) {   // 2026-11-25: a stopped one is never picked
+    return res.status(400).json({ error: 'السيلز ده متوقف — رجّعه الأول من «متوقفين»', code: 'rep_not_active' });
   }
   if (a.name.trim() === b.name.trim()) {
     return res.status(400).json({ error: 'الاتنين بنفس الاسم — مينفعش التبديل' });
@@ -7968,9 +8276,12 @@ app.post('/api/admin/transfer-rep', requireAuth, requireRole('admin'), (req, res
   const newBranch = (req.body?.newBranch && String(req.body.newBranch).trim()) || null;
   if (!repId || !newBranch) return res.status(400).json({ error: 'اختار السيلز والفرع الجديد' });
 
-  const rep = db.prepare(`SELECT id, name, branch, role FROM users WHERE id = ?`).get(repId);
+  const rep = db.prepare(`SELECT id, name, branch, role, active FROM users WHERE id = ?`).get(repId);
   if (!rep) return res.status(404).json({ error: 'السيلز مش موجود' });
   if (!['sales', 'rep'].includes(rep.role)) return res.status(400).json({ error: 'النقل للسيلز بس' });
+  if (Number(rep.active) !== 1) {   // 2026-11-25: a stopped one is never picked
+    return res.status(400).json({ error: 'السيلز ده متوقف — رجّعه الأول من «متوقفين»', code: 'rep_not_active' });
+  }
   if ((rep.branch || null) === newBranch) return res.status(400).json({ error: 'هو أصلاً في الفرع ده' });
 
   const oldBranch = rep.branch || null;
@@ -8045,13 +8356,17 @@ app.post('/api/notifications/read-all', requireAuth, requireRole('admin'), (req,
 // Sales targets — admin sets revenue goals per branch / per sales rep.
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/api/admin/targets', requireAuth, authorizeRoles('admin', 'branch_manager'), (req, res) => {
-  // Defaults to the current calendar month when ?month is not given.
+  // Defaults to the current CAIRO month when ?month is not given.
   const month = (req.query.month && String(req.query.month).trim()) || currentMonth();
-  const rows = getDb().prepare(`
+  const db = getDb();
+  const rows = db.prepare(`
     SELECT scope_type, scope_name, target_month, target_amount
     FROM sales_targets WHERE target_month = ?
   `).all(month);
-  return res.json({ month, targets: rows });
+  // A stopped salesperson's target (2026-11-25) is not listed — it stays
+  // stored, and comes back with him when he is re-activated.
+  const who = honest.sellers(db);
+  return res.json({ month, targets: rows.filter((t) => t.scope_type !== 'sales_rep' || who.shown(t.scope_name)) });
 });
 
 app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => {
@@ -8061,11 +8376,17 @@ app.post('/api/admin/targets', requireAuth, requireRole('admin'), (req, res) => 
   }
   const name = (scope_name && String(scope_name).trim()) || '';
   if (!name) return res.status(400).json({ error: 'scope_name_required' });
+  // A salesperson's target is for an ACTIVE salesperson (2026-11-25): never a
+  // stopped one, never a free-typed name.
+  if (scope_type === 'sales_rep' && !getDb().prepare(
+    `SELECT 1 FROM users WHERE TRIM(name) = ? AND role IN ('sales','rep') AND active = 1`).get(name)) {
+    return res.status(400).json({ error: 'السيلز ده متوقف أو مش موجود — اختار من القايمة', code: 'rep_not_active' });
+  }
   const amount = Number(target_amount);
   if (!Number.isFinite(amount) || amount < 0) {
     return res.status(400).json({ error: 'bad_target_amount' });
   }
-  // Default to the current calendar month; validate the 'YYYY-MM' shape.
+  // Default to the current Cairo month; validate the 'YYYY-MM' shape.
   let month = (target_month && String(target_month).trim()) || currentMonth();
   if (!/^\d{4}-\d{2}$/.test(month)) month = currentMonth();
 
@@ -8126,7 +8447,7 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
   // Visitors (and buyers among them) — every check-in day, Cairo.
   const pv = honest.periodVisits(db, { from, to, branch: branch || null });
 
-  // Target progress — strictly the CURRENT calendar month: this month's
+  // Target progress — strictly the CURRENT Cairo month: this month's
   // target vs contracts this month (independent of the filter range).
   const curMonth = currentMonth();
   let target = 0;
@@ -8181,7 +8502,7 @@ app.get('/api/admin/kpis', requireAuth, requireRole('admin'), (req, res) => {
 app.get('/api/sales/my-target', requireAuth, authorizeRoles('sales', 'rep'), (req, res) => {
   const db = getDb();
   const me = req.user.name;
-  // Current calendar month: this month's target vs this month's revenue.
+  // Current Cairo month: this month's target vs this month's contracts.
   const target    = getTarget(db, 'sales_rep', me);
   const revenue   = monthRevenue(db, { rep: me });
   const contracts = monthContracts(db, { rep: me });
@@ -8397,9 +8718,17 @@ app.get('/api/admin/sales-value', requireAuth, requireRole('admin'), (req, res) 
   const byBranch  = agg('GROUP BY p.branch ORDER BY value_total DESC', `p.branch AS branch,`).all(...dr.params);
   const byRep     = agg('GROUP BY p.rep, p.branch ORDER BY value_total DESC', `p.rep AS rep, p.branch AS branch,`).all(...dr.params);
   const byCampaign = agg('GROUP BY lp.campaign_source ORDER BY value_total DESC', `lp.campaign_source AS campaign_source,`).all(...dr.params);
+  // Stopped salespeople (2026-11-25): no row in «السيلز» (a contract with no
+  // salesperson keeps its «—» row); the totals keep their contracts, and
+  // stopped_sales says how many and their value.
+  const who = honest.sellers(db);
+  const noRep = (r) => r.rep == null || String(r.rep).trim() === '';
+  const { rows: repRows, hidden } = honest.hideStopped(byRep, { ...who, shown: (n) => n == null || String(n).trim() === '' || who.shown(n) },
+    (r) => (noRep(r) ? null : r.rep), { contracts: (r) => r.contracts, value_total: (r) => r.value_total });
   return res.json({
     from, to, timezone: CAIRO_TZ, currency: 'EGP', approximate: true,
-    totals, by_branch: byBranch, by_rep: byRep, by_campaign: byCampaign,
+    totals, by_branch: byBranch, by_rep: repRows, by_campaign: byCampaign,
+    ...(hidden.rows ? { stopped_sales: { contracts: hidden.contracts, value_total: hidden.value_total, removed: hidden.removed } } : {}),
   });
 });
 
@@ -8697,7 +9026,7 @@ setTimeout(() => {
   function buildMcpServer() {
     const srv = new McpServerCls({ name: 'grand-furniture-crm', version: '1.0.0' });
     const db  = getDb();
-    const currentMonth = () => new Date().toISOString().slice(0, 7);
+    // the Cairo month (2026-11-25), like every month counter of the API
     const ok  = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
     const fail = (msg) => ({ content: [{ type: 'text', text: 'خطأ: ' + msg }], isError: true });
 
@@ -8713,19 +9042,15 @@ setTimeout(() => {
         const month = (target_month && /^\d{4}-\d{2}$/.test(target_month))
           ? target_month : currentMonth();
 
-        let revWhere = `strftime('%Y-%m', created_at) = ?`;
-        const revP = [month];
-        if (branch) { revWhere += ' AND branch = ?'; revP.push(branch); }
-        const revenue = db.prepare(
-          `SELECT COALESCE(SUM(price), 0) AS r FROM purchases WHERE ${revWhere}`
-        ).get(...revP).r;
+        const revenue = monthRevenue(db, { branch: branch || null, month });
 
-        let visWhere = `strftime('%Y-%m', visited_at) = ?`;
-        const visP = [month];
+        const vm = cairoMonthSql('visited_at', month);
+        let visWhere = '1=1';
+        const visP = [];
         if (branch) { visWhere += ' AND branch = ?'; visP.push(branch); }
         const visits = db.prepare(
-          `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}`
-        ).get(...visP).n;
+          `SELECT COUNT(DISTINCT user_id) AS n FROM lead_visits WHERE ${visWhere}${vm.clause}`
+        ).get(...visP, ...vm.params).n;
 
         const target = branch
           ? (() => {
@@ -8896,6 +9221,33 @@ process.on('uncaughtException', (err) => {
       }
     })();
 
+    // purchases too (2026-11-25 review): a legacy contract under an alias
+    // ('المعادي') was in honest's normalized «اشتروا» but out of every raw
+    // `p.branch = ?` (the overview's contracts / total, GET /api/contracts).
+    // Current writes are canonical already; no unique key, so a plain UPDATE.
+    const purchaseRows = db.prepare(`SELECT id, branch FROM purchases WHERE branch IS NOT NULL`).all();
+    const updPurchase  = db.prepare(`UPDATE purchases SET branch = ? WHERE id = ?`);
+    let purchasesFixed = 0;
+    db.transaction(() => {
+      for (const r of purchaseRows) {
+        const canonical = normalizeBranch(r.branch);
+        if (canonical && canonical !== r.branch) { updPurchase.run(canonical, r.id); purchasesFixed++; }
+      }
+    })();
+
+    // followup_log too (2026-11-25 review): a legacy follow-up under an alias
+    // ('المعادي') was in the admin's normalized «أداء السيلز» but out of the
+    // manager's exact `l.branch = ?` range «تابع». Append-only, no unique key.
+    const fuLogRows = db.prepare(`SELECT id, branch FROM followup_log WHERE branch IS NOT NULL`).all();
+    const updFuLog  = db.prepare(`UPDATE followup_log SET branch = ? WHERE id = ?`);
+    let fuLogFixed = 0;
+    db.transaction(() => {
+      for (const r of fuLogRows) {
+        const canonical = normalizeBranch(r.branch);
+        if (canonical && canonical !== r.branch) { updFuLog.run(canonical, r.id); fuLogFixed++; }
+      }
+    })();
+
     const profileRows = db.prepare(
       `SELECT user_id, preferred_branch FROM lead_profiles WHERE preferred_branch IS NOT NULL`
     ).all();
@@ -8937,8 +9289,8 @@ process.on('uncaughtException', (err) => {
       } catch (_) { /* malformed setting — leave it */ }
     }
 
-    if (eventsFixed || visitsFixed || profilesFixed || configFixed) {
-      console.log(`✅ Migration: normalized branch ids — events:${eventsFixed} visits:${visitsFixed} profiles:${profilesFixed} config:${configFixed}`);
+    if (eventsFixed || visitsFixed || purchasesFixed || fuLogFixed || profilesFixed || configFixed) {
+      console.log(`✅ Migration: normalized branch ids — events:${eventsFixed} visits:${visitsFixed} purchases:${purchasesFixed} followup_log:${fuLogFixed} profiles:${profilesFixed} config:${configFixed}`);
     }
   } catch (e) {
     console.error('[migration] branch normalize failed:', e.message);
