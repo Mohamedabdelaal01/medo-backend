@@ -320,6 +320,21 @@ function initializeDatabase(dbPath = DB_PATH) {
     }
   }
 
+  // purchases.recorded_at (2026-11-25 «تعديل تاريخ التعاقد»): the moment the
+  // sale was TYPED, kept when a branch manager / the admin corrects the
+  // contract's date (created_at). NULL = the date was never edited, so the
+  // moment is created_at itself — read it as COALESCE(recorded_at, created_at).
+  // Analytics follow created_at (the contract's day); what is about the moment
+  // of typing follows recorded_at: Meta's Purchase re-send window and event
+  // time (backfillPurchaseEstimates), the reception desk's «اتسجّلت النهارده»
+  // and the duplicate guards.
+  try {
+    db.exec(`ALTER TABLE purchases ADD COLUMN recorded_at DATETIME`);
+    console.log('✅ Migration: recorded_at added to purchases');
+  } catch (e) {
+    if (!e.message.includes('duplicate column name')) throw e;
+  }
+
   // ── Product catalog — categories + products + per-purchase line items ────
   // The catalog is admin/branch-manager managed. Sales reps pick from it when
   // recording a purchase. A single contract can include multiple products, so

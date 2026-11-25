@@ -14,7 +14,7 @@ const { getDb, getLiveDb,
 // deploy checks, GET /health) can confirm production runs the latest code.
 // Declared here (not next to /health) because the boot backup below names its
 // pre-migration copy after it.
-const BUILD_VERSION = '2026-11-25-manager-range-stopped-sales-r2';
+const BUILD_VERSION = '2026-11-25-contracts-filters-r2';
 // Phase 0: a copy of the live DB BEFORE this boot's migrations (first boot of
 // each version) + the day's copy — /data/backups, see services/backup.js.
 const backup = require('./services/backup');
@@ -218,6 +218,13 @@ function cairoHHMM(d) { const p = cairoParts(d); return `${p.hour}:${p.minute}`;
 // «أرقام حقيقية» (2026-11-22): what every analytics step counts — Cairo days,
 // people not events, walk-ins never a chat step (services/honestNumbers.js).
 const honest = require('./services/honestNumbers')({ cairoDay, cairoDayBoundsSql, sqlUtcToDate, normalizeBranch });
+// The moment a sale was TYPED (2026-11-25): a contract's date (created_at) can
+// be corrected by its branch manager / the admin; recorded_at keeps the typing
+// moment then (NULL = never re-dated → created_at). Analytics and the reception
+// desk's «اشترى النهارده» (today's list, «مشي من غير شراء», review r2) read
+// created_at — the contract's day; Meta's re-send window and the duplicate /
+// old-tab guards read this.
+const RECORDED_AT = (a = '') => `COALESCE(${a ? a + '.' : ''}recorded_at, ${a ? a + '.' : ''}created_at)`;
 
 // ── Auto-assignment ───────────────────────────────────────────────────────────
 // Assigns an unassigned lead to the SALES user of the lead's OWN branch
@@ -2862,6 +2869,7 @@ app.post('/api/visits/:userId/left', requireAuth, authorizeRoles('reception', 'a
     return res.status(409).json({ error: 'العميل ده مش مسجّل إنه وصل الفرع النهارده', code: 'not_checked_in_today' });
   }
   const [start, end] = cairoDayBoundsSql(checkin.visit_day);
+  // the contract's day (created_at, corrected by the manager if he did), not the typing moment
   const sold = db.prepare(`SELECT 1 FROM purchases WHERE user_id = ? AND branch = ?
                            AND datetime(created_at) >= ? AND datetime(created_at) < ? LIMIT 1`).get(userId, branch, start, end);
   if (sold) return res.status(409).json({ error: 'العميل ده اتسجّلتله بيعة النهارده', code: 'sold_today' });
@@ -5459,7 +5467,7 @@ function findDuplicatePurchase(db, { userId, contractNumber, rep, productIds, li
   const want = [...productIds].sort((a, b) => a - b).join(',');
   const wantLines = linesSignature(lines);
   const recent = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND rep IS ? AND COALESCE(TRIM(contract_number),'') = ''
-                             AND datetime(created_at) >= datetime('now','-60 seconds')`).all(userId, rep);
+                             AND datetime(${RECORDED_AT()}) >= datetime('now','-60 seconds')`).all(userId, rep);
   for (const r of recent) {
     const have = db.prepare(`SELECT product_id FROM purchase_items WHERE purchase_id = ? ORDER BY product_id`).all(r.id)
                    .map(x => x.product_id).join(',');
@@ -5756,8 +5764,8 @@ async function backfillPurchaseEstimates(db) {
   const out = { estimated: 0, resent: 0, failed: 0 };
   try {
     const rows = db.prepare(`
-      SELECT p.id, p.user_id, p.price, CAST(strftime('%s', p.created_at) AS INTEGER) AS ts,
-             (datetime(p.created_at) >= datetime('now', '-${PURCHASE_RESEND_WINDOW_H} hours')) AS in_window
+      SELECT p.id, p.user_id, p.price, CAST(strftime('%s', ${RECORDED_AT('p')}) AS INTEGER) AS ts,
+             (datetime(${RECORDED_AT('p')}) >= datetime('now', '-${PURCHASE_RESEND_WINDOW_H} hours')) AS in_window
       FROM purchases p
       WHERE EXISTS (SELECT 1 FROM purchase_lines pl WHERE pl.purchase_id = p.id)
         AND NOT EXISTS (SELECT 1 FROM purchase_estimates e WHERE e.purchase_id = p.id)
@@ -5828,7 +5836,7 @@ app.post('/api/purchases', requireAuth, async (req, res) => {
   if (role === 'sales' || role === 'rep') {
     const [dayStart, dayEnd] = cairoDayBoundsSql(cairoDay());
     const already = db.prepare(`SELECT id FROM purchases WHERE user_id = ? AND entered_via = 'reception'
-                                  AND datetime(created_at) >= ? AND datetime(created_at) < ?
+                                  AND datetime(${RECORDED_AT()}) >= ? AND datetime(${RECORDED_AT()}) < ?
                                 ORDER BY id DESC LIMIT 1`).get(user_id, dayStart, dayEnd);
     if (already) {
       return res.status(409).json({
@@ -6637,11 +6645,186 @@ app.get('/api/leads/:user_id/purchases', requireAuth, (req, res) => {
   return res.json({ purchases });
 });
 
+// ── «فلترة التعاقدات» (2026-11-25, «اعملي فلترة في التعاقدات … ويبقي في تعديل
+// لتاريخ التعاقد لمدير الفرع») ───────────────────────────────────────────────
+// GET /api/contracts narrows by salesperson (?rep=, «من غير سيلز» = ?rep=__none__),
+// searches the contract number (?number=, part of it) and sorts (?sort=) — all
+// in SQL, before the 500-row LIMIT, so the list, the header's «N تعاقد —
+// إجمالي X» and the cap agree. Every one only NARROWS the caller's role scope
+// (sales → his own, a manager → his branch): ?rep / ?branch / ?number never
+// reach a contract the role can't see. Checked by scripts/smoke-contracts-filters.js.
+const CONTRACT_SORTS = {
+  // newest = the order the page always had (the contract's date, newest first)
+  newest:      () => `datetime(p.created_at) DESC, p.id DESC`,
+  oldest:      () => `datetime(p.created_at) ASC, p.id ASC`,
+  // the number's DIGITS as a number (2 < 10 < 100: shorter digit string first,
+  // then the digits), a contract with no digits last in both directions; ties
+  // (the same number) newest first. Digit strings are compared as text after
+  // the leading zeros go, so a 25-digit number never overflows.
+  number_asc:  () => `(contract_no_digits(p.contract_number) IS NULL), LENGTH(contract_no_digits(p.contract_number)) ASC,
+                      contract_no_digits(p.contract_number) ASC, datetime(p.created_at) DESC, p.id DESC`,
+  number_desc: () => `(contract_no_digits(p.contract_number) IS NULL), LENGTH(contract_no_digits(p.contract_number)) DESC,
+                      contract_no_digits(p.contract_number) DESC, datetime(p.created_at) DESC, p.id DESC`,
+};
+const CONTRACT_NO_REP = '__none__';      // ?rep= for «من غير سيلز»
+const CONTRACT_NUMBER_MAX = 30;          // characters of a searched number (after the cleanup)
+const CONTRACT_REP_MAX = 100;
+// Arabic-Indic (٠-٩) and extended (۰-۹) digits → 0-9.
+const westernDigits = (v) => String(v)
+  .replace(/[٠-٩]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+  .replace(/[۰-۹]/g, (c) => String(c.charCodeAt(0) - 0x06F0));
+// What a contract number is searched on: Western digits, no spaces, dashes,
+// underscores or direction marks, lower-case («١٢٣ - ٤» = «1234» = «12-34»).
+function contractNoKey(v) {
+  if (v == null) return '';
+  return westernDigits(v).replace(/[\s\-_‐-―−‎‏‪-‮⁦-⁩]/g, '').toLowerCase();
+}
+// What a contract number is SORTED on: its digits (Western), leading zeros
+// dropped («007» = 7); no digit at all → null (sorted last).
+function contractNoDigits(v) {
+  if (v == null) return null;
+  const d = westernDigits(v).replace(/[^0-9]/g, '');
+  return d ? d.replace(/^0+(?=\d)/, '') : null;
+}
+const contractSqlFnsOn = new WeakSet();
+function contractSqlFns(db) {
+  if (contractSqlFnsOn.has(db)) return;
+  db.function('contract_no_key', { deterministic: true }, (v) => contractNoKey(v));
+  db.function('contract_no_digits', { deterministic: true }, (v) => contractNoDigits(v));
+  contractSqlFnsOn.add(db);
+}
+// The query's filters → { sort, number, rep, noRep, branch } | { error, code }.
+// A value sent twice (?rep=a&rep=b → an array) is a 400, never a guess.
+function parseContractFilters(db, q, role) {
+  const one = (k) => {
+    const v = q[k];
+    if (v == null) return '';
+    if (typeof v !== 'string') return null;
+    return v.trim();
+  };
+  const bad = (error, code) => ({ error, code });
+  const sortIn = one('sort');
+  if (sortIn === null) return bad('الترتيب ده مش معروف', 'bad_sort');
+  const sort = sortIn || 'newest';
+  if (!Object.prototype.hasOwnProperty.call(CONTRACT_SORTS, sort)) return bad('الترتيب ده مش معروف — اختار من القايمة', 'bad_sort');
+  const numIn = one('number');
+  if (numIn === null) return bad('رقم العقد مش مفهوم', 'bad_number');
+  const number = contractNoKey(numIn);
+  // review r2: a box of dashes / underscores / direction marks only cleans down
+  // to nothing — said, never a silent «every contract matched».
+  if (numIn && !number) return bad('اكتب رقم العقد أو جزء منه — الشَرطة والمسافات لوحدها مش بتدوّر على حاجة', 'bad_number');
+  if (numIn.length > CONTRACT_NUMBER_MAX * 2 || number.length > CONTRACT_NUMBER_MAX) {
+    return bad(`رقم العقد طويل أوي — اكتب ${CONTRACT_NUMBER_MAX} حرف بالكتير`, 'bad_number');
+  }
+  const repIn = one('rep');
+  if (repIn === null || (repIn && repIn.length > CONTRACT_REP_MAX)) return bad('اسم السيلز مش مفهوم — اختار من القايمة', 'bad_rep');
+  // sales / rep: always their own contracts — ?rep is ignored (never widens).
+  const canPickRep = role === 'admin' || role === 'branch_manager';
+  const rep = canPickRep && repIn && repIn !== CONTRACT_NO_REP ? repIn : null;
+  const noRep = canPickRep && repIn === CONTRACT_NO_REP;
+  // ?branch — the admin only (a manager stays on his own branch): a system
+  // branch (or an alias of one), or a branch that contracts carry.
+  let branch = null;
+  const brIn = one('branch');
+  if (brIn === null) return bad('الفرع ده مش من فروع السيستم — اختار من القايمة', 'invalid_branch');
+  if (role === 'admin' && brIn) {
+    branch = intakeBranch(brIn, { db })
+      || (db.prepare(`SELECT 1 FROM purchases WHERE branch = ? LIMIT 1`).get(brIn) ? brIn : null);
+    if (!branch) return bad('الفرع ده مش من فروع السيستم — اختار من القايمة', 'invalid_branch');
+  }
+  return { sort, number: number || null, rep, noRep, branch };
+}
+// The admin's «الفرع» choices on «التعاقدات» (review r2): the configured
+// branches + every branch a contract carries — each one passes
+// parseContractFilters' ?branch= rule (an events-only value never shows).
+function contractBranchChoices(db) {
+  const names = branchLabelMap(db);
+  const out = new Map();
+  for (const b of activeBranchIds(db)) out.set(b.id, { id: b.id, name: names[b.id] || null });
+  for (const r of db.prepare(`SELECT DISTINCT branch FROM purchases WHERE branch IS NOT NULL AND TRIM(branch) <> ''`).all()) {
+    if (!out.has(r.branch)) out.set(r.branch, { id: r.branch, name: names[r.branch] || null });
+  }
+  return [...out.values()];
+}
+// «فلتر السيلز»'s choices: the ACTIVE sellers of the branch (all branches for
+// the admin with no branch picked) — the active salespeople there, plus an
+// active manager / admin who has contracts there in his own name. A stopped
+// salesperson is in no list (honest.sellers, owner 2026-11-25 «اللي يتوقف
+// يتأرشف وميبانش تاني»): his contracts stay in the list and every total.
+function contractRepChoices(db, branch) {
+  const who = honest.sellers(db);
+  const branchOf = new Map(db.prepare(`SELECT name, branch FROM users WHERE active = 1`).all()
+    .map((u) => [String(u.name || '').trim(), u.branch || null]));
+  const out = new Map();
+  const users = branch
+    ? db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales', 'rep') AND active = 1 AND branch = ?`).all(branch)
+    : db.prepare(`SELECT name, branch FROM users WHERE role IN ('sales', 'rep') AND active = 1`).all();
+  for (const u of users) {
+    const n = String(u.name || '').trim();
+    if (n && who.shown(n)) out.set(n, { name: n, branch: u.branch || null });
+  }
+  const onContracts = branch
+    ? db.prepare(`SELECT DISTINCT TRIM(rep) AS n FROM purchases WHERE branch = ? AND rep IS NOT NULL AND TRIM(rep) <> ''`).all(branch)
+    : db.prepare(`SELECT DISTINCT TRIM(rep) AS n FROM purchases WHERE rep IS NOT NULL AND TRIM(rep) <> ''`).all();
+  for (const r of onContracts) {
+    if (r.n && who.shown(r.n) && !out.has(r.n)) out.set(r.n, { name: r.n, branch: branchOf.get(r.n) || null });
+  }
+  return [...out.values()].sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+}
+
+// ── «تعديل تاريخ التعاقد» (2026-11-25) ─────────────────────────────────────
+// A day the contract may be moved to: a real day, 2020-01-01 … today (Cairo).
+const CONTRACT_DAY_MIN = '2020-01-01';
+// The UTC SQL text of a Cairo wall time on `day` (summer time aware); null when
+// that wall time does not exist on that day (the spring-forward hour).
+function cairoWallToSqlUtc(day, hh, mm, ss) {
+  const [y, m, d] = day.split('-').map(Number);
+  const want = Date.UTC(y, m - 1, d, hh, mm, ss);
+  let t = want;
+  for (let i = 0; i < 3; i++) t = want - cairoOffsetMs(new Date(t));
+  const p = cairoParts(new Date(t));
+  if (`${p.year}-${p.month}-${p.day}` !== day || +p.hour !== hh || +p.minute !== mm) return null;
+  return toSqlUtc(new Date(t));
+}
+// The contract's new time: the NEW Cairo day at the contract's OWN Cairo time
+// of day (a contract typed at 19:40 stays at 19:40), so its place among the
+// day's contracts and every Cairo-day count are what they would have been. A
+// time of day that does not exist on the new day (summer time) → 12:00; a
+// time later than now (the new day is today) → now. → 'YYYY-MM-DD HH:MM:SS' UTC.
+function movedContractTime(oldAt, newDay, now = new Date()) {
+  const old = sqlUtcToDate(oldAt);
+  let hh = 12, mm = 0, ss = 0;
+  if (old && !Number.isNaN(old.getTime())) { const p = cairoParts(old); hh = +p.hour; mm = +p.minute; ss = +p.second; }
+  let at = cairoWallToSqlUtc(newDay, hh, mm, ss) || cairoWallToSqlUtc(newDay, 12, 0, 0);
+  if (at > toSqlUtc(now)) at = toSqlUtc(now);
+  return at;
+}
+// The body's contract_date → { day } | { error, code } (null when not sent).
+function parseContractDay(v) {
+  if (v == null || v === '') return null;
+  if (typeof v !== 'string') return { error: 'تاريخ التعاقد لازم يكون يوم بالشكل ده: 2026-11-20', code: 'bad_contract_date' };
+  const day = westernDigits(v.trim());
+  if (!honest.isDay(day)) return { error: 'تاريخ التعاقد لازم يكون يوم بالشكل ده: 2026-11-20', code: 'bad_contract_date' };
+  if (day < CONTRACT_DAY_MIN) return { error: 'مينفعش تاريخ تعاقد قبل 2020', code: 'contract_date_too_old' };
+  if (day > cairoDay()) return { error: 'مينفعش تاريخ التعاقد يبقى بعد النهارده', code: 'contract_date_future' };
+  return { day };
+}
+// A customer's purchased_at = his FIRST contract's date (insertPurchaseRows
+// writes it once, at the first sale): after a date edit it follows the
+// contracts' dates. Inside the caller's transaction.
+function syncPurchasedAt(db, userId) {
+  const first = db.prepare(`SELECT created_at FROM purchases WHERE user_id = ? ORDER BY datetime(created_at), id LIMIT 1`).get(userId);
+  if (first) db.prepare(`UPDATE lead_profiles SET purchased_at = ? WHERE user_id = ? AND purchased_at IS NOT NULL`).run(first.created_at, userId);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Contracts module — purchases viewed as contracts.
 //   GET    /api/contracts      — RBAC: sales→own, branch_manager→branch, admin→all
 //                                ?month=YYYY-MM → that calendar month only.
+//                                ?rep= ?number= ?sort= ?branch= (2026-11-25,
+//                                parseContractFilters above: they only narrow).
 //   PUT    /api/contracts/:id  — admin / branch_manager (manager → own branch)
+//                                + contract_date (2026-11-25, the Cairo day)
 //   DELETE /api/contracts/:id  — admin / branch_manager (manager → own branch)
 //                                + smart reversion when a customer's last
 //                                  purchase is removed.
@@ -6668,7 +6851,11 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
 
   // Optional filters — month, date range, branch & rep (admin/manager scoping
   // above already constrains non-admins, so these only narrow further).
-  const { startDate, endDate, branch: fBranch, rep: fRep } = req.query;
+  const { startDate, endDate } = req.query;
+  // 2026-11-25 «فلترة التعاقدات»: salesperson / number / sort / admin branch.
+  const f = parseContractFilters(db, req.query, role);
+  if (f.error) return res.status(400).json({ error: f.error, code: f.code });
+  contractSqlFns(db);
 
   // month=YYYY-MM → التعاقدات بتاعة الشهر ده بس. A month here is a CAIRO month
   // (2026-11-25 review: the UTC month put a contract made at 00:10 Cairo on
@@ -6695,11 +6882,15 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
   const dr = honest.rangeSql('p.created_at', startDate || null, endDate || null);   // Cairo days
   where += dr.clause;
   params.push(...dr.params);
-  if (fBranch && role === 'admin') { where += ' AND p.branch = ?'; params.push(fBranch); }
-  if (fRep && (role === 'admin' || role === 'branch_manager')) {
-    where += ' AND p.rep = ?';
-    params.push(fRep);
-  }
+  // the admin's branch (a manager is already on his own; sales on their own)
+  if (f.branch) { where += ' AND p.branch = ?'; params.push(f.branch); }
+  // part of the number, its digits/spaces/dashes cleaned on both sides
+  if (f.number) { where += ' AND instr(contract_no_key(p.contract_number), ?) > 0'; params.push(f.number); }
+  // review r2: «من غير سيلز (N)» counts what choosing it would show — every
+  // filter (month, days, branch, number) but the salesperson.
+  const pickWhere = where; const pickParams = [...params];
+  if (f.rep)   { where += ' AND TRIM(p.rep) = ?'; params.push(f.rep); }
+  if (f.noRep) { where += ` AND (p.rep IS NULL OR TRIM(p.rep) = '')`; }
 
   // Listing cap — sent back to the client so the page can say "دي أول 500" بدل
   // ما يبان إن الباقي اتمسح (الملخص تحت بيعدّ من غير الحد ده).
@@ -6707,15 +6898,34 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
 
   const contracts = db.prepare(`
     SELECT p.id, p.user_id, p.price, p.contract_number, p.branch, p.rep,
-           p.product_id, p.notes, p.created_at,
+           p.product_id, p.notes, p.created_at, p.recorded_at,
            p.entered_by, p.entered_by_role, p.entered_via,
            lp.first_name, lp.phone
     FROM purchases p
     LEFT JOIN lead_profiles lp ON lp.user_id = p.user_id
     WHERE ${where}
-    ORDER BY p.created_at DESC
+    ORDER BY ${CONTRACT_SORTS[f.sort]()}
     LIMIT ${LIST_LIMIT}
   `).all(...params);
+  // A re-dated contract says so: the latest date change still standing (not
+  // undone in «سجل العمليات») — from which day, by whom, when.
+  if (contracts.length) {
+    const byId = new Map();
+    const ph = contracts.map(() => '?').join(',');
+    for (const a of db.prepare(`
+      SELECT id, operator_name, created_at, old_state, CAST(json_extract(old_state, '$.where.id') AS INTEGER) AS pid
+      FROM system_audit_log
+      WHERE action_type = 'contract_date_change' AND COALESCE(reverted, 0) = 0
+        AND CAST(json_extract(old_state, '$.where.id') AS INTEGER) IN (${ph})
+      ORDER BY id DESC`).all(...contracts.map((c) => c.id))) {
+      if (byId.has(a.pid)) continue;
+      let st = null; try { st = JSON.parse(a.old_state); } catch (_) {}
+      const d = sqlUtcToDate(a.created_at);
+      byId.set(a.pid, { from: st?.from || null, to: st?.to || null, by: a.operator_name || null,
+        at: d && !isNaN(d) ? d.toISOString().slice(0, 19) + 'Z' : null });
+    }
+    for (const c of contracts) c.date_change = byId.get(c.id) || null;
+  }
 
   // Attach the products on each contract (what the customer actually took), so
   // the contracts table can show it and the manager can edit it.
@@ -6792,20 +7002,47 @@ app.get('/api/contracts', requireAuth, authorizeRoles('admin', 'branch_manager',
     limit: LIST_LIMIT,
     truncated: totals.count > contracts.length,
     months,
+    // 2026-11-25: the filters applied, and the salesperson picker's choices
+    // (admin / manager only: the active sellers of the branch in scope) +
+    // how many contracts in that scope carry no salesperson («من غير سيلز»).
+    filters: { sort: f.sort, number: f.number, rep: f.rep, no_rep: f.noRep, branch: f.branch },
+    ...((role === 'admin' || role === 'branch_manager') ? {
+      rep_choices: contractRepChoices(db, role === 'branch_manager' ? req.user.branch : f.branch),
+      no_rep_count: db.prepare(`SELECT COUNT(*) AS n FROM purchases p WHERE ${pickWhere} AND (p.rep IS NULL OR TRIM(p.rep) = '')`)
+        .get(...pickParams).n,
+    } : {}),
+    // review r2: the admin's «الفرع» choices = exactly what ?branch= accepts —
+    // the system's branches + any branch a contract carries (never an events
+    // value such as a stale bot answer, which ?branch= refuses with a 400).
+    ...(role === 'admin' ? { branch_choices: contractBranchChoices(db) } : {}),
   });
 });
 
 app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manager'), async (req, res) => {
  try {
   const db  = getDb();
-  const row = db.prepare(`SELECT id, user_id, branch, contract_number, rep FROM purchases WHERE id = ?`).get(req.params.id);
+  const row = db.prepare(`SELECT id, user_id, branch, contract_number, rep, price, created_at FROM purchases WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'contract_not_found' });
   if (req.user?.role === 'branch_manager' && row.branch !== req.user.branch) {
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const { price, contract_number, product_ids, rep: repIn, items } = req.body || {};
-  const newNumber = (contract_number && String(contract_number).trim()) || null;
+  const body = req.body || {};
+  const { price, contract_number, product_ids, rep: repIn, items } = body;
+  // 2026-11-25: price / number are written only when the body carries them (the
+  // portal always sends both; a date-only or rep-only edit keeps them).
+  const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+  const newNumber = has('contract_number') ? ((contract_number && String(contract_number).trim()) || null) : row.contract_number;
+  const newPrice  = has('price') ? (price != null && price !== '' ? Number(price) : null) : row.price;
+  if (newPrice != null && !Number.isFinite(newPrice)) return res.status(400).json({ error: 'المبلغ لازم يكون رقم', code: 'bad_price' });
+
+  // «تعديل تاريخ التعاقد» (2026-11-25): the admin, or the branch manager of the
+  // contract's branch (checked above). A Cairo day 2020-01-01 … today; the
+  // contract keeps its own Cairo time of day (movedContractTime).
+  const dayIn = parseContractDay(body.contract_date);
+  if (dayIn && dayIn.error) return res.status(400).json({ error: dayIn.error, code: dayIn.code });
+  const oldDay = honest.dayOf(row.created_at);
+  const newAt = dayIn && dayIn.day !== oldDay ? movedContractTime(row.created_at, dayIn.day) : null;
 
   // Optional: the salesperson the sale counts for (a sale entered for the wrong
   // one). Only an active salesperson of the contract's branch, by the DB's exact
@@ -6846,10 +7083,22 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
 
   db.transaction(() => {
     db.prepare(`UPDATE purchases SET price = ?, contract_number = ? WHERE id = ?`).run(
-      price != null && price !== '' ? Number(price) : null,
+      newPrice,
       newNumber,
       row.id
     );
+    if (newAt) {
+      // recorded_at keeps the moment it was typed (the first edit stores it);
+      // the right-hand side reads the row as it was before this UPDATE.
+      db.prepare(`UPDATE purchases SET created_at = ?, recorded_at = COALESCE(recorded_at, created_at) WHERE id = ?`).run(newAt, row.id);
+      syncPurchasedAt(db, row.user_id);
+      // the undo ledger: «رجّع» puts created_at back (REVERTABLE_AUDIT_TABLES)
+      auditLog(db, req.user?.name, 'contract_date_change', row.user_id, {
+        table: 'purchases', where: { id: row.id }, row: { created_at: row.created_at },
+        from: oldDay, to: dayIn.day, from_at: row.created_at, to_at: newAt,
+        contract_number: newNumber || row.contract_number || null, branch: row.branch || null,
+      });
+    }
     if (validIds) {
       // Replace the product lines wholesale with the new selection.
       db.prepare(`DELETE FROM purchase_items WHERE purchase_id = ?`).run(row.id);
@@ -6874,11 +7123,15 @@ app.put('/api/contracts/:id', requireAuth, authorizeRoles('admin', 'branch_manag
   // Macro alert for the admin war-room.
   createNotification(db, 'admin', 'contract_modified',
     `تم تعديل تعاقد رقم [${newNumber || row.contract_number || row.id}] بواسطة [${req.user?.name || '؟'}]` +
-    (newRep ? ` — البيعة بقت باسم [${newRep}] بدل [${row.rep || '—'}]` : ''));
+    (newRep ? ` — البيعة بقت باسم [${newRep}] بدل [${row.rep || '—'}]` : '') +
+    (newAt ? ` — التاريخ بقى [${dayIn.day}] بدل [${oldDay || '—'}]` : ''));
 
+  // The estimate stays the list price of the day it was recorded (a date edit
+  // never re-prices it); Meta's Purchase already sent is never sent again.
   if (newLines) estimatePurchase(db, row.id).catch(() => {});
 
-  return res.json({ ok: true, rep: newRep || row.rep || null });
+  return res.json({ ok: true, rep: newRep || row.rep || null, created_at: newAt || row.created_at,
+    date_changed: newAt ? { from: oldDay, to: dayIn.day } : null });
  } catch (err) {
   console.error('[contracts] update failed:', err && err.message);
   if (!res.headersSent) res.status(500).json({ error: 'حصلت مشكلة — جرّب تاني' });
@@ -7871,10 +8124,15 @@ app.post('/api/admin/cleanup-orphan-reps', requireAuth, requireRole('admin'), (r
 // Every other type — bulk_assign, bulk_reassign_customers, swap_reps,
 // transfer_rep, mark_duplicate, rep_history_repair (one-off repair trace, no
 // table by design) — is display-only: its old_state is a summary, not a row.
+//   contract_date_change (2026-11-25) changed only purchases.created_at and
+//     stored it ({ where: { id }, row: { created_at }, to_at }) → UPDATE it back,
+//     only while the contract still has the date this change gave it (a later
+//     change is undone first), and the customer's purchased_at follows.
 const REVERTABLE_AUDIT_TABLES = {
   assign_customer:   'branch_customer_followups',
   set_sales:         'lead_visits',
   assign_post_visit: 'lead_visits',
+  contract_date_change: 'purchases',
 };
 
 // old_state keys are interpolated into SQL as column names → only a non-empty
@@ -7898,6 +8156,26 @@ function planAuditRevert(log) {
     return { error: 'bad_old_state' };
   }
   const { where, row } = state;
+
+  if (log.action_type === 'contract_date_change') {
+    if (where.id == null || !row || typeof row.created_at !== 'string' || typeof state.to_at !== 'string') return { error: 'bad_old_state' };
+    return {
+      revert: (db) => {
+        const cur = db.prepare(`SELECT user_id, created_at FROM purchases WHERE id = ?`).get(where.id);
+        if (!cur) return false;
+        // review r2: a later change that landed back on this change's day has
+        // the same to_at (the time of day is kept) — any newer change still
+        // standing on this contract must be undone first.
+        const newer = db.prepare(`SELECT 1 FROM system_audit_log
+          WHERE action_type = 'contract_date_change' AND COALESCE(reverted, 0) = 0 AND id > ?
+            AND CAST(json_extract(old_state, '$.where.id') AS INTEGER) = ? LIMIT 1`).get(log.id, where.id);
+        if (newer || cur.created_at !== state.to_at) return 'تاريخ العقد ده اتغيّر تاني بعد التعديل ده — رجّع التعديل الأحدث الأول';
+        db.prepare(`UPDATE purchases SET created_at = ? WHERE id = ?`).run(row.created_at, where.id);
+        syncPurchasedAt(db, cur.user_id);
+        return true;
+      },
+    };
+  }
 
   if (log.action_type === 'assign_post_visit') {
     if (where.id == null || !row || !('sales_rep' in row)) return { error: 'bad_old_state' };
@@ -7947,11 +8225,14 @@ app.post('/api/admin/audit-logs/:id/revert', requireAuth, requireRole('admin'), 
   if (plan.error) return res.status(400).json({ error: plan.error });
 
   const restored = db.transaction(() => {
-    if (!plan.revert(db)) return false;
+    const done = plan.revert(db);
+    if (typeof done === 'string') return done;   // a conflict, said in Arabic
+    if (!done) return false;
     // Mark the ledger entry as reverted so the UI reflects it.
     db.prepare(`UPDATE system_audit_log SET reverted = 1 WHERE id = ?`).run(log.id);
     return true;
   })();
+  if (typeof restored === 'string') return res.status(409).json({ error: restored, code: 'changed_since' });
   if (!restored) {
     return res.status(409).json({ error: 'البيانات اللي الإجراء ده عدّلها اتمسحت — مفيش حاجة ترجع' });
   }
